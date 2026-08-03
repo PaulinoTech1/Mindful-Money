@@ -1,0 +1,704 @@
+/* Vault client.
+   Everything security-relevant and every number on screen is computed here,
+   on the device. The server is a blob store: it never sees a passphrase, a
+   key, a merchant name or an amount. */
+
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+let S = null;                 // sodium, after ready
+let KEYS = null;              // { publicKey, privateKey, indexKey }
+let TXNS = [];                // decrypted, in memory only
+let CHARTS = {};
+
+/* ---- DEMO ONLY -----------------------------------------------------------
+   Fixed salts so a page reload can re-derive the same key without a signup
+   flow. A real build generates random salts per user at signup and stores
+   them alongside the public key. Do not ship this constant.            */
+const DEMO_SALT_ENC  = new Uint8Array([73,26,201,4,155,88,17,240,63,129,7,198,44,90,231,12]);
+const DEMO_SALT_IDX  = new Uint8Array([9,144,37,222,101,58,175,20,86,3,249,130,66,11,193,77]);
+
+/* ---------- categorization: on the device, never on the server ---------- */
+
+const RULES = [
+  [/payroll|deposit/i,                                  'Income'],
+  [/rent|stuyvesant/i,                                  'Housing'],
+  [/trader joe|whole foods/i,                           'Groceries'],
+  [/blue bottle|sweetgreen|lucali/i,                    'Dining'],
+  [/mta|omny|uber|citi bike|enterprise|delta air/i,     'Transport'],
+  [/con edison|verizon/i,                               'Utilities'],
+  [/spotify|netflix|fans only/i,                        'Subscriptions'],
+  [/amazon|apple store|rough trade|paragon|warby/i,     'Shopping'],
+  [/duane reade|weill cornell|equinox|state farm/i,     'Health & insurance'],
+  [/ira contribution|401\(k\)|employee deferral|employer match/i, 'Investing'],
+];
+
+const CAT_COLOR = {
+  'Housing':            '#2e4b6b',
+  'Groceries':          '#1f6b54',
+  'Dining':             '#9e3b3b',
+  'Transport':          '#7a5c2e',
+  'Utilities':          '#4a6572',
+  'Subscriptions':      '#6b4a7a',
+  'Shopping':           '#a66a2e',
+  'Health & insurance': '#3a7a7a',
+  'Investing':          '#8a5b31',
+  'Income':             '#1f6b54',
+  'Uncategorized':      '#74879a',
+};
+
+const ACCOUNT_META = {
+  demo_checking: { bank: 'Scammers Inc', label: 'Everyday checking', type: 'Checking' },
+  demo_ira:      { bank: 'Wells Foreclose', label: 'Traditional IRA', type: 'IRA' },
+  demo_401k:     { bank: 'DC Unc', label: 'Employer 401(k)', type: '401(k)' },
+};
+
+const categorize = (merchant) => {
+  for (const [re, cat] of RULES) if (re.test(merchant)) return cat;
+  return 'Uncategorized';
+};
+
+/* ---------- crypto ---------- */
+
+async function deriveKeys(passphrase) {
+  const A = S.crypto_pwhash_ALG_ARGON2ID13;
+  const ops = S.crypto_pwhash_OPSLIMIT_INTERACTIVE;
+  const mem = S.crypto_pwhash_MEMLIMIT_INTERACTIVE;
+
+  // Seeded keypair so the same passphrase always yields the same identity.
+  const seed = S.crypto_pwhash(32, passphrase, DEMO_SALT_ENC, ops, mem, A);
+  const kp = S.crypto_box_seed_keypair(seed);
+  const indexKey = S.crypto_pwhash(32, passphrase, DEMO_SALT_IDX, ops, mem, A);
+
+  return { publicKey: kp.publicKey, privateKey: kp.privateKey, indexKey };
+}
+
+const seal = (obj) =>
+  S.to_hex(S.crypto_box_seal(S.from_string(JSON.stringify(obj)), KEYS.publicKey));
+
+const open = (hex) =>
+  JSON.parse(S.to_string(
+    S.crypto_box_seal_open(S.from_hex(hex), KEYS.publicKey, KEYS.privateKey)));
+
+const blindIndex = (id) =>
+  S.to_hex(S.crypto_generichash(32, S.from_string(id), KEYS.indexKey));
+
+/* ---------- formatting ---------- */
+
+const money = (n, sign) => {
+  const s = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (sign && n < 0 ? '\u2212' : '') + '$' + s;
+};
+const monthName = (ym) => {
+  const [y, m] = ym.split('-');
+  return new Date(y, m - 1, 1).toLocaleString('en-US', { month: 'short' });
+};
+
+/* ---------- flow ---------- */
+
+async function unlock() {
+  const pass = $('pass').value.trim();
+  if (!pass) { $('gateNote').textContent = 'Enter a passphrase to continue.'; return; }
+
+  $('unlockBtn').disabled = true;
+  $('gateNote').textContent = 'Deriving key\u2026';
+  await new Promise((r) => setTimeout(r, 30));   // let the label paint
+
+  KEYS = await deriveKeys(pass);
+
+  $('lock').dataset.state = 'open';
+  $('lockLabel').textContent = 'Unlocked';
+  $('statKey').textContent = S.to_hex(KEYS.publicKey).slice(0, 12);
+  $('stats').hidden = false;
+  $('syncBtn').hidden = false;
+  $('resetBtn').hidden = false;
+  $('gate').hidden = true;
+
+  await load();
+}
+
+async function load() {
+  const { records } = await (await fetch('/api/records')).json();
+
+  if (!records.length) { $('empty').hidden = false; return; }
+
+  // Decrypt everything locally. ~20MB for a decade of history, so the whole
+  // corpus lives in memory and every aggregate is computed here.
+  TXNS = records.map((r) => open(r.sealed))
+                .map((t) => ({ ...t, category: categorize(t.merchant) }))
+                .sort((a, b) => a.date.localeCompare(b.date));
+
+  $('statRecords').textContent = TXNS.length;
+  renderAccounts();
+  $('empty').hidden = true;
+  $('dash').hidden = false;
+  $('viewToggle').hidden = false;
+  render();
+}
+
+async function connect() {
+  $('connectBtn').disabled = true;
+  $('syncBtn').disabled = true;
+  $('connectNote').textContent = 'Fetching from bank\u2026';
+
+  // The server relays plaintext in this response and stores none of it.
+  const { transactions } = await (await fetch('/api/relay', { method: 'POST' })).json();
+
+  $('connectNote').textContent = `Encrypting ${transactions.length} transactions in your browser\u2026`;
+  await new Promise((r) => setTimeout(r, 30));
+
+  const sealedRows = transactions.map((t) => ({
+    blind_index: blindIndex(t.id),
+    sealed: seal(t),
+  }));
+
+  await fetch('/api/records', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ records: sealedRows }),
+  });
+
+  $('connectNote').textContent = '';
+  $('connectBtn').disabled = false;
+  $('syncBtn').disabled = false;
+  await load();
+}
+
+/* ---------- aggregates ---------- */
+
+function monthly() {
+  const m = new Map();
+  for (const t of TXNS) {
+    const k = t.date.slice(0, 7);
+    if (!m.has(k)) m.set(k, { in: 0, out: 0 });
+    if (t.amount < 0) m.get(k).in -= t.amount; else m.get(k).out += t.amount;
+  }
+  return [...m.entries()].sort();
+}
+
+function byCategory() {
+  const m = new Map();
+  for (const t of TXNS) {
+    if (t.amount <= 0) continue;
+    m.set(t.category, (m.get(t.category) || 0) + t.amount);
+  }
+  return [...m.entries()].sort((a, b) => b[1] - a[1]);
+}
+
+function runningBalance() {
+  let bal = 0;
+  const byDay = new Map();
+  for (const t of TXNS) { bal -= t.amount; byDay.set(t.date, bal); }
+  return [...byDay.entries()];
+}
+
+function topMerchants(n = 8) {
+  const m = new Map();
+  for (const t of TXNS) {
+    if (t.amount <= 0) continue;
+    if (!m.has(t.merchant)) m.set(t.merchant, { n: 0, sum: 0 });
+    const e = m.get(t.merchant); e.n++; e.sum += t.amount;
+  }
+  return [...m.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, n);
+}
+
+function renderAccounts() {
+  const groups = new Map(Object.keys(ACCOUNT_META).map((id) => [id, []]));
+  for (const txn of TXNS) {
+    if (!groups.has(txn.account)) groups.set(txn.account, []);
+    groups.get(txn.account).push(txn);
+  }
+  $('accounts').hidden = false;
+  $('accountList').innerHTML = [...groups.entries()].map(([id, rows]) => {
+    const meta = ACCOUNT_META[id] || { bank: id, label: 'Encrypted account', type: 'Account' };
+    const net = rows.reduce((sum, t) => sum - t.amount, 0);
+    return `<div class="accountItem">
+      <div class="accountBank">${meta.bank}</div>
+      <div class="accountLabel">${meta.type} · ${meta.label}<span>${rows.length} records</span></div>
+      <div class="accountFlow">Net flow ${money(net, true)}</div>
+    </div>`;
+  }).join('');
+
+  const totalVisible = [...groups.values()].reduce((sum, rows) => sum + rows.reduce((inner, t) => inner + (t.amount < 0 ? -t.amount : 0), 0), 0);
+  $('dashboardAccounts').innerHTML = [...groups.entries()].map(([id, rows]) => {
+    const meta = ACCOUNT_META[id] || { bank: id, label: 'Encrypted account', type: 'Account' };
+    const contributions = rows.reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
+    const net = rows.reduce((sum, t) => sum - t.amount, 0);
+    const retirement = meta.type !== 'Checking';
+    const amount = retirement ? contributions : net;
+    const amountLabel = retirement ? 'Contributed' : 'Net flow';
+    const width = totalVisible ? Math.max(5, Math.round((contributions / totalVisible) * 100)) : 5;
+    return `<article class="accountCard ${retirement ? 'retirement' : 'checking'}">
+      <div class="accountCardTop"><span class="accountCardType">${meta.type}</span><span class="accountCardBadge">${rows.length} records</span></div>
+      <div class="accountCardBank">${meta.bank}</div>
+      <div class="accountCardLabel">${meta.label}</div>
+      <div class="accountCardAmount"><small>${amountLabel}</small>${money(amount, true)}</div>
+      <div class="accountCardMeta">${retirement ? 'Retirement contributions' : 'Everyday account movement'}</div>
+      <div class="accountBar" aria-label="${width}% of deposits"><span style="width:${width}%"></span></div>
+    </article>`;
+  }).join('');
+}
+
+/* ---------- private local assistant -----------------------------------
+   This deliberately uses the decrypted TXNS array in this page only. It is
+   a small deterministic assistant rather than a remote LLM: no chat text,
+   merchant name, amount or date is sent anywhere.                           */
+
+const localCurrentMonth = () => new Date().toISOString().slice(0, 7);
+const localMonthLabel = (ym) => new Date(ym + '-01').toLocaleString('en-US', { month: 'long', year: 'numeric' });
+const localMonthRows = (ym) => TXNS.filter((t) => t.date.slice(0, 7) === ym);
+const localTotals = (rows) => rows.reduce((a, t) => {
+  if (t.amount < 0) a.in -= t.amount; else a.out += t.amount;
+  return a;
+}, { in: 0, out: 0 });
+const localCompleteMonths = () => monthly().filter(([k]) => k !== localCurrentMonth());
+const localShare = (amount, total) => total ? Math.round((amount / total) * 100) : 0;
+
+function localMonthReport(key, phrase) {
+  const totals = localTotals(localMonthRows(key));
+  const net = totals.in - totals.out;
+  return `${phrase || localMonthLabel(key)}: income ${money(totals.in)}, spending ${money(totals.out)}, net ${money(net, true)}. ` +
+    (net >= 0 ? 'The math behaved for once.' : 'Spending won this round.');
+}
+
+function localSummary() {
+  const totals = localTotals(TXNS);
+  const net = totals.in - totals.out;
+  const months = monthly();
+  const cats = byCategory();
+  const frequent = topMerchants(1)[0];
+  const latest = localCompleteMonths().slice(-1)[0] || months.slice(-1)[0];
+  const accountCount = new Set(TXNS.map((t) => t.account)).size;
+  const pieces = [
+    `Across ${months.length} months, ${TXNS.length} transactions, and ${accountCount} accounts, income was ${money(totals.in)} and spending was ${money(totals.out)}.`,
+    `Net cash flow was ${money(net, true)} — ${net >= 0 ? 'a respectable escape from the red.' : 'the red carpet has been rolled out for spending.'}`,
+  ];
+  if (cats.length) {
+    const share = localShare(cats[0][1], totals.out);
+    pieces.push(`Your largest spending category was ${cats[0][0]} at ${money(cats[0][1])} (${share}% of spending) — ${share >= 40 ? 'spectacularly over the top.' : 'the largest slice, though not exactly subtle.'}`);
+  }
+  if (frequent) pieces.push(`Your most frequent merchant was ${frequent[0]} with ${frequent[1].n} visits — an eccentric little recurring character.`);
+  if (latest) pieces.push(localMonthReport(latest[0], `For ${localMonthLabel(latest[0])}`));
+  return pieces.join(' ');
+}
+
+function localAccountReport() {
+  const groups = new Map(Object.keys(ACCOUNT_META).map((id) => [id, []]));
+  for (const txn of TXNS) {
+    if (!groups.has(txn.account)) groups.set(txn.account, []);
+    groups.get(txn.account).push(txn);
+  }
+  return 'Accounts — three banks, three distinct financial personalities:\n' + [...groups.entries()].map(([id, rows]) => {
+    const meta = ACCOUNT_META[id] || { bank: id, label: 'Encrypted account', type: 'Account' };
+    const net = rows.reduce((sum, t) => sum - t.amount, 0);
+    return `${meta.type} at ${meta.bank} — ${rows.length} records, net flow ${money(net, true)}`;
+  }).join('\n');
+}
+
+let CHAT_CHART_INDEX = 0;
+const CHAT_CHARTS = {};
+
+function localMathReport() {
+  const expenses = TXNS.filter((t) => t.amount > 0).map((t) => t.amount).sort((a, b) => a - b);
+  const totals = localTotals(TXNS);
+  const mean = expenses.length ? totals.out / expenses.length : 0;
+  const middle = Math.floor(expenses.length / 2);
+  const median = expenses.length ? (expenses.length % 2 ? expenses[middle] : (expenses[middle - 1] + expenses[middle]) / 2) : 0;
+  const largest = expenses.at(-1) || 0;
+  const cats = byCategory();
+  const top = cats[0];
+  const share = top ? localShare(top[1], totals.out) : 0;
+  return `Mathematical analysis: ${expenses.length} expenses totaling ${money(totals.out)}. ` +
+    `Average charge ${money(mean)}; median charge ${money(median)}; largest charge ${money(largest)}. ` +
+    (top ? `${top[0]} accounts for ${share}% of spending.` : 'No spending categories found.') +
+    ' The arithmetic is sound; the spending choices remain under review.';
+}
+
+function localGraphicAnswer(question) {
+  const q = question.toLowerCase();
+  const id = `chatChart${++CHAT_CHART_INDEX}`;
+  const chartBase = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 350 },
+    plugins: { legend: { display: false } },
+  };
+
+  if (q.includes('category') || q.includes('where') || q.includes('goes')) {
+    const data = byCategory().slice(0, 8);
+    return {
+      text: 'A spending-by-category chart, because apparently the budget wanted a pie chart before admitting what happened.',
+      chart: {
+        id,
+        config: {
+          type: 'doughnut',
+          data: {
+            labels: data.map(([name]) => name),
+            datasets: [{ data: data.map(([, amount]) => amount), backgroundColor: data.map(([name]) => CAT_COLOR[name] || '#74879a'), borderWidth: 2, borderColor: '#fff' }],
+          },
+          options: { ...chartBase, cutout: '56%', plugins: { legend: { display: true, position: 'right', labels: { color: TICK, font: { size: 11 }, boxWidth: 10 } }, tooltip: { callbacks: { label: (c) => ` ${c.label}: ${money(c.raw)}` } } } },
+        },
+      },
+    };
+  }
+
+  if (q.includes('account') || q.includes('bank') || q.includes('ira') || q.includes('401') || q.includes('retirement') || q.includes('contribution')) {
+    const data = Object.keys(ACCOUNT_META).map((id) => {
+      const meta = ACCOUNT_META[id];
+      const rows = TXNS.filter((t) => t.account === id);
+      const total = meta.type === 'Checking'
+        ? rows.reduce((sum, t) => sum - t.amount, 0)
+        : rows.reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
+      return { label: `${meta.type} · ${meta.bank}`, total };
+    });
+    return {
+      text: 'Account flows, rendered locally. Retirement gets the contribution spotlight; checking gets the net-flow reality check.',
+      chart: {
+        id,
+        config: {
+          type: 'bar',
+          data: { labels: data.map((item) => item.label), datasets: [{ data: data.map((item) => item.total), backgroundColor: ['#2e6c91', '#8a5b31', '#8a5b31'], borderRadius: 4 }] },
+          options: {
+            ...chartBase,
+            indexAxis: 'y',
+            scales: {
+              x: axis({ ticks: { color: TICK, callback: (v) => '$' + (v / 1000).toFixed(1) + 'k' } }),
+              y: axis({ grid: { display: false } }),
+            },
+            plugins: { tooltip: { callbacks: { label: (c) => ` ${money(c.raw)}` } } },
+          },
+        },
+      },
+    };
+  }
+
+  const rows = monthly();
+  const spendingOnly = q.includes('spending') && !q.includes('income') && !q.includes('cash flow');
+  const incomeOnly = q.includes('income') && !q.includes('spending');
+  const datasets = [];
+  if (!spendingOnly) datasets.push({ label: 'Income', data: rows.map(([, values]) => values.in), backgroundColor: '#18784e', borderRadius: 3 });
+  if (!incomeOnly) datasets.push({ label: 'Spending', data: rows.map(([, values]) => values.out), backgroundColor: '#ae3c42', borderRadius: 3 });
+  return {
+    text: 'Monthly cash flow, rendered locally. The bars are factual; the financial decisions remain gloriously eccentric.',
+    chart: {
+      id,
+      config: {
+        type: 'bar',
+        data: { labels: rows.map(([key]) => monthName(key)), datasets },
+        options: {
+          ...chartBase,
+          plugins: { legend: { display: datasets.length > 1, position: 'bottom', labels: { color: TICK, font: { size: 11 }, boxWidth: 10 } }, tooltip: { callbacks: { label: (c) => ` ${c.dataset.label}: ${money(c.raw)}` } } },
+          scales: { x: axis({ grid: { display: false } }), y: axis({ ticks: { callback: (v) => '$' + (v / 1000).toFixed(1) + 'k' } }) },
+        },
+      },
+    },
+  };
+}
+
+function localAssistantAnswer(question) {
+  const q = question.toLowerCase().trim();
+  if (!TXNS.length) return 'Your vault has no decrypted transactions yet. Connect the demo bank first.';
+  if (/^(hi|hello|hey|thanks|thank you)\b/.test(q)) {
+    return 'Hello. I can summarize spending, income, categories, merchants, monthly patterns, and net cash flow. I bring arithmetic, opinions, and absolutely no chill. Everything stays in this browser.';
+  }
+  if (q.includes('help') || q.includes('what can')) {
+    return 'Try “give me a summary,” “where did most of my money go?”, “how much did I spend last month?”, “what was my income?”, or “who are my most frequent merchants?” I have numbers, not clairvoyance.';
+  }
+  if (/(chart|graph|plot|visuali[sz]|trend|doughnut|bar graph)/.test(q)) {
+    return localGraphicAnswer(question);
+  }
+  if (q.includes('math') || q.includes('average') || q.includes('mean') || q.includes('median') || q.includes('calculate') || q.includes('percentage')) {
+    return localMathReport();
+  }
+  if (q.includes('account') || q.includes('bank') || q.includes('ira') || q.includes('401')) {
+    return localAccountReport();
+  }
+  if (q.includes('summary') || q.includes('summarize') || q.includes('overview') || q.includes('how am i doing')) {
+    return localSummary();
+  }
+  if (q.includes('top') || q.includes('frequent') || q.includes('merchant')) {
+    const tops = topMerchants(5);
+    return 'Most frequent merchants — an eccentric little cast of characters:\n' + tops.map(([name, v], i) => `${i + 1}. ${name} — ${v.n} visits, ${money(v.sum)} total`).join('\n');
+  }
+
+  const merchantNames = [...new Set(TXNS.map((t) => t.merchant))].sort((a, b) => b.length - a.length);
+  const merchant = merchantNames.find((name) => q.includes(name.toLowerCase()));
+  if (merchant) {
+    let rows = TXNS.filter((t) => t.merchant === merchant && t.amount > 0);
+    let period = 'all available data';
+    if (q.includes('last month')) {
+      const complete = localCompleteMonths();
+      if (complete.length) { rows = rows.filter((t) => t.date.startsWith(complete.at(-1)[0])); period = localMonthLabel(complete.at(-1)[0]); }
+    } else if (q.includes('this month')) {
+      rows = rows.filter((t) => t.date.startsWith(localCurrentMonth()));
+      period = localMonthLabel(localCurrentMonth());
+    }
+    return `${merchant}: ${money(rows.reduce((sum, t) => sum + t.amount, 0))} across ${rows.length} charge${rows.length === 1 ? '' : 's'} in ${period}. A factual report, not an intervention.`;
+  }
+
+  const category = Object.keys(CAT_COLOR).find((name) => q.includes(name.toLowerCase()));
+  if (category && q.includes('spend')) {
+    const rows = TXNS.filter((t) => t.category === category && t.amount > 0);
+    const amount = rows.reduce((sum, t) => sum + t.amount, 0);
+    const share = localShare(amount, localTotals(TXNS).out);
+    return `${category}: ${money(amount)} across ${rows.length} transaction${rows.length === 1 ? '' : 's'} (${share}% of spending). ${share >= 40 ? 'That is objectively over the top.' : 'Not a scandal, merely the largest available slice.'}`;
+  }
+  if (q.includes('category') || q.includes('where') || q.includes('goes') || q.includes('went')) {
+    const cats = byCategory().slice(0, 5);
+    return 'Spending by category — the fiscal personality test:\n' + cats.map(([name, amount], i) => `${i + 1}. ${name} — ${money(amount)}`).join('\n');
+  }
+  if (q.includes('last month')) {
+    const complete = localCompleteMonths();
+    return complete.length ? localMonthReport(complete.at(-1)[0], `Last month (${localMonthLabel(complete.at(-1)[0])})`) : 'There is no complete month in the available data yet.';
+  }
+  if (q.includes('this month')) return localMonthReport(localCurrentMonth(), `This month (${localMonthLabel(localCurrentMonth())})`);
+  if (q.includes('month') || q.includes('monthly')) {
+    return monthly().map(([key, values]) => `${localMonthLabel(key)} — income ${money(values.in)}, spending ${money(values.out)}, net ${money(values.in - values.out, true)}`).join('\n');
+  }
+  if (q.includes('income') || q.includes('earned') || q.includes('pay')) {
+    const income = localTotals(TXNS).in;
+    return `Income across the available data was ${money(income)} from ${TXNS.filter((t) => t.amount < 0).length} income transactions. Good: money arrived. The eccentric part is how quickly it found somewhere else to be.`;
+  }
+  if (q.includes('balance') || q.includes('net cash') || q.includes('cash flow')) {
+    const totals = localTotals(TXNS);
+    const net = totals.in - totals.out;
+    return `Net cash flow across the available data was ${money(net, true)}: ${money(totals.in)} in and ${money(totals.out)} out. ${net >= 0 ? 'Miraculously, the inflow won.' : 'Spending remains undefeated.'}`;
+  }
+  if (q.includes('largest') || q.includes('biggest') || q.includes('expensive')) {
+    const largest = TXNS.filter((t) => t.amount > 0).sort((a, b) => b.amount - a.amount)[0];
+    return largest ? `The largest single expense was ${money(largest.amount)} at ${largest.merchant} on ${largest.date}. Over the top? Possibly. Confirmed by the arithmetic? Absolutely.` : 'There are no expenses in the available data.';
+  }
+  if (q.includes('recent')) {
+    return 'Recent activity — the latest evidence:\n' + TXNS.slice(-5).reverse().map((t) => `${t.date} — ${t.merchant}, ${t.amount < 0 ? 'income ' + money(-t.amount) : 'spent ' + money(t.amount)}`).join('\n');
+  }
+  return 'I can answer questions about your summary, spending, income, categories, merchants, monthly patterns, largest expenses, and net cash flow. Try asking for a summary. I promise to be accurate and only mildly judgmental.';
+}
+
+function appendChatMessage(role, text) {
+  const bubble = document.createElement('div');
+  bubble.className = `chatBubble ${role}`;
+  bubble.textContent = text;
+  const chart = arguments[2];
+  if (chart) {
+    bubble.classList.add('hasChart');
+    const graph = document.createElement('div');
+    graph.className = 'chatGraph';
+    const canvas = document.createElement('canvas');
+    canvas.id = chart.id;
+    canvas.setAttribute('aria-label', 'Locally generated financial chart');
+    graph.appendChild(canvas);
+    bubble.appendChild(graph);
+  }
+  $('chatMessages').appendChild(bubble);
+  if (chart) CHAT_CHARTS[chart.id] = new Chart($(chart.id), chart.config);
+  $('chatMessages').scrollTop = $('chatMessages').scrollHeight;
+}
+
+function askChat() {
+  const input = $('chatInput');
+  const question = input.value.trim();
+  if (!question) return;
+  appendChatMessage('user', question);
+  input.value = '';
+  const answer = localAssistantAnswer(question);
+  appendChatMessage('bot', typeof answer === 'string' ? answer : answer.text, typeof answer === 'string' ? null : answer.chart);
+  input.focus();
+}
+
+function initChat() {
+  $('chatSend').addEventListener('click', askChat);
+  $('chatInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') askChat(); });
+  document.querySelectorAll('[data-prompt]').forEach((button) => {
+    button.addEventListener('click', () => {
+      $('chatInput').value = button.dataset.prompt;
+      askChat();
+    });
+  });
+}
+
+/* ---------- charts ---------- */
+
+const GRID = '#e2e9ed', TICK = '#74879a';
+const baseOpts = {
+  responsive: true,
+  maintainAspectRatio: false,
+  plugins: { legend: { display: false } },
+  animation: { duration: 380 },
+};
+const axis = (extra = {}) => ({
+  grid: { color: GRID, drawTicks: false },
+  border: { display: false },
+  ticks: { color: TICK, font: { size: 11 }, padding: 8 },
+  ...extra,
+});
+
+function draw(id, cfg) {
+  CHARTS[id]?.destroy();
+  CHARTS[id] = new Chart($(id), cfg);
+}
+
+function render() {
+  const months = monthly();
+  const cats = byCategory();
+  const bal = runningBalance();
+  const tops = topMerchants();
+
+  // Headline uses the last COMPLETE month. The current month is partial by
+  // definition -- on the 2nd it has rent but no paycheck, which would render
+  // as an alarming loss in the largest number on the page.
+  const currentKey = new Date().toISOString().slice(0, 7);
+  const complete = months.filter(([k]) => k !== currentKey);
+  const [lastKey, last] = (complete.length ? complete : months).slice(-1)[0];
+  const net = last.in - last.out;
+  $('periodLabel').textContent =
+    new Date(lastKey + '-01').toLocaleString('en-US', { month: 'long', year: 'numeric' });
+  $('figureNet').textContent = money(net, true);
+  $('figureNet').className = 'figure ' + (net < 0 ? 'debit' : 'credit');
+  $('figureSub').textContent = net < 0
+    ? 'Spending outpaced income this month.'
+    : 'Income covered spending this month.';
+  $('figureIn').textContent = money(last.in);
+  $('figureOut').textContent = money(last.out);
+
+  draw('chMonthly', {
+    type: 'bar',
+    data: {
+      labels: months.map(([k]) => monthName(k)),
+      datasets: [
+        { label: 'In',  data: months.map(([, v]) => v.in),  backgroundColor: '#1f6b54', borderRadius: 2 },
+        { label: 'Out', data: months.map(([, v]) => v.out), backgroundColor: '#9e3b3b', borderRadius: 2 },
+      ],
+    },
+    options: {
+      ...baseOpts,
+      plugins: { legend: { display: true, position: 'bottom', labels: { boxWidth: 10, boxHeight: 10, color: TICK, font: { size: 11 } } } },
+      scales: { x: axis({ grid: { display: false } }), y: axis({ ticks: { color: TICK, font: { size: 11 }, padding: 8, callback: (v) => '$' + (v / 1000) + 'k' } }) },
+    },
+  });
+
+  draw('chCategory', {
+    type: 'doughnut',
+    data: {
+      labels: cats.map(([c]) => c),
+      datasets: [{
+        data: cats.map(([, v]) => v),
+        backgroundColor: cats.map(([c]) => CAT_COLOR[c] || '#74879a'),
+        borderWidth: 2, borderColor: '#fff',
+      }],
+    },
+    options: {
+      ...baseOpts,
+      cutout: '58%',
+      plugins: {
+        legend: { display: true, position: 'right', labels: { boxWidth: 9, boxHeight: 9, color: TICK, font: { size: 11 }, padding: 9 } },
+        tooltip: { callbacks: { label: (c) => ` ${c.label}  ${money(c.raw)}` } },
+      },
+    },
+  });
+
+  draw('chBalance', {
+    type: 'line',
+    data: {
+      labels: bal.map(([d]) => d),
+      datasets: [{
+        data: bal.map(([, v]) => v),
+        borderColor: '#2e4b6b', borderWidth: 1.5,
+        backgroundColor: 'rgba(46,75,107,.08)', fill: true,
+        pointRadius: 0, tension: .25,
+      }],
+    },
+    options: {
+      ...baseOpts,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ' ' + money(c.raw, true) } } },
+      scales: {
+        x: axis({ grid: { display: false }, ticks: { color: TICK, font: { size: 11 }, maxTicksLimit: 6, callback(v) { return monthName(this.getLabelForValue(v).slice(0, 7)); } } }),
+        y: axis({ ticks: { color: TICK, font: { size: 11 }, padding: 8, callback: (v) => '$' + (v / 1000).toFixed(0) + 'k' } }),
+      },
+    },
+  });
+
+  draw('chMerchants', {
+    type: 'bar',
+    data: {
+      labels: tops.map(([m]) => m),
+      datasets: [{
+        data: tops.map(([, v]) => v.n),
+        backgroundColor: '#3d5162', borderRadius: 2, barThickness: 16,
+      }],
+    },
+    options: {
+      ...baseOpts,
+      indexAxis: 'y',
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ` ${c.raw} visits \u00b7 ${money(tops[c.dataIndex][1].sum)} total` } } },
+      scales: { x: axis({ ticks: { color: TICK, font: { size: 11 }, precision: 0 } }), y: axis({ grid: { display: false }, ticks: { color: '#3d5162', font: { size: 12 } } }) },
+    },
+  });
+
+  $('ledgerBody').innerHTML = TXNS.slice(-14).reverse().map((t) => `
+    <tr>
+      <td class="date">${t.date}</td>
+      <td>${t.merchant}</td>
+      <td><span class="tag" style="background:${(CAT_COLOR[t.category] || '#74879a')}1a;color:${CAT_COLOR[t.category] || '#74879a'}">${t.category}</span></td>
+      <td class="num ${t.amount < 0 ? 'credit' : ''}">${t.amount < 0 ? money(-t.amount) : '\u2212' + money(t.amount)}</td>
+    </tr>`).join('');
+}
+
+/* ---------- server view ---------- */
+
+async function renderServerView() {
+  const d = await (await fetch('/api/server-view')).json();
+
+  $('svFigure').textContent = `${d.record_count} rows \u00d7 ${d.columns.length} columns`;
+  $('statReadable').textContent = '0';
+
+  draw('chSizes', {
+    type: 'bar',
+    data: {
+      labels: d.size_histogram.map((s) => s.bytes + 'B'),
+      datasets: [{ data: d.size_histogram.map((s) => s.n), backgroundColor: '#2b6c9b', borderRadius: 2 }],
+    },
+    options: { ...baseOpts, scales: { x: axis({ grid: { display: false } }), y: axis() } },
+  });
+
+  draw('chDays', {
+    type: 'bar',
+    data: {
+      labels: d.write_days.map((w) => w.d.slice(5, 10)),
+      datasets: [{ data: d.write_days.map((w) => w.n), backgroundColor: '#4a6572', borderRadius: 2 }],
+    },
+    options: { ...baseOpts, scales: { x: axis({ grid: { display: false } }), y: axis() } },
+  });
+
+  $('rawBody').innerHTML = d.sample.map((r) => `
+    <tr><td>${r.blind_index.slice(0, 24)}\u2026</td><td>${r.sealed.slice(0, 96)}\u2026</td></tr>
+  `).join('');
+}
+
+function toggleView() {
+  const on = !document.body.classList.contains('sv');
+  document.body.classList.toggle('sv', on);
+  $('dash').hidden = on;
+  $('serverview').hidden = !on;
+  if (on) renderServerView();
+  window.scrollTo({ top: 0, behavior: 'instant' });
+}
+
+async function reset() {
+  await fetch('/api/records', { method: 'DELETE' });
+  location.reload();
+}
+
+/* ---------- boot ---------- */
+
+(async () => {
+  await sodium.ready;
+  S = sodium;
+  $('unlockBtn').addEventListener('click', unlock);
+  $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+  $('connectBtn').addEventListener('click', connect);
+  $('syncBtn').addEventListener('click', connect);
+  $('viewToggle').addEventListener('click', toggleView);
+  $('resetBtn').addEventListener('click', reset);
+  initChat();
+  $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';
+})();
