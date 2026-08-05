@@ -103,6 +103,13 @@ def _parse_origin(value: str):
 
 SECRET, RP_ID, ORIGIN, RP_NAME, PRODUCTION, AUTH_POLICY, CSP_MODE = _configuration()
 EXPECTED_ORIGIN = _parse_origin(ORIGIN)
+# Browsers commonly open the development server through either loopback name.
+# Treat only localhost and 127.0.0.1 as equivalent in development; deployed
+# origins continue to require an exact scheme, host and port match.
+ALLOWED_ORIGINS = {EXPECTED_ORIGIN}
+if not PRODUCTION and EXPECTED_ORIGIN[1] in {"localhost", "127.0.0.1"}:
+    alias = "127.0.0.1" if EXPECTED_ORIGIN[1] == "localhost" else "localhost"
+    ALLOWED_ORIGINS.add((EXPECTED_ORIGIN[0], alias, EXPECTED_ORIGIN[2]))
 app = Flask(__name__, static_folder=None)
 app.config.update(
     SECRET_KEY=SECRET, MAX_CONTENT_LENGTH=MAX_REQUEST_BYTES,
@@ -281,7 +288,7 @@ def database_error(_error):
 @app.before_request
 def protect_unsafe_requests():
     if request.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        if _parse_origin(request.headers.get("Origin", "")) != EXPECTED_ORIGIN:
+        if _parse_origin(request.headers.get("Origin", "")) not in ALLOWED_ORIGINS:
             LOG.warning('event="request_rejected" reason="origin" client="%s"', _client_log_id())
             return api_error("Request authorization failed", 403)
         supplied, expected = request.headers.get("X-CSRF-Token", ""), session.get("csrf_token", "")

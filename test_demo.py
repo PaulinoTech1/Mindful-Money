@@ -436,6 +436,13 @@ class TestSecurityIncrement(ServerCase):
             self.assertEqual(r.status_code, 403, origin)
         self.assertEqual(self.unsafe("post", "/api/relay").status_code, 200)
 
+    def test_development_accepts_equivalent_loopback_origin(self):
+        token = self.client.get("/api/session").get_json()["csrf_token"]
+        response = self.client.post("/api/relay", headers={
+            "Origin": "http://127.0.0.1:5000", "X-CSRF-Token": token,
+        })
+        self.assertEqual(response.status_code, 200)
+
     def test_upload_validation_is_atomic(self):
         good = {"blind_index": "a" * 64, "sealed": "b" * 96}
         invalid_payloads = [

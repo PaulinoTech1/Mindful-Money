@@ -47,7 +47,8 @@ server session, returning to the passkey screen when protection is enabled.
 
 ### WebAuthn configuration
 
-Development uses exactly `http://localhost:5000` with RP ID `localhost`.
+Development uses `http://localhost:5000` with RP ID `localhost`; the equivalent
+`http://127.0.0.1:5000` loopback origin is also accepted for local requests.
 WebAuthn credentials are scoped to the RP ID and origin: do not switch between
 `localhost` and `127.0.0.1` after enrollment. Configure deployments with:
 
@@ -83,7 +84,9 @@ expired, or consumed ceremonies produce the same generic error.
 
 Every unsafe `/api/` request (`POST`, `PUT`, `PATCH`, or `DELETE`) requires both
 the in-memory CSRF token from `GET /api/session` in `X-CSRF-Token` and an Origin
-that exactly equals `VAULT_ORIGIN` by scheme, hostname, and effective port.
+that exactly equals `VAULT_ORIGIN` by scheme, hostname, and effective port. The
+only exception is the `localhost`/`127.0.0.1` alias in development; production
+always requires an exact match.
 Missing and `null` origins, suffix tricks, paths, user-info, alternate ports,
 and cross-origin requests are rejected. There is no CORS wildcard or Host-based
 origin inference.
