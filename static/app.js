@@ -165,7 +165,7 @@ async function load(duringUnlock = false) {
   // Records written by older versions do not contain encrypted institution
   // metadata. Fetch it again, merge and re-seal it here in the browser so the
   // names become visible without ever adding plaintext columns server-side.
-  if (decrypted.some((t) => !t.bank || !t.account_label || !t.account_type)) {
+  if (decrypted.some((t) => !t.bank || !t.account_label || !t.account_type || t.bank === 'Wells Forclosure')) {
     const { transactions } = await api('/api/relay', { method: 'POST' });
     const metadata = new Map(transactions.map((t) => [t.account, {
       bank: t.bank, account_label: t.account_label, account_type: t.account_type,

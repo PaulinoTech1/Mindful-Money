@@ -124,7 +124,7 @@ that commits a successfully verified credential.
 Set any passphrase, click **Connect demo bank**. Six months of transactions get
 generated across a checking account, an IRA and a 401(k), encrypted in your
 browser, and stored as ciphertext. The demo banks are Scammers Inc, Wells
-Foreclose and DC Unc. The checking feed includes a fixed $423.23 monthly
+Foreclosure and DC Unc. The checking feed includes a fixed $423.23 monthly
 Fans Only subscription charge.
 
 No network access required. Chart.js and libsodium are vendored in

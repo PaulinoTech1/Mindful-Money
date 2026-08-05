@@ -125,7 +125,7 @@ async function load() {
 
   // Migrate older ciphertext in-browser when it predates encrypted account
   // metadata. The server still receives only re-sealed records.
-  if (decrypted.some((t) => !t.bank || !t.account_label || !t.account_type)) {
+  if (decrypted.some((t) => !t.bank || !t.account_label || !t.account_type || t.bank === 'Wells Forclosure')) {
     const { transactions } = await (await fetch('/api/relay', { method: 'POST' })).json();
     const metadata = new Map(transactions.map((t) => [t.account, {
       bank: t.bank, account_label: t.account_label, account_type: t.account_type,
