@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Operator-specific source checkout. This script never creates a secret file.
+: "${VAULT_SOURCE:?set VAULT_SOURCE to the reviewed source directory}"
+test -d "$VAULT_SOURCE"
+test ! -e /etc/vault/vault.env || { echo "Refusing to overwrite /etc/vault/vault.env" >&2; exit 1; }
+
+echo "Installing reviewed application files and protected state directories"
+install -d -o root -g root -m 0755 /opt/vault
+install -d -o root -g root -m 0700 /etc/vault
+install -d -o vault -g vault -m 0700 /var/lib/vault
+install -d -o vault -g vault -m 0700 /var/backups/vault
+install -o root -g root -m 0644 "$VAULT_SOURCE/app.py" /opt/vault/app.py
+install -o root -g root -m 0644 "$VAULT_SOURCE/fakebank.py" /opt/vault/fakebank.py
+install -o root -g root -m 0644 "$VAULT_SOURCE/requirements.txt" /opt/vault/requirements.txt
+install -d -o root -g root -m 0755 /opt/vault/static /opt/vault/static/vendor /opt/vault/deploy
+install -o root -g root -m 0644 "$VAULT_SOURCE/static/index.html" /opt/vault/static/index.html
+install -o root -g root -m 0644 "$VAULT_SOURCE/static/style.css" /opt/vault/static/style.css
+install -o root -g root -m 0644 "$VAULT_SOURCE/static/app.js" /opt/vault/static/app.js
+install -o root -g root -m 0644 "$VAULT_SOURCE/static/vendor/libsodium-sumo.js" /opt/vault/static/vendor/libsodium-sumo.js
+install -o root -g root -m 0644 "$VAULT_SOURCE/static/vendor/libsodium-wrappers.js" /opt/vault/static/vendor/libsodium-wrappers.js
+install -o root -g root -m 0644 "$VAULT_SOURCE/static/vendor/chart.umd.min.js" /opt/vault/static/vendor/chart.umd.min.js
+install -o root -g root -m 0644 "$VAULT_SOURCE/deploy/gunicorn.conf.py" /opt/vault/deploy/gunicorn.conf.py
+echo "Create /etc/vault/vault.env separately as root with mode 0600; no secret was generated or printed."

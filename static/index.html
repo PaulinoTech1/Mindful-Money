@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mindful Money — private finance</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="wordmark">Mindful Money</div>
+      <p>Your bank data, sealed to your device</p>
+    </div>
+
+    <div class="lock" id="lock" data-state="locked">
+      <span class="dot" aria-hidden="true"></span><span id="lockLabel">Locked</span>
+    </div>
+
+    <div class="sidebarStats" id="stats" hidden>
+      <div class="sideStat"><span>Records held</span><strong id="statRecords">0</strong></div>
+      <div class="sideStat"><span>Readable by server</span><strong id="statReadable">0</strong></div>
+      <div class="sideStat"><span>Your key</span><strong id="statKey">—</strong></div>
+    </div>
+
+    <div class="accounts" id="accounts" hidden>
+      <div class="sideSectionLabel">Accounts</div>
+      <div id="accountList"></div>
+    </div>
+
+    <div class="sidebarBottom">
+      <button class="sideButton syncButton" id="syncBtn" hidden>Refresh demo accounts</button>
+      <button class="sideButton" id="viewToggle" hidden>See what the server sees</button>
+      <button class="clearButton" id="resetBtn" hidden>Clear stored data</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="gate" id="passkeyGate" hidden>
+      <div class="eyebrow">Passkey protection enabled</div>
+      <h1>Sign in with passkey</h1>
+      <p class="lede">Authenticate access to the stored ciphertext first. Your passphrase will still be required afterward to decrypt the vault locally.</p>
+      <button class="primary" id="passkeyLoginBtn">Sign in with passkey</button>
+      <p class="hint" id="passkeyGateNote"></p>
+    </section>
+
+    <section class="gate" id="gate">
+      <h1>Set a passphrase</h1>
+      <p class="lede">Your key is derived from this passphrase in your browser and never sent anywhere. The server stores only what it cannot read. Forget the passphrase and the data is unrecoverable — that is the proof, not a bug.</p>
+      <div class="formRow">
+        <label class="srOnly" for="pass">Passphrase</label>
+        <input id="pass" type="password" placeholder="Any passphrase" autocomplete="off">
+        <button class="primary" id="unlockBtn">Unlock</button>
+      </div>
+      <p class="hint" id="gateNote">Loading cryptography…</p>
+    </section>
+
+    <section class="security card" id="security" hidden>
+      <div class="securityHeader">
+        <div><div class="eyebrow">Security</div><h2>Passkey protection</h2></div>
+        <strong id="passkeyState">Not enabled</strong>
+      </div>
+      <p>Your passkey will authenticate access to stored ciphertext. Your passphrase will still be required to decrypt the vault. Enabling this changes future access so both steps are necessary.</p>
+      <div class="securityActions">
+        <input id="passkeyLabel" maxlength="80" placeholder="Passkey label (for example, Laptop)">
+        <button class="primary" id="enablePasskeyBtn">Enable passkey protection</button>
+        <button class="primary" id="addPasskeyBtn" hidden>Add another passkey</button>
+        <button class="sideAction" id="lockVaultBtn">Lock vault</button>
+        <button class="sideAction" id="signOutBtn" hidden>Sign out</button>
+      </div>
+      <div id="passkeyList" class="passkeyList"></div>
+      <button class="dangerAction" id="disablePasskeyBtn" hidden>Disable passkey protection</button>
+      <p class="hint" id="securityNote"></p>
+    </section>
+
+    <section class="empty" id="empty" hidden>
+      <h1>Your Money is empty</h1>
+      <p class="lede">Connect the demo bank to fetch six months of transactions. They will be encrypted in your browser before anything is stored.</p>
+      <button class="primary" id="connectBtn">Connect demo bank</button>
+      <p class="hint" id="connectNote"></p>
+    </section>
+
+    <section class="dashboard" id="dash" hidden>
+      <header class="summary">
+        <div>
+          <div class="eyebrow" id="periodLabel">Latest month</div>
+          <div class="figure" id="figureNet">$0.00</div>
+          <p id="figureSub">Income covered spending this month.</p>
+        </div>
+        <div class="summaryStats">
+          <div><span>IN</span><strong class="credit" id="figureIn">$0.00</strong></div>
+          <div><span>OUT</span><strong class="debit" id="figureOut">$0.00</strong></div>
+        </div>
+      </header>
+
+      <section class="accountDashboard">
+        <div class="accountDashboardHeader">
+          <div>
+            <div class="eyebrow">Account overview</div>
+            <h2>Where the money lives</h2>
+          </div>
+          <p>Account-level totals computed on this device.</p>
+        </div>
+        <div class="accountCards" id="dashboardAccounts"></div>
+      </section>
+
+      <div class="chartGrid">
+        <article class="card cardWide"><h2>Income and spending by month</h2><div class="chart large"><canvas id="chMonthly"></canvas></div></article>
+        <article class="card"><h2>Where the money goes</h2><div class="chart medium"><canvas id="chCategory"></canvas></div></article>
+        <article class="card"><h2>Running balance</h2><div class="chart medium"><canvas id="chBalance"></canvas></div></article>
+        <article class="card cardWide"><h2>Most frequent merchants</h2><div class="chart merchants"><canvas id="chMerchants"></canvas></div></article>
+      </div>
+
+      <section class="ledger">
+        <h2>Recent activity</h2>
+        <table>
+          <thead><tr><th>Date</th><th>Merchant</th><th>Category</th><th class="right">Amount</th></tr></thead>
+          <tbody id="ledgerBody"></tbody>
+        </table>
+      </section>
+
+      <section class="assistant card" id="assistant">
+        <div class="assistantHeader">
+          <div>
+            <div class="eyebrow">Private local assistant</div>
+            <h2>Money Chat</h2>
+            <p>Summaries are computed in this browser from the decrypted transactions already in memory.</p>
+          </div>
+          <span class="privacyBadge">LOCAL ONLY</span>
+        </div>
+        <div class="chatMessages" id="chatMessages" aria-live="polite">
+          <div class="chatBubble bot">I can summarize your spending, income, categories, merchants, and monthly patterns—with the appropriate amount of judgment. No chat message or plaintext transaction is sent to the server.</div>
+        </div>
+        <div class="chatForm">
+          <label class="srOnly" for="chatInput">Money Chat</label>
+          <input id="chatInput" type="text" placeholder="How much did I spend last month?" autocomplete="off">
+          <button class="primary" id="chatSend">Ask</button>
+        </div>
+        <div class="chatSuggestions" aria-label="Suggested questions">
+          <button type="button" data-prompt="Give me a summary of my finances">Give me a summary</button>
+          <button type="button" data-prompt="Where did most of my money go?">Where did it go?</button>
+          <button type="button" data-prompt="Who are my most frequent merchants?">Top merchants</button>
+          <button type="button" data-prompt="Graph my monthly income and spending">Graph monthly flow</button>
+          <button type="button" data-prompt="Chart my spending by category">Chart categories</button>
+        </div>
+      </section>
+    </section>
+
+    <section class="serverview" id="serverview" hidden>
+      <header class="serverHeader">
+        <div class="eyebrow">Everything the operator can read</div>
+        <div class="serverFigure" id="svFigure">0 rows × 5 columns</div>
+        <p>Sealed records. No merchant, amount, date or category is recoverable from this table.</p>
+      </header>
+
+      <div class="chartGrid serverCharts">
+        <article class="card"><h2>Blob sizes — the one real leak</h2><div class="chart serverChart"><canvas id="chSizes"></canvas></div></article>
+        <article class="card"><h2>Records written per day</h2><div class="chart serverChart"><canvas id="chDays"></canvas></div></article>
+      </div>
+
+      <p class="callout">Ciphertext length hints at the length of the merchant name. Padding every blob to fixed 256-byte buckets closes it — about ten lines of code.</p>
+
+      <section class="ledger rawLedger">
+        <h2>Raw rows, straight from the table</h2>
+        <table>
+          <thead><tr><th>Blind_index</th><th>Sealed</th></tr></thead>
+          <tbody id="rawBody"></tbody>
+        </table>
+      </section>
+    </section>
+  </main>
+
+  <script src="/static/vendor/libsodium-sumo.js"></script>
+  <script src="/static/vendor/libsodium-wrappers.js"></script>
+  <script src="/static/vendor/chart.umd.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

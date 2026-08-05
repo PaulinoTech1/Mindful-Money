@@ -5,10 +5,118 @@ cannot read them. Fake bank data, real cryptography, charts computed entirely
 in your browser.
 
 ```bash
-pip install -r requirements.txt
-python3 app.py
-# open http://127.0.0.1:5000
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+python -m pip install -r requirements.txt
+python app.py
+# open http://localhost:5000
 ```
+
+## Authentication policy and passkey protection
+
+`VAULT_AUTH_POLICY` is explicit: `optional` or `required`. Development defaults
+to `optional` for the localhost prototype and optional mode may bind only to a
+loopback host. Production has no optional default and refuses to start unless
+`VAULT_AUTH_POLICY=required`. Required policy protects APIs independently of
+whether a credential happens to have been enrolled; an existing deployment
+must enroll its passkey before switching to required production policy.
+
+Passkeys are optional. A new or existing installation continues in the current
+passphrase-only mode until **Enable passkey protection** is chosen from inside
+an unlocked vault. A passkey authenticates the Flask session and authorizes
+access to stored ciphertext; it never derives or replaces the vault key. The
+passphrase remains in the browser, runs through the unchanged Argon2id key
+derivation, and decrypts records locally.
+
+After protection is enabled, future access has two distinct steps:
+
+1. **Sign in with passkey** to access the server's encrypted records.
+2. **Unlock vault with passphrase** to derive the encryption key locally.
+
+A passkey cannot recover a forgotten passphrase. Add a backup passkey from the
+Security section before the primary device is lost. The final passkey cannot be
+removed while enforcement is enabled. Disabling protection requires a current
+passkey-authenticated session, confirmation from the locally unlocked vault,
+and restores passphrase-only access.
+
+**Lock vault** clears derived keys, decrypted transactions, charts, dashboard,
+server view, and assistant content as far as JavaScript permits, but preserves
+the passkey session. **Sign out** performs the same lock and invalidates the
+server session, returning to the passkey screen when protection is enabled.
+
+### WebAuthn configuration
+
+Development uses exactly `http://localhost:5000` with RP ID `localhost`.
+WebAuthn credentials are scoped to the RP ID and origin: do not switch between
+`localhost` and `127.0.0.1` after enrollment. Configure deployments with:
+
+```bash
+VAULT_SECRET_KEY='a-long-random-deployment-secret'
+VAULT_RP_ID='vault.example.com'
+VAULT_ORIGIN='https://vault.example.com'
+VAULT_RP_NAME='Vault'
+VAULT_ENV='production'
+VAULT_AUTH_POLICY='required'
+```
+
+Production fails at startup when the secret, RP ID, origin, or required policy is missing, or
+when the origin is not HTTPS. It never derives these values from the request
+Host header.
+
+### Server-side authorization state
+
+The browser cookie contains only a random 256-bit opaque identifier. Its
+SHA-256 hash and the minimal session fields are stored in SQLite in
+`server_sessions`; no passphrase, encryption key, plaintext, or credential
+response is session data. Sessions have an eight-hour absolute lifetime and a
+30-minute idle lifetime by default. Logout revokes the row immediately, and
+successful registration, login, and policy transitions rotate both the
+identifier and CSRF token. Cookies are HttpOnly, SameSite=Strict, Path `/`, and
+Secure in production. Expired and revoked rows are cleaned opportunistically.
+
+WebAuthn challenges live in `webauthn_challenges`, are bound to the initiating
+server session and ceremony kind, expire after five minutes, and are consumed
+with a conditional SQLite update before the first verification attempt. A
+failed attempt consumes the challenge too, and all missing, mismatched,
+expired, or consumed ceremonies produce the same generic error.
+
+Every unsafe `/api/` request (`POST`, `PUT`, `PATCH`, or `DELETE`) requires both
+the in-memory CSRF token from `GET /api/session` in `X-CSRF-Token` and an Origin
+that exactly equals `VAULT_ORIGIN` by scheme, hostname, and effective port.
+Missing and `null` origins, suffix tricks, paths, user-info, alternate ports,
+and cross-origin requests are rejected. There is no CORS wildcard or Host-based
+origin inference.
+
+### Ciphertext and resource limits
+
+`POST /api/records` accepts only `application/json` with exactly this shape:
+
+```json
+{"records":[{"blind_index":"64 lowercase hex characters","sealed":"lowercase even-length hex"}]}
+```
+
+The whole batch is validated before an atomic upsert. Unknown fields,
+duplicates, malformed blind indexes, and ciphertext outside 96–16384 hex
+characters are rejected without partial writes. Defaults are an 8 MiB request
+and JSON limit, 1,000 records per batch, and 100,000 total stored records. Byte
+counts are computed from decoded hex on the server.
+
+Configuration overrides are `VAULT_SESSION_TTL`, `VAULT_SESSION_IDLE_TTL`,
+`VAULT_CHALLENGE_TTL`, `VAULT_MAX_REQUEST_BYTES`,
+`VAULT_MAX_JSON_OBJECT_BYTES`, `VAULT_MAX_RECORDS_PER_BATCH`,
+`VAULT_MAX_TOTAL_RECORDS`, `VAULT_MIN_SEALED_HEX_LENGTH`, and
+`VAULT_MAX_SEALED_HEX_LENGTH`. `VAULT_HOST` and `VAULT_PORT` control the dev
+listener; optional policy rejects a non-loopback host.
+
+The database migrates in place on first access using idempotent `CREATE TABLE
+IF NOT EXISTS` statements. Existing `records` rows and their encryption format
+are not rewritten. The migration adds one `vault_identity` row for this
+prototype's single local vault and a `passkey_credentials` table containing
+credential IDs, public keys, counters, transports, backup/device state, labels,
+and timestamps, plus server session and challenge tables. Existing record rows
+and ciphertext are never rewritten. `passkey_required` changes to true only in the same transaction
+that commits a successfully verified credential.
 
 Set any passphrase, click **Connect demo bank**. Six months of transactions get
 generated across a checking account, an IRA and a 401(k), encrypted in your
@@ -24,9 +132,32 @@ out its own crypto library.
 ## Tests
 
 ```bash
-pip install -r requirements.txt
-python3 test_demo.py        # 29 tests, ~15s, no browser needed
+python -m pip install -r requirements.txt
+python test_demo.py         # unit, crypto, privacy, WebAuthn/session tests
+python test_browser.py      # real Chromium UI and virtual WebAuthn
 ```
+
+## Production deployment
+
+Production uses Gunicorn behind nginx over a protected Unix socket, never the
+Flask development server or a public Gunicorn TCP listener. See
+[`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md) for the dedicated service account,
+TLS, exact-origin WebAuthn configuration, filesystem permissions, systemd
+confinement, persistent rate limits, backup/restore, upgrades, and validation.
+
+Flask emits a strict CSP (`default-src 'none'`, self-only scripts/styles/connect,
+no inline handlers/styles, narrow `wasm-unsafe-eval` for vendored libsodium),
+application security headers, sensitive-response `no-store`, and production
+HSTS. `VAULT_CSP_MODE=report-only|enforce` selects the CSP header; production
+defaults to enforcement. `VAULT_TRUST_PROXY=1` trusts exactly one controlled
+proxy hop and must never be used with directly exposed Gunicorn.
+
+Persistent SQLite rate-limit defaults are: general API 120/minute, session
+60/minute, login options 20/5 minutes, login verification 10/10 minutes,
+registration 10/hour, uploads 10/minute, relay 6/minute, record deletion
+3/hour, passkey administration 5/hour, and logout 30/minute. Corresponding
+`VAULT_RATE_*` environment variables adjust counts; window durations remain
+fixed and should be changed only through reviewed code.
 
 Covers the fake bank feed, the crypto, the API contract, and the privacy
 guarantee. `BrowserSim` in that file reproduces `static/app.js` exactly — the
@@ -37,8 +168,10 @@ first and loudly.
 
 ```bash
 pip install playwright && python3 -m playwright install chromium
-python3 test_browser.py             # 37 checks against the real UI
-python3 test_browser.py --headed    # watch it drive the browser
+python -m pip install playwright
+python -m playwright install chromium
+python test_browser.py             # includes Chromium virtual WebAuthn
+python test_browser.py --headed    # watch it drive the browser
 ```
 
 Exercises the actual JavaScript: real Argon2id in WASM, real Chart.js
@@ -102,7 +235,9 @@ personally triggered — never in a database, a queue, or a background worker.
 The cost: sync happens when the app is open, not at 3am. For a finance tracker
 that's an acceptable trade, and it makes the core claim literally true.
 
-`app.py` imports no crypto library at all. It has no keys and needs none.
+`app.py` has no vault encryption keys. Its maintained `webauthn` dependency
+parses authenticator data and verifies WebAuthn registrations and signatures;
+that public-key authentication is separate from transaction encryption.
 
 ## What the server genuinely knows
 
@@ -145,15 +280,26 @@ weakening the encryption.
 1. **Fixed salts** in `app.js` (`DEMO_SALT_ENC`, `DEMO_SALT_IDX`) so a reload
    re-derives the same key without a signup flow. Real builds generate random
    salts per user and store them next to the public key.
-2. **No authentication.** Any browser hitting this server gets every record.
-   They're unreadable without the passphrase, but record counts and timing
-   leak. Add sessions.
+2. **Optional authentication.** Until passkey protection is explicitly enabled,
+   any browser reaching this single-vault server can fetch its ciphertext and
+metadata. Optional mode preserves compatibility; it does not protect users
+who have not enabled it, and is deliberately restricted to loopback development.
 3. **No recovery.** Forget the passphrase, lose the data. That's the honest
    consequence of the design; a real build adds a 24-word recovery phrase
    wrapping a second copy of the private key.
 4. **Aggregator tokens** aren't wrapped here because there aren't any. When
    `fakebank` becomes Plaid, seal the access token under a KMS key.
 5. **Flask dev server.** Obviously.
+
+Additional threat-model limits remain: this is a single-vault prototype with
+no account recovery or multi-user isolation; a compromised origin can replace
+the JavaScript and steal the passphrase or plaintext; XSS runs with the user's
+session; ciphertext count, timing, and length remain visible to the server once
+authenticated (and always in passphrase-only mode); Flask's signed cookie does
+and cloned/non-counter authenticators can limit sign-counter detection. Passkey
+backup security depends on the platform provider. Use HTTPS, a hardened CSP,
+trusted static deployment, rate limits,
+and operational monitoring before production use.
 
 ## Next
 

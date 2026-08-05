@@ -16,9 +16,9 @@ import random
 
 SEED = 20260802
 
-# The account identifier is what gets encrypted with each transaction. The
-# bank and account type are therefore visible only after the browser unlocks
-# the vault, just like the merchant and amount.
+# Account metadata is copied into each transaction so the browser seals it
+# together with the merchant and amount. The UI has no plaintext bank-name
+# lookup table to leak before the vault is unlocked.
 ACCOUNTS = {
     "demo_checking": {"bank": "Scammers Inc", "label": "Everyday checking", "type": "Checking"},
     "demo_ira": {"bank": "Wells Foreclose", "label": "Traditional IRA", "type": "IRA"},
@@ -95,6 +95,7 @@ def generate(months: int = 6) -> list[dict]:
             external_id = f"demo_fans_only_{date:%Y%m}"
         else:
             external_id = f"demo_{sequence:05d}" if account == "demo_checking" else f"{account}_{sequence:05d}"
+        meta = ACCOUNTS[account]
         rows.append(
             {
                 "id": external_id,
@@ -103,6 +104,9 @@ def generate(months: int = 6) -> list[dict]:
                 "date": date.isoformat(),
                 "pending": False,
                 "account": account,
+                "bank": meta["bank"],
+                "account_label": meta["label"],
+                "account_type": meta["type"],
             }
         )
         if not (account == "demo_checking" and merchant == "Fans Only"):

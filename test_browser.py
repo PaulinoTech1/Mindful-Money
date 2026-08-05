@@ -14,6 +14,7 @@ Add --headed to watch it happen in a visible window.
 from __future__ import annotations
 
 import socket
+import os
 import subprocess
 import sys
 import time
@@ -72,14 +73,16 @@ def main() -> int:
     db = HERE / "e2e-test.db"
     db.unlink(missing_ok=True)
 
+    server_env = os.environ.copy()
+    server_env.update({"VAULT_ORIGIN": f"http://localhost:{port}", "VAULT_RP_ID": "localhost", "VAULT_SECRET_KEY": "browser-test-secret-not-for-production", "VAULT_CSP_MODE": "enforce"})
     env_server = subprocess.Popen(
         [sys.executable, "-c",
          f"import app; app.DB = __import__('pathlib').Path(r'{db}'); "
          f"app.app.run(port={port})"],
-        cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=HERE, env=server_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
-    base = f"http://127.0.0.1:{port}"
+    base = f"http://localhost:{port}"
     for _ in range(50):
         try:
             socket.create_connection(("127.0.0.1", port), 0.2).close()
@@ -101,20 +104,30 @@ def main() -> int:
 
             errors: list[str] = []
             requests: list[str] = []
+            request_bodies: list[str] = []
             page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
             page.on("pageerror", lambda e: errors.append(f"PAGEERROR: {e}"))
-            page.on("request", lambda r: requests.append(r.url))
+            page.on("request", lambda r: (requests.append(r.url), request_bodies.append(r.post_data or "")))
 
             # --- unlock -------------------------------------------------
             print("  Unlock")
             page.goto(base, wait_until="networkidle")
             check(page.is_visible("#gate"), "passphrase gate shown on first load")
+            missing_csrf = page.evaluate("() => fetch('/api/relay', {method: 'POST'}).then(r => r.status)")
+            check(missing_csrf == 403, "unsafe browser request without CSRF is rejected")
+            csrf = page.evaluate("() => CSRF")
+            hostile = page.request.post(f"{base}/api/relay", headers={
+                "Origin": "http://localhost.evil", "X-CSRF-Token": csrf,
+            })
+            check(hostile.status == 403, "unsafe request with hostile Origin is rejected")
+            errors.clear()  # Chromium logs the deliberately rejected raw fetch as a resource error.
             page.screenshot(path=SHOTS / "1-unlock.png")
 
             t0 = time.time()
             page.fill("#pass", PASSPHRASE)
             page.click("#unlockBtn")
             page.wait_for_selector("#empty:not([hidden]), #dash:not([hidden])", timeout=30000)
+            page.wait_for_function("() => document.getElementById('lock').dataset.state === 'open'", timeout=30000)
             kdf_ms = int((time.time() - t0) * 1000)
 
             check(page.get_attribute("#lock", "data-state") == "open", "vault reports unlocked")
@@ -143,8 +156,9 @@ def main() -> int:
             check("Scammers Inc" in page.inner_text("#dashboardAccounts"), "dashboard visual includes checking bank")
             check("Wells Foreclose" in page.inner_text("#dashboardAccounts") and "DC Unc" in page.inner_text("#dashboardAccounts"), "dashboard visual includes both investment banks")
             page.click("#syncBtn")
+            page.wait_for_function("() => !document.getElementById('syncBtn').disabled", timeout=60000)
             page.wait_for_function(
-                f"document.getElementById('statRecords').textContent === '{records}'",
+                f"() => document.getElementById('statRecords').textContent === '{records}'",
                 timeout=60000,
             )
             check(int(page.inner_text("#statRecords")) == records, "refreshing accounts does not duplicate records")
@@ -172,20 +186,20 @@ def main() -> int:
 
             # --- local assistant ---------------------------------------
             print("\n  Local assistant")
-            before_chat_requests = len(requests)
+            before_chat_requests = list(requests)
             page.fill("#chatInput", "Give me a summary of my finances")
             page.click("#chatSend")
             page.wait_for_function(
-                "document.querySelectorAll('#chatMessages .chatBubble').length >= 3"
+                "() => document.querySelectorAll('#chatMessages .chatBubble').length >= 3"
             )
             chat_text = page.inner_text("#chatMessages")
             check("Across" in chat_text, "assistant summarizes decrypted transactions locally")
             check("LOCAL ONLY" in page.inner_text("#assistant"), "assistant shows its local-only privacy boundary")
-            check(len(requests) == before_chat_requests, "chat question made no network request")
+            check(requests == before_chat_requests, "chat question made no network request", str(requests[len(before_chat_requests):]))
             page.fill("#chatInput", "How much did I spend at Fans Only last month?")
             page.click("#chatSend")
             page.wait_for_function(
-                "document.querySelectorAll('#chatMessages .chatBubble').length >= 5"
+                "() => document.querySelectorAll('#chatMessages .chatBubble').length >= 5"
             )
             check("$423.23" in page.inner_text("#chatMessages"), "assistant reports the exact Fans Only charge")
             page.fill("#chatInput", "Graph my spending by category")
@@ -195,9 +209,9 @@ def main() -> int:
             check(graph_id and canvas_has_content(page, graph_id), "assistant renders a local spending graph")
             page.fill("#chatInput", "Calculate my average and median expense")
             page.click("#chatSend")
-            page.wait_for_function("document.querySelector('#chatMessages').innerText.includes('Mathematical analysis')")
+            page.wait_for_function("() => document.querySelector('#chatMessages').innerText.includes('Mathematical analysis')")
             check("Mathematical analysis" in page.inner_text("#chatMessages"), "assistant provides local mathematical analysis")
-            check(len(requests) == before_chat_requests, "charts and math made no network request")
+            check(requests == before_chat_requests, "charts and math made no network request", str(requests[len(before_chat_requests):]))
             page.screenshot(path=SHOTS / "2-dashboard.png", full_page=True)
 
             # --- server view --------------------------------------------
@@ -234,6 +248,73 @@ def main() -> int:
                 int(page.inner_text("#statRecords")) == records,
                 "same passphrase re-derives the key and reopens the data",
             )
+
+            # --- optional passkeys (Chromium virtual authenticator) ----
+            print("\n  Optional passkeys")
+            cdp = page.context.new_cdp_session(page)
+            cdp.send("WebAuthn.enable", {"enableUI": False})
+            authenticator = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+                "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
+                "hasUserVerification": True, "isUserVerified": True,
+                "automaticPresenceSimulation": True,
+            }})["authenticatorId"]
+            page.fill("#passkeyLabel", "Test laptop")
+            page.click("#enablePasskeyBtn")
+            try:
+                page.wait_for_function("() => document.querySelector('#passkeyState').innerText === 'Enabled'", timeout=15000)
+            except Exception:
+                print("    passkey error:", page.inner_text("#securityNote"))
+                raise
+            page.wait_for_function("() => document.querySelectorAll('#passkeyList .passkeyItem').length === 1", timeout=15000)
+            check("Test laptop" in page.inner_text("#passkeyList"), "optional passkey enrollment succeeds", page.inner_text("#passkeyList"))
+
+            page.reload(wait_until="networkidle")
+            check(page.is_visible("#gate"), "authenticated reload proceeds to passphrase stage")
+            page.click("#signOutBtn") if page.is_visible("#signOutBtn") else None
+            if not page.is_visible("#passkeyGate"):
+                # A reload is authenticated but locked; explicitly expire it through the API.
+                page.evaluate("() => signOut()")
+            page.wait_for_selector("#passkeyGate:not([hidden])")
+            check(page.is_visible("#passkeyGate"), "sign out returns to passkey screen")
+            page.click("#passkeyLoginBtn")
+            page.wait_for_selector("#gate:not([hidden])", timeout=15000)
+            check("Passkey accepted" in page.inner_text("#gateNote"), "passkey login precedes vault unlock")
+            page.fill("#pass", "wrong passphrase")
+            page.click("#unlockBtn")
+            page.wait_for_function("() => document.querySelector('#gateNote').innerText.includes('Incorrect')", timeout=30000)
+            check(page.is_visible("#gate"), "wrong passphrase still fails after valid passkey")
+            page.fill("#pass", PASSPHRASE); page.click("#unlockBtn")
+            page.wait_for_selector("#dash:not([hidden])", timeout=30000)
+            cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": authenticator})
+            authenticator = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+                "protocol": "ctap2", "transport": "usb", "hasResidentKey": True,
+                "hasUserVerification": True, "isUserVerified": True,
+                "automaticPresenceSimulation": True,
+            }})["authenticatorId"]
+            page.fill("#passkeyLabel", "Backup key")
+            page.click("#addPasskeyBtn")
+            try:
+                page.wait_for_function("() => document.querySelectorAll('#passkeyList .passkeyItem').length === 2", timeout=15000)
+            except Exception:
+                print("    second passkey error:", page.inner_text("#securityNote"), page.inner_text("#passkeyList"))
+                raise
+            check(len(page.query_selector_all("#passkeyList .passkeyItem")) == 2, "a second passkey can be added")
+            page.once("dialog", lambda dialog: dialog.accept("Renamed laptop"))
+            page.click("#passkeyList [data-rename]")
+            page.wait_for_function("() => document.querySelector('#passkeyList').innerText.includes('Renamed laptop')")
+            check("Renamed laptop" in page.inner_text("#passkeyList"), "passkey rename succeeds")
+            page.click("#passkeyList [data-remove]")
+            page.wait_for_function("() => document.querySelectorAll('#passkeyList .passkeyItem').length === 1")
+            check(len(page.query_selector_all("#passkeyList .passkeyItem")) == 1, "passkey removal succeeds")
+            page.click("#lockVaultBtn")
+            check(page.is_visible("#gate") and not page.is_visible("#passkeyGate"), "lock clears vault but preserves passkey session")
+            page.fill("#pass", PASSPHRASE); page.click("#unlockBtn"); page.wait_for_selector("#dash:not([hidden])", timeout=30000)
+            page.on("dialog", lambda dialog: dialog.accept())
+            page.click("#disablePasskeyBtn")
+            page.wait_for_function("() => document.querySelector('#passkeyState').innerText === 'Not enabled'")
+            check(page.is_visible("#security"), "disabling restores passphrase-only mode")
+            check(all(PASSPHRASE not in body for body in request_bodies), "passphrase never appears in network request bodies")
+            cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": authenticator})
 
             # --- mobile --------------------------------------------------
             print("\n  Responsive")

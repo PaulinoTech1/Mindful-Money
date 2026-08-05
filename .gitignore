@@ -1,0 +1,9 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+__pycache__/
+*.pyc
+deploy/vault.env
+e2e-test.db*
