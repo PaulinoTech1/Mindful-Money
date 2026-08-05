@@ -220,6 +220,16 @@ def main() -> int:
             page.wait_for_function("() => document.querySelector('#chatMessages').innerText.includes('Mathematical analysis')")
             check("Mathematical analysis" in page.inner_text("#chatMessages"), "assistant provides local mathematical analysis")
             check(requests == before_chat_requests, "charts and math made no network request", str(requests[len(before_chat_requests):]))
+            page.fill("#chatInput", "Make a projection")
+            page.click("#chatSend")
+            page.wait_for_function("() => document.querySelector('#chatMessages').innerText.includes('next month or the next three months')")
+            check(len(page.query_selector_all("#chatMessages .chatFollowUps button")) >= 2, "assistant asks a clickable follow-up question")
+            page.get_by_role("button", name="Next 3 months", exact=True).last.click()
+            page.wait_for_function("() => document.querySelector('#chatMessages').innerText.includes('robust Theil')")
+            check("historical residual variability" in page.inner_text("#chatMessages"), "assistant projects cash flow with an uncertainty caveat")
+            page.get_by_role("button", name="Project categories", exact=True).last.click()
+            page.wait_for_function("() => document.querySelector('#chatMessages').innerText.includes('Next-month category projection')")
+            check(requests == before_chat_requests, "follow-ups and projections make no network request", str(requests[len(before_chat_requests):]))
 
             # --- encrypted transaction editing ------------------------
             expense_row = page.locator("#ledgerBody tr").filter(has=page.locator("td.num:not(.credit)")).first

@@ -531,6 +531,10 @@ class TestSecurityIncrement(ServerCase):
         self.assertIn('id="editFraudStatus"', html)
         self.assertIn("async function setFraudStatus", runtime)
         self.assertIn("marked as fraud by you", runtime)
+        self.assertIn("function theilSenForecast", runtime)
+        self.assertIn("function conversationalAnswer", runtime)
+        self.assertIn("historical residual variability", runtime)
+        self.assertIn("Project cash flow", html)
         browser_test = (Path(__file__).parent / "test_browser.py").read_text()
         self.assertIn("page.goto(base", browser_test)
 

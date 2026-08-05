@@ -520,6 +520,7 @@ function localAccountReport() {
 let CHAT_CHART_INDEX = 0;
 const CHAT_CHARTS = {};
 let LAST_ATTITUDE = -1;
+let CHAT_CONTEXT = { pending: '', lastTopic: '', projectionHorizon: 1 };
 
 const CHAT_ATTITUDE = [
   'I did the arithmetic. You supplied the plot twist.',
@@ -548,6 +549,100 @@ function chatAttitude(question) {
   if (choices.length > 1 && index === LAST_ATTITUDE) index = (index + 1) % choices.length;
   LAST_ATTITUDE = index;
   return choices[index];
+}
+
+function theilSenForecast(values, horizon) {
+  if (values.length < 3) return null;
+  const slopes = [];
+  for (let i = 0; i < values.length; i++) {
+    for (let j = i + 1; j < values.length; j++) slopes.push((values[j] - values[i]) / (j - i));
+  }
+  const slope = median(slopes);
+  const intercept = median(values.map((value, index) => value - slope * index));
+  const residuals = values.map((value, index) => Math.abs(value - (intercept + slope * index)));
+  const variability = Math.max(median(residuals) * 1.4826, median(values) * 0.05);
+  return Array.from({ length: horizon }, (_, step) => {
+    const estimate = Math.max(0, intercept + slope * (values.length + step));
+    return { estimate, low: Math.max(0, estimate - 1.28 * variability), high: estimate + 1.28 * variability };
+  });
+}
+
+const futureMonthLabel = (offset) => {
+  const date = new Date();
+  date.setUTCDate(1); date.setUTCMonth(date.getUTCMonth() + offset);
+  return date.toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+};
+
+function localProjectionReport(horizon = 1, scope = 'cashflow') {
+  const complete = localCompleteMonths();
+  if (complete.length < 3) return { text: 'I need at least three complete months before making a projection. Even I have standards.', followUps: [] };
+  const months = complete.slice(-12);
+  if (scope === 'category') {
+    const categories = byCategory().slice(0, 3).map(([name]) => name);
+    const lines = categories.map((category) => {
+      const values = months.map(([key]) => TXNS.filter((t) => reportable(t) && t.amount > 0 && t.date.startsWith(key)).reduce((sum, txn) => {
+        if (txn.splits.length) return sum + txn.splits.filter((part) => part.category === category).reduce((partSum, part) => partSum + part.amount, 0);
+        return sum + (txn.category === category ? txn.amount : 0);
+      }, 0));
+      const forecast = theilSenForecast(values, 1)[0];
+      return `${category}: ${money(forecast.estimate)} (historical-variability range ${money(forecast.low)}–${money(forecast.high)})`;
+    });
+    return { text: `Next-month category projection from ${months.length} complete months:\n${lines.join('\n')}\nThis is a habit-based estimate, not a promise from the universe.`, followUps: [
+      { label: 'Project cash flow', prompt: 'Project my cash flow for the next 3 months' },
+      { label: 'Show category chart', prompt: 'Chart my spending by category' },
+    ] };
+  }
+  const income = theilSenForecast(months.map(([, values]) => values.in), horizon);
+  const spending = theilSenForecast(months.map(([, values]) => values.out), horizon);
+  const lines = Array.from({ length: horizon }, (_, index) => {
+    const net = income[index].estimate - spending[index].estimate;
+    return `${futureMonthLabel(index + 1)}: income ${money(income[index].estimate)}, spending ${money(spending[index].estimate)} (${money(spending[index].low)}–${money(spending[index].high)}), net ${money(net, true)}`;
+  });
+  return { text: `Projection using a robust Theil–Sen trend across ${months.length} complete months:\n${lines.join('\n')}\nThe range reflects historical residual variability; it is not a guarantee or a confidence interval from a large sample.`, followUps: [
+    { label: 'Project categories', prompt: 'Project my category spending next month' },
+    { label: horizon === 1 ? 'Next 3 months' : 'Next month only', prompt: horizon === 1 ? 'Project my cash flow for the next 3 months' : 'Project next month' },
+  ] };
+}
+
+function conversationalAnswer(question) {
+  const q = question.toLowerCase().trim();
+  const affirmative = /^(yes|yeah|yep|sure|please|do it)\b/.test(q);
+  if (CHAT_CONTEXT.pending === 'summary_followup' && affirmative) {
+    CHAT_CONTEXT.pending = 'projection_horizon';
+    return { text: 'Fine. How far ahead—next month or the next three months?', noAttitude: true, followUps: [
+      { label: 'Next month', prompt: 'Project next month' }, { label: 'Next 3 months', prompt: 'Project the next 3 months' },
+    ] };
+  }
+  if (CHAT_CONTEXT.pending === 'projection_horizon' && /(next month|one month|1 month|three|3 months)/.test(q)) {
+    const horizon = /(three|3 months)/.test(q) ? 3 : 1;
+    CHAT_CONTEXT = { pending: 'projection_scope', lastTopic: 'projection', projectionHorizon: horizon };
+    return localProjectionReport(horizon);
+  }
+  if (CHAT_CONTEXT.pending === 'projection_scope' && /^(category|categories|category breakdown)/.test(q)) {
+    CHAT_CONTEXT.pending = '';
+    return localProjectionReport(1, 'category');
+  }
+  if (/(project|projection|forecast|predict|next few months|future spending|what will.*spend)/.test(q)) {
+    const scope = /categor/.test(q) ? 'category' : 'cashflow';
+    const hasHorizon = /(next month|one month|1 month|three|3 months)/.test(q);
+    if (!hasHorizon && scope === 'cashflow') {
+      CHAT_CONTEXT.pending = 'projection_horizon';
+      return { text: 'I can project from your completed monthly habits. Do you want next month or the next three months?', noAttitude: true, followUps: [
+        { label: 'Next month', prompt: 'Project next month' }, { label: 'Next 3 months', prompt: 'Project the next 3 months' },
+      ] };
+    }
+    const horizon = /(three|3 months)/.test(q) ? 3 : 1;
+    CHAT_CONTEXT = { pending: 'projection_scope', lastTopic: 'projection', projectionHorizon: horizon };
+    return localProjectionReport(horizon, scope);
+  }
+  const answer = localAssistantAnswer(question);
+  if (q.includes('summary') || q.includes('overview') || q.includes('how am i doing')) {
+    CHAT_CONTEXT = { pending: 'summary_followup', lastTopic: 'summary', projectionHorizon: 1 };
+    return { text: `${typeof answer === 'string' ? answer : answer.text}\n\nWant me to project where these habits lead next?`, chart: typeof answer === 'string' ? null : answer.chart, followUps: [
+      { label: 'Yes, project it', prompt: 'Yes' }, { label: 'Category trend', prompt: 'Project my category spending next month' },
+    ] };
+  }
+  return answer;
 }
 
 function localMathReport() {
@@ -654,7 +749,7 @@ function localAssistantAnswer(question) {
     return 'Hello. I can summarize spending, income, categories, merchants, monthly patterns, and net cash flow. I bring arithmetic, opinions, and absolutely no chill. Everything stays in this browser.';
   }
   if (q.includes('help') || q.includes('what can')) {
-    return 'Try “give me a summary,” “where did most of my money go?”, “how much did I spend last month?”, “what was my income?”, or “who are my most frequent merchants?” I have numbers, not clairvoyance.';
+    return 'Try “give me a summary,” “where did most of my money go?”, “project my cash flow,” “how much did I spend last month?”, or “who are my most frequent merchants?” I have numbers, not clairvoyance.';
   }
   if (/(chart|graph|plot|visuali[sz]|trend|doughnut|bar graph)/.test(q)) {
     return localGraphicAnswer(question);
@@ -731,6 +826,7 @@ function appendChatMessage(role, text) {
   bubble.className = `chatBubble ${role}`;
   bubble.textContent = text;
   const chart = arguments[2];
+  const followUps = arguments[3] || [];
   if (chart) {
     bubble.classList.add('hasChart');
     const graph = document.createElement('div');
@@ -740,6 +836,17 @@ function appendChatMessage(role, text) {
     canvas.setAttribute('aria-label', 'Locally generated financial chart');
     graph.appendChild(canvas);
     bubble.appendChild(graph);
+  }
+  if (followUps.length) {
+    const choices = document.createElement('div');
+    choices.className = 'chatFollowUps';
+    for (const followUp of followUps) {
+      const button = document.createElement('button');
+      button.type = 'button'; button.textContent = followUp.label;
+      button.addEventListener('click', () => { $('chatInput').value = followUp.prompt; askChat(); });
+      choices.appendChild(button);
+    }
+    bubble.appendChild(choices);
   }
   $('chatMessages').appendChild(bubble);
   if (chart) CHAT_CHARTS[chart.id] = new Chart($(chart.id), chart.config);
@@ -752,9 +859,10 @@ function askChat() {
   if (!question) return;
   appendChatMessage('user', question);
   input.value = '';
-  const answer = localAssistantAnswer(question);
+  const answer = conversationalAnswer(question);
   const text = typeof answer === 'string' ? answer : answer.text;
-  appendChatMessage('bot', `${text}\n\n${chatAttitude(question)}`, typeof answer === 'string' ? null : answer.chart);
+  const attitude = typeof answer === 'string' || !answer.noAttitude ? `\n\n${chatAttitude(question)}` : '';
+  appendChatMessage('bot', `${text}${attitude}`, typeof answer === 'string' ? null : answer.chart, typeof answer === 'string' ? [] : answer.followUps);
   input.focus();
 }
 
@@ -1090,6 +1198,7 @@ async function refreshSecurity() {
 function lockVault() {
   if (KEYS) { KEYS.privateKey?.fill(0); KEYS.indexKey?.fill(0); KEYS.publicKey?.fill(0); }
   KEYS = null; TXNS = [];
+  CHAT_CONTEXT = { pending: '', lastTopic: '', projectionHorizon: 1 };
   Object.values(CHARTS).forEach((c) => c.destroy()); CHARTS = {};
   Object.values(CHAT_CHARTS).forEach((c) => c.destroy());
   $('ledgerBody').textContent = ''; $('accountList').textContent = ''; $('dashboardAccounts').textContent = ''; $('chatMessages').textContent = ''; $('rawBody').textContent = '';

@@ -254,6 +254,9 @@ td.num { color: #233d54; text-align: right; }
 .chatGraph { height: 225px; margin-top: 10px; position: relative; width: 100%; }
 .chatBubble.bot { align-self: flex-start; background: linear-gradient(145deg, rgba(235,248,255,.95), rgba(211,235,249,.88)); border: 1px solid #b4d2e5; color: #294f70; box-shadow: inset 0 1px rgba(255,255,255,.78); }
 .chatBubble.user { align-self: flex-end; background: linear-gradient(180deg, #4da0ce, #1a659a); border: 1px solid #155582; color: #fff; box-shadow: inset 0 1px rgba(255,255,255,.35), 0 1px 3px rgba(35,84,119,.2); text-shadow: 0 1px 1px #12466f; }
+.chatFollowUps { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chatFollowUps button { background: #fff; border: 1px solid #73a8ca; border-radius: 14px; color: #225f89; cursor: pointer; font-size: 11px; font-weight: 600; padding: 5px 9px; }
+.chatFollowUps button:hover, .chatFollowUps button:focus-visible { background: #dceffa; outline: 2px solid rgba(34,95,137,.2); }
 .chatForm { display: flex; gap: 9px; }
 .chatForm input { flex: 1; width: auto; }
 .chatSuggestions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }

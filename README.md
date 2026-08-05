@@ -290,6 +290,21 @@ suppressed from future flags while remaining part of the legitimate baseline;
 user-confirmed fraud stays visible and is excluded from future baselines. The
 review state is stored only inside the transaction ciphertext.
 
+## Local conversational projections
+
+Money Chat keeps short-lived conversation context only in browser memory. It
+can ask clarification questions, interpret a contextual "yes", and offer
+clickable follow-up choices. Projection requests use reportable transactions
+from complete months only, so partial-month rent or paycheck timing does not
+distort the baseline.
+
+Cash-flow and category projections use a robust Theil-Sen month-level trend.
+Displayed ranges are based on median absolute historical residuals and are
+explicitly described as historical variability, not a guaranteed outcome or a
+large-sample confidence interval. At least three complete months are required.
+Transfers and user-excluded transactions remain outside the model. Questions,
+context, projections, and results never leave the browser.
+
 ## Files
 
 | File | Role |
