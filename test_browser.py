@@ -177,6 +177,7 @@ def main() -> int:
 
             rows = page.query_selector_all("#ledgerBody tr")
             check(len(rows) == 14, f"ledger lists {len(rows)} recent transactions")
+            check("Changes are encrypted in your browser" in page.inner_text(".ledgerEditNote"), "ledger explains encrypted editing")
             check(
                 len(page.query_selector_all("#ledgerBody .tag")) == len(rows),
                 "every row categorized on-device",

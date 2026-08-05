@@ -177,7 +177,8 @@ input:focus { border-color: #4d9bd0; outline: 2px solid rgba(45,118,173,.18); }
 .chart.medium { height: 220px; }
 .chart.merchants { height: 285px; }
 .ledger { margin-top: 33px; }
-.ledger h2 { margin-bottom: 13px; }
+.ledger h2 { margin-bottom: 6px; }
+.ledgerEditNote { color: #4c708b; font-size: 12px; line-height: 1.45; margin: 0 0 15px; max-width: 820px; }
 table { border-collapse: collapse; table-layout: fixed; width: 100%; }
 th { border-bottom: 1px solid #b6d1e3; font-weight: 600; padding: 0 0 9px; text-align: left; }
 td { border-bottom: 1px solid #c6dce9; color: #214663; overflow: hidden; padding: 9px 0; text-overflow: ellipsis; white-space: nowrap; }
@@ -190,7 +191,8 @@ td.date { color: #5e819e; font-family: monospace; font-size: 12px; }
 .right { text-align: right; }
 td.num { color: #233d54; text-align: right; }
 .tag { border-radius: 2px; display: inline-block; font-size: 11px; padding: 2px 6px; }
-.editTransaction { background: transparent; border: 0; color: var(--blue); cursor: pointer; font-weight: 600; padding: 3px; }
+.editTransaction { background: linear-gradient(180deg, #4da8dc, #17699f); border: 1px solid #0f5787; border-radius: 4px; color: #fff; cursor: pointer; font-size: 11px; font-weight: 700; padding: 5px 9px; box-shadow: inset 0 1px rgba(255,255,255,.35), 0 1px 2px rgba(18,70,105,.22); text-shadow: 0 1px #104d76; }
+.editTransaction:hover, .editTransaction:focus-visible { background: linear-gradient(180deg, #67b9e6, #0f5b91); outline: 2px solid rgba(23,105,159,.25); outline-offset: 1px; }
 .transactionState { color: #8a5b31; display: block; font-size: 10px; margin-top: 3px; }
 .transactionEditor { background: #f4fbff; border: 1px solid #73a8ca; border-radius: 8px; color: var(--ink); max-height: 90vh; max-width: 570px; padding: 22px; width: calc(100% - 40px); box-shadow: 0 18px 60px rgba(7,42,68,.38); }
 .transactionEditor::backdrop { background: rgba(5,31,50,.55); }
