@@ -116,7 +116,7 @@
       <section class="ledger">
         <h2>Recent activity</h2>
         <table>
-          <thead><tr><th>Date</th><th>Merchant</th><th>Category</th><th class="right">Amount</th></tr></thead>
+          <thead><tr><th>Date</th><th>Merchant</th><th>Category</th><th class="right">Amount</th><th><span class="srOnly">Actions</span></th></tr></thead>
           <tbody id="ledgerBody"></tbody>
         </table>
       </section>
@@ -171,6 +171,31 @@
       </section>
     </section>
   </main>
+
+  <dialog class="transactionEditor" id="transactionEditor">
+    <form id="transactionEditForm">
+      <div class="editorHeader"><div><div class="eyebrow">Encrypted locally</div><h2>Edit transaction</h2></div><button class="editorClose" id="editCancelX" type="button" aria-label="Close">×</button></div>
+      <label for="editMerchant">Merchant</label>
+      <input id="editMerchant" maxlength="120" required>
+      <label for="editCategory">Category</label>
+      <select id="editCategory">
+        <option>Housing</option><option>Groceries</option><option>Dining</option><option>Transport</option>
+        <option>Utilities</option><option>Subscriptions</option><option>Shopping</option>
+        <option>Health &amp; insurance</option><option>Investing</option><option>Income</option><option>Uncategorized</option>
+      </select>
+      <label for="editNotes">Private notes</label>
+      <textarea id="editNotes" maxlength="1000" rows="3" placeholder="Stored only inside this transaction's ciphertext"></textarea>
+      <label for="editTags">Tags</label>
+      <input id="editTags" placeholder="tax, reimbursable, vacation">
+      <label for="editSplits">Category splits</label>
+      <textarea id="editSplits" rows="3" placeholder="Groceries: 40.00&#10;Dining: 15.25"></textarea>
+      <p class="editorHint" id="editSplitHint"></p>
+      <label class="editorCheck"><input id="editTransfer" type="checkbox"> Mark as transfer — exclude from income and spending</label>
+      <label class="editorCheck"><input id="editExcluded" type="checkbox"> Exclude from reports</label>
+      <p class="editorError" id="editError" role="alert"></p>
+      <div class="editorActions"><button class="sideAction" id="editCancel" type="button">Cancel</button><button class="primary" type="submit">Encrypt and save</button></div>
+    </form>
+  </dialog>
 
   <script src="/static/vendor/libsodium-sumo.js"></script>
   <script src="/static/vendor/libsodium-wrappers.js"></script>

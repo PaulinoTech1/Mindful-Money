@@ -13,6 +13,7 @@ let CHARTS = {};
 let CSRF = '';
 let PASSKEY_REQUIRED = false;
 let PASSKEY_AUTHENTICATED = false;
+let EDITING_TRANSACTION_ID = null;
 
 const apiFetch = async (url, options = {}) => {
   const opts = { credentials: 'same-origin', ...options, headers: { ...(options.headers || {}) } };
@@ -209,7 +210,13 @@ async function load(duringUnlock = false) {
     });
   }
 
-  TXNS = decrypted.map((t) => ({ ...t, category: categorize(t.merchant) }))
+  TXNS = decrypted.map((t) => ({
+    ...t, category: t.category || categorize(t.merchant),
+    notes: typeof t.notes === 'string' ? t.notes : '',
+    tags: Array.isArray(t.tags) ? t.tags : [],
+    splits: Array.isArray(t.splits) ? t.splits : [],
+    is_transfer: Boolean(t.is_transfer), excluded: Boolean(t.excluded),
+  }))
                   .sort((a, b) => a.date.localeCompare(b.date));
 
   $('statRecords').textContent = TXNS.length;
@@ -231,9 +238,14 @@ async function connect() {
   $('connectNote').textContent = `Encrypting ${transactions.length} transactions in your browser\u2026`;
   await new Promise((r) => setTimeout(r, 30));
 
+  const prior = new Map(TXNS.map((t) => [t.id, t]));
+  const editable = ['merchant', 'category', 'notes', 'tags', 'splits', 'is_transfer', 'excluded'];
   const sealedRows = transactions.map((t) => ({
     blind_index: blindIndex(t.id),
-    sealed: seal(t),
+    sealed: seal(editable.reduce((merged, key) => {
+      if (prior.has(t.id) && Object.hasOwn(prior.get(t.id), key)) merged[key] = prior.get(t.id)[key];
+      return merged;
+    }, { ...t })),
   }));
 
   await api('/api/records', {
@@ -253,6 +265,7 @@ async function connect() {
 function monthly() {
   const m = new Map();
   for (const t of TXNS) {
+    if (!reportable(t)) continue;
     const k = t.date.slice(0, 7);
     if (!m.has(k)) m.set(k, { in: 0, out: 0 });
     if (t.amount < 0) m.get(k).in -= t.amount; else m.get(k).out += t.amount;
@@ -263,8 +276,9 @@ function monthly() {
 function byCategory() {
   const m = new Map();
   for (const t of TXNS) {
-    if (t.amount <= 0) continue;
-    m.set(t.category, (m.get(t.category) || 0) + t.amount);
+    if (!reportable(t) || t.amount <= 0) continue;
+    const parts = t.splits.length ? t.splits : [{ category: t.category, amount: t.amount }];
+    for (const part of parts) m.set(part.category, (m.get(part.category) || 0) + part.amount);
   }
   return [...m.entries()].sort((a, b) => b[1] - a[1]);
 }
@@ -272,19 +286,21 @@ function byCategory() {
 function runningBalance() {
   let bal = 0;
   const byDay = new Map();
-  for (const t of TXNS) { bal -= t.amount; byDay.set(t.date, bal); }
+  for (const t of TXNS) { if (t.excluded) continue; bal -= t.amount; byDay.set(t.date, bal); }
   return [...byDay.entries()];
 }
 
 function topMerchants(n = 8) {
   const m = new Map();
   for (const t of TXNS) {
-    if (t.amount <= 0) continue;
+    if (!reportable(t) || t.amount <= 0) continue;
     if (!m.has(t.merchant)) m.set(t.merchant, { n: 0, sum: 0 });
     const e = m.get(t.merchant); e.n++; e.sum += t.amount;
   }
   return [...m.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, n);
 }
+
+const reportable = (t) => !t.excluded && !t.is_transfer;
 
 // Bank details exist only inside decrypted records. Net flows are derived
 // here from encrypted amounts and are never sent to or stored by the server.
@@ -307,7 +323,7 @@ function renderAccounts() {
   $('accounts').hidden = false;
   $('accountList').innerHTML = [...groups.entries()].map(([id, rows]) => {
     const meta = accountMeta(id, rows);
-    const net = rows.reduce((sum, t) => sum - t.amount, 0);
+    const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
     return `<div class="accountItem">
       <div class="accountBank">${meta.bank}</div>
       <div class="accountLabel">${meta.type} · ${meta.label}<span>${rows.length} records</span></div>
@@ -315,11 +331,11 @@ function renderAccounts() {
     </div>`;
   }).join('');
 
-  const totalVisible = [...groups.values()].reduce((sum, rows) => sum + rows.reduce((inner, t) => inner + (t.amount < 0 ? -t.amount : 0), 0), 0);
+  const totalVisible = [...groups.values()].reduce((sum, rows) => sum + rows.filter(reportable).reduce((inner, t) => inner + (t.amount < 0 ? -t.amount : 0), 0), 0);
   $('dashboardAccounts').innerHTML = [...groups.entries()].map(([id, rows]) => {
     const meta = accountMeta(id, rows);
-    const contributions = rows.reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
-    const net = rows.reduce((sum, t) => sum - t.amount, 0);
+    const contributions = rows.filter(reportable).reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
+    const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
     const retirement = meta.type !== 'Checking';
     const amount = retirement ? contributions : net;
     const amountLabel = retirement ? 'Contributed' : 'Net flow';
@@ -344,6 +360,7 @@ const localCurrentMonth = () => new Date().toISOString().slice(0, 7);
 const localMonthLabel = (ym) => new Date(ym + '-01').toLocaleString('en-US', { month: 'long', year: 'numeric' });
 const localMonthRows = (ym) => TXNS.filter((t) => t.date.slice(0, 7) === ym);
 const localTotals = (rows) => rows.reduce((a, t) => {
+  if (!reportable(t)) return a;
   if (t.amount < 0) a.in -= t.amount; else a.out += t.amount;
   return a;
 }, { in: 0, out: 0 });
@@ -382,7 +399,7 @@ function localAccountReport() {
   const groups = accountGroups();
   return 'Accounts — three banks, three distinct financial personalities:\n' + [...groups.entries()].map(([id, rows]) => {
     const meta = accountMeta(id, rows);
-    const net = rows.reduce((sum, t) => sum - t.amount, 0);
+    const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
     return `${meta.type} at ${meta.bank} — ${rows.length} records, net flow ${money(net, true)}`;
   }).join('\n');
 }
@@ -421,7 +438,7 @@ function chatAttitude(question) {
 }
 
 function localMathReport() {
-  const expenses = TXNS.filter((t) => t.amount > 0).map((t) => t.amount).sort((a, b) => a - b);
+  const expenses = TXNS.filter((t) => reportable(t) && t.amount > 0).map((t) => t.amount).sort((a, b) => a - b);
   const totals = localTotals(TXNS);
   const mean = expenses.length ? totals.out / expenses.length : 0;
   const middle = Math.floor(expenses.length / 2);
@@ -467,9 +484,10 @@ function localGraphicAnswer(question) {
   if (q.includes('account') || q.includes('bank') || q.includes('ira') || q.includes('401') || q.includes('retirement') || q.includes('contribution')) {
     const data = [...accountGroups().entries()].map(([id, rows]) => {
       const meta = accountMeta(id, rows);
+      const reportRows = rows.filter(reportable);
       const total = meta.type === 'Checking'
-        ? rows.reduce((sum, t) => sum - t.amount, 0)
-        : rows.reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
+        ? reportRows.reduce((sum, t) => sum - t.amount, 0)
+        : reportRows.reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
       return { label: `${meta.type} · ${meta.bank}`, total };
     });
     return {
@@ -545,7 +563,7 @@ function localAssistantAnswer(question) {
   const merchantNames = [...new Set(TXNS.map((t) => t.merchant))].sort((a, b) => b.length - a.length);
   const merchant = merchantNames.find((name) => q.includes(name.toLowerCase()));
   if (merchant) {
-    let rows = TXNS.filter((t) => t.merchant === merchant && t.amount > 0);
+    let rows = TXNS.filter((t) => reportable(t) && t.merchant === merchant && t.amount > 0);
     let period = 'all available data';
     if (q.includes('last month')) {
       const complete = localCompleteMonths();
@@ -559,7 +577,7 @@ function localAssistantAnswer(question) {
 
   const category = Object.keys(CAT_COLOR).find((name) => q.includes(name.toLowerCase()));
   if (category && q.includes('spend')) {
-    const rows = TXNS.filter((t) => t.category === category && t.amount > 0);
+    const rows = TXNS.filter((t) => reportable(t) && t.category === category && t.amount > 0);
     const amount = rows.reduce((sum, t) => sum + t.amount, 0);
     const share = localShare(amount, localTotals(TXNS).out);
     return `${category}: ${money(amount)} across ${rows.length} transaction${rows.length === 1 ? '' : 's'} (${share}% of spending). ${share >= 40 ? 'That is objectively over the top.' : 'Not a scandal, merely the largest available slice.'}`;
@@ -578,7 +596,7 @@ function localAssistantAnswer(question) {
   }
   if (q.includes('income') || q.includes('earned') || q.includes('pay')) {
     const income = localTotals(TXNS).in;
-    return `Income across the available data was ${money(income)} from ${TXNS.filter((t) => t.amount < 0).length} income transactions. Good: money arrived. The eccentric part is how quickly it found somewhere else to be.`;
+    return `Income across the available data was ${money(income)} from ${TXNS.filter((t) => reportable(t) && t.amount < 0).length} income transactions. Good: money arrived. The eccentric part is how quickly it found somewhere else to be.`;
   }
   if (q.includes('balance') || q.includes('net cash') || q.includes('cash flow')) {
     const totals = localTotals(TXNS);
@@ -586,11 +604,11 @@ function localAssistantAnswer(question) {
     return `Net cash flow across the available data was ${money(net, true)}: ${money(totals.in)} in and ${money(totals.out)} out. ${net >= 0 ? 'Miraculously, the inflow won.' : 'Spending remains undefeated.'}`;
   }
   if (q.includes('largest') || q.includes('biggest') || q.includes('expensive')) {
-    const largest = TXNS.filter((t) => t.amount > 0).sort((a, b) => b.amount - a.amount)[0];
+    const largest = TXNS.filter((t) => reportable(t) && t.amount > 0).sort((a, b) => b.amount - a.amount)[0];
     return largest ? `The largest single expense was ${money(largest.amount)} at ${largest.merchant} on ${largest.date}. Over the top? Possibly. Confirmed by the arithmetic? Absolutely.` : 'There are no expenses in the available data.';
   }
   if (q.includes('recent')) {
-    return 'Recent activity — the latest evidence:\n' + TXNS.slice(-5).reverse().map((t) => `${t.date} — ${t.merchant}, ${t.amount < 0 ? 'income ' + money(-t.amount) : 'spent ' + money(t.amount)}`).join('\n');
+    return 'Recent activity — the latest evidence:\n' + TXNS.filter(reportable).slice(-5).reverse().map((t) => `${t.date} — ${t.merchant}, ${t.amount < 0 ? 'income ' + money(-t.amount) : 'spent ' + money(t.amount)}`).join('\n');
   }
   return 'I can answer questions about your summary, spending, income, categories, merchants, monthly patterns, largest expenses, and net cash flow. Try asking for a summary. I promise to be accurate and only mildly judgmental.';
 }
@@ -636,6 +654,72 @@ function initChat() {
       askChat();
     });
   });
+}
+
+/* ---------- encrypted transaction editor ------------------------------ */
+
+function openTransactionEditor(id) {
+  const txn = TXNS.find((t) => t.id === id);
+  if (!txn) return;
+  EDITING_TRANSACTION_ID = id;
+  $('editMerchant').value = txn.merchant;
+  $('editCategory').value = txn.category;
+  $('editNotes').value = txn.notes;
+  $('editTags').value = txn.tags.join(', ');
+  $('editTransfer').checked = txn.is_transfer;
+  $('editExcluded').checked = txn.excluded;
+  $('editSplits').value = txn.splits.map((part) => `${part.category}: ${part.amount.toFixed(2)}`).join('\n');
+  $('editSplitHint').textContent = txn.amount > 0
+    ? `Optional. One “Category: amount” per line; entries must total ${money(txn.amount)}.`
+    : 'Splits are available for spending transactions only.';
+  $('editSplits').disabled = txn.amount <= 0;
+  $('editError').textContent = '';
+  $('transactionEditor').showModal();
+}
+
+function parseSplits(value, amount) {
+  if (!value.trim()) return [];
+  if (amount <= 0) throw new Error('Income transactions cannot be split.');
+  const splits = value.split('\n').filter((line) => line.trim()).map((line) => {
+    const match = line.match(/^(.{1,50}):\s*(\d+(?:\.\d{1,2})?)$/);
+    if (!match) throw new Error(`Invalid split: “${line.trim()}”. Use Category: amount.`);
+    return { category: match[1].trim(), amount: Number(match[2]) };
+  });
+  const total = splits.reduce((sum, part) => sum + part.amount, 0);
+  if (splits.some((part) => part.amount <= 0) || Math.abs(total - amount) > 0.005) {
+    throw new Error(`Split amounts must be positive and total ${money(amount)}.`);
+  }
+  return splits;
+}
+
+async function saveTransactionEdit(event) {
+  event.preventDefault();
+  const txn = TXNS.find((t) => t.id === EDITING_TRANSACTION_ID);
+  if (!txn) return;
+  const error = $('editError');
+  try {
+    const merchant = $('editMerchant').value.trim();
+    if (!merchant || merchant.length > 120) throw new Error('Merchant must be between 1 and 120 characters.');
+    const notes = $('editNotes').value.trim();
+    if (notes.length > 1000) throw new Error('Notes cannot exceed 1,000 characters.');
+    const tags = [...new Set($('editTags').value.split(',').map((tag) => tag.trim()).filter(Boolean))];
+    if (tags.length > 10 || tags.some((tag) => tag.length > 40)) throw new Error('Use at most 10 tags, each 40 characters or fewer.');
+    const updated = {
+      ...txn, merchant, category: $('editCategory').value, notes, tags,
+      splits: parseSplits($('editSplits').value, txn.amount),
+      is_transfer: $('editTransfer').checked, excluded: $('editExcluded').checked,
+    };
+    await api('/api/records', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ records: [{ blind_index: blindIndex(updated.id), sealed: seal(updated) }] }),
+    });
+    TXNS[TXNS.findIndex((t) => t.id === updated.id)] = updated;
+    $('transactionEditor').close();
+    renderAccounts();
+    render();
+  } catch (failure) {
+    error.textContent = failure.message;
+  }
 }
 
 /* ---------- charts ---------- */
@@ -756,13 +840,21 @@ function render() {
     },
   });
 
-  $('ledgerBody').innerHTML = TXNS.slice(-14).reverse().map((t) => `
-    <tr>
+  $('ledgerBody').innerHTML = TXNS.slice(-14).reverse().map((t) => {
+    const state = [t.is_transfer ? 'Transfer' : '', t.excluded ? 'Excluded' : '', t.splits.length ? `${t.splits.length} splits` : '', t.tags.length ? t.tags.join(', ') : ''].filter(Boolean).join(' · ');
+    const category = t.splits.length ? `Split (${t.splits.length})` : t.category;
+    return `
+    <tr class="${t.excluded ? 'excludedRow' : ''}">
       <td class="date">${t.date}</td>
-      <td>${t.merchant}</td>
-      <td><span class="tag cat-${t.category.toLowerCase().replace(/[^a-z]+/g, '-')}">${t.category}</span></td>
+      <td title="${escapeHtml(t.notes)}">${escapeHtml(t.merchant)}${state ? `<span class="transactionState">${escapeHtml(state)}</span>` : ''}</td>
+      <td><span class="tag cat-${category.toLowerCase().replace(/[^a-z]+/g, '-')}">${escapeHtml(category)}</span></td>
       <td class="num ${t.amount < 0 ? 'credit' : ''}">${t.amount < 0 ? money(-t.amount) : '\u2212' + money(t.amount)}</td>
-    </tr>`).join('');
+      <td><button class="editTransaction" data-edit-transaction="${escapeHtml(t.id)}">Edit</button></td>
+    </tr>`;
+  }).join('');
+  $('ledgerBody').querySelectorAll('[data-edit-transaction]').forEach((button) => {
+    button.addEventListener('click', () => openTransactionEditor(button.dataset.editTransaction));
+  });
 }
 
 /* ---------- server view ---------- */
@@ -922,6 +1014,9 @@ async function disablePasskeys() {
   $('lockVaultBtn').addEventListener('click', lockVault);
   $('signOutBtn').addEventListener('click', signOut);
   $('disablePasskeyBtn').addEventListener('click', disablePasskeys);
+  $('transactionEditForm').addEventListener('submit', saveTransactionEdit);
+  $('editCancel').addEventListener('click', () => $('transactionEditor').close());
+  $('editCancelX').addEventListener('click', () => $('transactionEditor').close());
   initChat();
   if (PASSKEY_REQUIRED && !PASSKEY_AUTHENTICATED) { $('gate').hidden = true; $('passkeyGate').hidden = false; }
   else $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';

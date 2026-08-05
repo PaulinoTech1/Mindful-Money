@@ -181,14 +181,30 @@ input:focus { border-color: #4d9bd0; outline: 2px solid rgba(45,118,173,.18); }
 table { border-collapse: collapse; table-layout: fixed; width: 100%; }
 th { border-bottom: 1px solid #b6d1e3; font-weight: 600; padding: 0 0 9px; text-align: left; }
 td { border-bottom: 1px solid #c6dce9; color: #214663; overflow: hidden; padding: 9px 0; text-overflow: ellipsis; white-space: nowrap; }
-th:nth-child(1), td:nth-child(1) { width: 16%; }
-th:nth-child(2), td:nth-child(2) { width: 37%; }
-th:nth-child(3), td:nth-child(3) { width: 28%; }
-th:nth-child(4), td:nth-child(4) { width: 19%; }
+th:nth-child(1), td:nth-child(1) { width: 14%; }
+th:nth-child(2), td:nth-child(2) { width: 34%; }
+th:nth-child(3), td:nth-child(3) { width: 27%; }
+th:nth-child(4), td:nth-child(4) { width: 17%; }
+th:nth-child(5), td:nth-child(5) { width: 8%; }
 td.date { color: #5e819e; font-family: monospace; font-size: 12px; }
 .right { text-align: right; }
 td.num { color: #233d54; text-align: right; }
 .tag { border-radius: 2px; display: inline-block; font-size: 11px; padding: 2px 6px; }
+.editTransaction { background: transparent; border: 0; color: var(--blue); cursor: pointer; font-weight: 600; padding: 3px; }
+.transactionState { color: #8a5b31; display: block; font-size: 10px; margin-top: 3px; }
+.transactionEditor { background: #f4fbff; border: 1px solid #73a8ca; border-radius: 8px; color: var(--ink); max-height: 90vh; max-width: 570px; padding: 22px; width: calc(100% - 40px); box-shadow: 0 18px 60px rgba(7,42,68,.38); }
+.transactionEditor::backdrop { background: rgba(5,31,50,.55); }
+.transactionEditor form { display: grid; gap: 7px; }
+.transactionEditor label:not(.editorCheck) { color: #456985; font-size: 12px; font-weight: 600; margin-top: 5px; }
+.transactionEditor input:not([type="checkbox"]), .transactionEditor select, .transactionEditor textarea { background: #fff; border: 1px solid #8eb7d5; border-radius: 5px; box-sizing: border-box; color: var(--ink); font: inherit; padding: 9px 11px; resize: vertical; width: 100%; }
+.editorHeader { align-items: start; display: flex; justify-content: space-between; margin-bottom: 4px; }
+.editorHeader h2 { font-size: 23px; margin-top: 2px; }
+.editorClose { background: transparent; border: 0; color: #557b96; cursor: pointer; font-size: 25px; }
+.editorCheck { align-items: center; display: flex; gap: 8px; margin-top: 7px; }
+.editorCheck input { width: auto; }
+.editorHint { color: #5e819e; font-size: 11px; margin: 0; }
+.editorError { color: #9b2f36; min-height: 18px; margin: 3px 0 0; }
+.editorActions { display: flex; gap: 9px; justify-content: flex-end; }
 .cat-income { background: #dcefe8; color: #3b8068; }
 .cat-housing { background: #f1e2d5; color: #8a5b31; }
 .cat-groceries { background: #e2ecdb; color: #63864e; }

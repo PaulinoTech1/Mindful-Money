@@ -212,6 +212,27 @@ def main() -> int:
             page.wait_for_function("() => document.querySelector('#chatMessages').innerText.includes('Mathematical analysis')")
             check("Mathematical analysis" in page.inner_text("#chatMessages"), "assistant provides local mathematical analysis")
             check(requests == before_chat_requests, "charts and math made no network request", str(requests[len(before_chat_requests):]))
+
+            # --- encrypted transaction editing ------------------------
+            expense_row = page.locator("#ledgerBody tr").filter(has=page.locator("td.num:not(.credit)")).first
+            amount_text = expense_row.locator("td.num").inner_text()
+            cents = round(float("".join(c for c in amount_text if c.isdigit() or c == ".")) * 100)
+            first_cents = cents // 2
+            second_cents = cents - first_cents
+            expense_row.locator("[data-edit-transaction]").click()
+            page.fill("#editMerchant", "Edited Merchant")
+            page.select_option("#editCategory", label="Groceries")
+            page.fill("#editNotes", "Private operator note")
+            page.fill("#editTags", "reviewed, reimbursable")
+            page.fill("#editSplits", f"Groceries: {first_cents / 100:.2f}\nDining: {second_cents / 100:.2f}")
+            page.check("#editTransfer")
+            page.check("#editExcluded")
+            page.click("#transactionEditForm button[type=submit]")
+            page.wait_for_selector("#transactionEditor", state="hidden")
+            ledger_text = page.inner_text("#ledgerBody")
+            check("Edited Merchant" in ledger_text, "merchant rename persists in the decrypted ledger")
+            check("Transfer" in ledger_text and "Excluded" in ledger_text and "2 splits" in ledger_text, "transfer, exclusion, tags, and splits are reflected")
+            check(all("Private operator note" not in body and "Edited Merchant" not in body for body in request_bodies), "transaction edits reach the server only as ciphertext")
             page.screenshot(path=SHOTS / "2-dashboard.png", full_page=True)
 
             # --- server view --------------------------------------------
@@ -248,6 +269,7 @@ def main() -> int:
                 int(page.inner_text("#statRecords")) == records,
                 "same passphrase re-derives the key and reopens the data",
             )
+            check("Edited Merchant" in page.inner_text("#ledgerBody"), "encrypted transaction edits survive reload")
 
             # --- optional passkeys (Chromium virtual authenticator) ----
             print("\n  Optional passkeys")

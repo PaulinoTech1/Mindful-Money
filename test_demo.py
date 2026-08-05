@@ -518,6 +518,10 @@ class TestSecurityIncrement(ServerCase):
         self.assertIn("Lost kid, get a better passphrase", runtime)
         self.assertIn("Decent, Buddy", runtime)
         self.assertIn("Good, but you're still Cooked.", runtime)
+        self.assertIn('id="transactionEditor"', html)
+        self.assertIn("async function saveTransactionEdit", runtime)
+        self.assertIn("const reportable", runtime)
+        self.assertIn("Split amounts must be positive", runtime)
         browser_test = (Path(__file__).parent / "test_browser.py").read_text()
         self.assertIn("page.goto(base", browser_test)
 
