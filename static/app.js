@@ -160,9 +160,29 @@ async function load(duringUnlock = false) {
 
   // Decrypt everything locally. ~20MB for a decade of history, so the whole
   // corpus lives in memory and every aggregate is computed here.
-  TXNS = records.map((r) => open(r.sealed))
-                .map((t) => ({ ...t, category: categorize(t.merchant) }))
-                .sort((a, b) => a.date.localeCompare(b.date));
+  let decrypted = records.map((r) => open(r.sealed));
+
+  // Records written by older versions do not contain encrypted institution
+  // metadata. Fetch it again, merge and re-seal it here in the browser so the
+  // names become visible without ever adding plaintext columns server-side.
+  if (decrypted.some((t) => !t.bank || !t.account_label || !t.account_type)) {
+    const { transactions } = await api('/api/relay', { method: 'POST' });
+    const metadata = new Map(transactions.map((t) => [t.account, {
+      bank: t.bank, account_label: t.account_label, account_type: t.account_type,
+    }]));
+    decrypted = decrypted.map((t) => ({ ...t, ...(metadata.get(t.account) || {}) }));
+    const migrated = records.map((record, index) => ({
+      blind_index: record.blind_index,
+      sealed: seal(decrypted[index]),
+    }));
+    await api('/api/records', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ records: migrated }),
+    });
+  }
+
+  TXNS = decrypted.map((t) => ({ ...t, category: categorize(t.merchant) }))
+                  .sort((a, b) => a.date.localeCompare(b.date));
 
   $('statRecords').textContent = TXNS.length;
   renderAccounts();

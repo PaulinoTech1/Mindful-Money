@@ -21,7 +21,7 @@ SEED = 20260802
 # lookup table to leak before the vault is unlocked.
 ACCOUNTS = {
     "demo_checking": {"bank": "Scammers Inc", "label": "Everyday checking", "type": "Checking"},
-    "demo_ira": {"bank": "Wells Foreclose", "label": "Traditional IRA", "type": "IRA"},
+    "demo_ira": {"bank": "Wells Forclosure", "label": "Traditional IRA", "type": "IRA"},
     "demo_401k": {"bank": "DC Unc", "label": "Employer 401(k)", "type": "401(k)"},
 }
 

@@ -160,7 +160,7 @@ class TestFakeBank(unittest.TestCase):
         self.assertEqual(set(counts), set(fakebank.ACCOUNTS))
         self.assertTrue(all(count > 0 for count in counts.values()))
         self.assertEqual({fakebank.ACCOUNTS[t["account"]]["bank"] for t in txns}, {
-            "Scammers Inc", "Wells Foreclose", "DC Unc"
+            "Scammers Inc", "Wells Forclosure", "DC Unc"
         })
         self.assertTrue(all(t["bank"] == fakebank.ACCOUNTS[t["account"]]["bank"] for t in txns))
         self.assertTrue(all(t["account_label"] == fakebank.ACCOUNTS[t["account"]]["label"] for t in txns))
