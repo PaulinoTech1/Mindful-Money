@@ -511,6 +511,8 @@ class TestSecurityIncrement(ServerCase):
         self.assertIn('id="resetPassphraseBtn"', html)
         self.assertIn("async function resetPassphrase()", runtime)
         self.assertIn("await api('/api/records', { method: 'DELETE' })", runtime)
+        self.assertIn("crypto.getRandomValues", runtime)
+        self.assertIn("CHAT_ATTITUDE", runtime)
         browser_test = (Path(__file__).parent / "test_browser.py").read_text()
         self.assertIn("page.goto(base", browser_test)
 

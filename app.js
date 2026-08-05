@@ -266,7 +266,7 @@ function renderAccounts() {
 
 /* ---------- private local assistant -----------------------------------
    This deliberately uses the decrypted TXNS array in this page only. It is
-   a small deterministic assistant rather than a remote LLM: no chat text,
+   a small private assistant rather than a remote LLM: no chat text,
    merchant name, amount or date is sent anywhere.                           */
 
 const localCurrentMonth = () => new Date().toISOString().slice(0, 7);
@@ -318,6 +318,36 @@ function localAccountReport() {
 
 let CHAT_CHART_INDEX = 0;
 const CHAT_CHARTS = {};
+let LAST_ATTITUDE = -1;
+
+const CHAT_ATTITUDE = [
+  'I did the arithmetic. You supplied the plot twist.',
+  'The numbers are being more honest with you than you have been with them.',
+  'I can explain the result; making it look innocent is outside my mandate.',
+  'Consider this the receipt your optimism conveniently misplaced.',
+  'No judgment. Fine, a measured amount of judgment.',
+  'The spreadsheet has declined to participate in your denial.',
+  'You asked for insight. Unfortunately, the transactions kept evidence.',
+  'I remain on your side, though your spending has mounted a persuasive counterargument.',
+];
+
+function chatAttitude(question) {
+  const q = question.toLowerCase();
+  const contextual = q.includes('spend') || q.includes('expense')
+    ? ['Your wallet would like to be included in future decision-making.', 'Bold spending strategy. The numbers have filed a dissent.']
+    : q.includes('income') || q.includes('pay')
+      ? ['Income arrived heroically; what happened afterward was less distinguished.']
+      : q.includes('chart') || q.includes('graph')
+        ? ['I made it visual in case the digits were too subtle.']
+        : [];
+  const choices = CHAT_ATTITUDE.concat(contextual);
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  let index = random[0] % choices.length;
+  if (choices.length > 1 && index === LAST_ATTITUDE) index = (index + 1) % choices.length;
+  LAST_ATTITUDE = index;
+  return choices[index];
+}
 
 function localMathReport() {
   const expenses = TXNS.filter((t) => t.amount > 0).map((t) => t.amount).sort((a, b) => a - b);
@@ -521,7 +551,8 @@ function askChat() {
   appendChatMessage('user', question);
   input.value = '';
   const answer = localAssistantAnswer(question);
-  appendChatMessage('bot', typeof answer === 'string' ? answer : answer.text, typeof answer === 'string' ? null : answer.chart);
+  const text = typeof answer === 'string' ? answer : answer.text;
+  appendChatMessage('bot', `${text}\n\n${chatAttitude(question)}`, typeof answer === 'string' ? null : answer.chart);
   input.focus();
 }
 
