@@ -217,6 +217,7 @@ async function load(duringUnlock = false) {
     tags: Array.isArray(t.tags) ? t.tags : [],
     splits: Array.isArray(t.splits) ? t.splits : [],
     is_transfer: Boolean(t.is_transfer), excluded: Boolean(t.excluded),
+    fraud_status: ['safe', 'fraud'].includes(t.fraud_status) ? t.fraud_status : '',
   }))
                   .sort((a, b) => a.date.localeCompare(b.date));
 
@@ -240,7 +241,7 @@ async function connect() {
   await new Promise((r) => setTimeout(r, 30));
 
   const prior = new Map(TXNS.map((t) => [t.id, t]));
-  const editable = ['merchant', 'category', 'notes', 'tags', 'splits', 'is_transfer', 'excluded'];
+  const editable = ['merchant', 'category', 'notes', 'tags', 'splits', 'is_transfer', 'excluded', 'fraud_status'];
   const sealedRows = transactions.map((t) => ({
     blind_index: blindIndex(t.id),
     sealed: seal(editable.reduce((merged, key) => {
@@ -328,14 +329,19 @@ function detectAnomalies(transactions) {
   const dayCounts = new Map();
   for (const txn of purchases) dayCounts.set(txn.date, (dayCounts.get(txn.date) || 0) + 1);
   const results = new Map();
+  for (const txn of transactions.filter((item) => item.fraud_status === 'fraud')) {
+    results.set(txn.id, { score: 100, level: 'Fraud', reasons: ['marked as fraud by you'], baselineSize: 0, userMarked: true });
+  }
 
   for (let index = 0; index < purchases.length; index++) {
     const txn = purchases[index];
+    if (txn.fraud_status === 'fraud') continue;
     const date = new Date(`${txn.date}T00:00:00Z`);
     const history = purchases.slice(0, index).filter((prior) => {
       const age = (date - new Date(`${prior.date}T00:00:00Z`)) / 86400000;
-      return age >= 0 && age <= 180 && prior.account === txn.account;
+      return age >= 0 && age <= 180 && prior.account === txn.account && prior.fraud_status !== 'fraud';
     });
+    if (txn.fraud_status === 'safe') continue;
     if (history.length < 20) continue;
 
     const logAmount = Math.log1p(txn.amount);
@@ -379,13 +385,34 @@ function renderFraudWatch() {
   const ranked = [...ANOMALIES.entries()].map(([id, result]) => ({ txn: TXNS.find((t) => t.id === id), ...result }))
     .filter((item) => item.txn).sort((a, b) => b.score - a.score).slice(0, 6);
   $('fraudCount').textContent = String(ANOMALIES.size);
-  $('fraudList').innerHTML = ranked.length ? ranked.map((item) => `<li>
-    <button data-review-anomaly="${escapeHtml(item.txn.id)}">
+  $('fraudList').innerHTML = ranked.length ? ranked.map((item) => `<li class="fraudRow">
+    <button class="fraudTransaction" data-review-anomaly="${escapeHtml(item.txn.id)}">
       <span><strong>${escapeHtml(item.txn.merchant)}</strong><small>${item.txn.date} · ${money(item.txn.amount)} · ${escapeHtml(item.reasons.join('; ') || 'combined statistical signals')}</small></span>
-      <b class="riskScore ${item.level.toLowerCase()}">${item.level} ${item.score}</b>
+      <b class="riskScore ${item.level.toLowerCase()}">${item.userMarked ? 'User fraud' : `${item.level} ${item.score}`}</b>
     </button>
+    <div class="fraudActions"><button class="fraudDecision safe" data-mark-safe="${escapeHtml(item.txn.id)}">Mark safe</button>${item.userMarked ? '' : `<button class="fraudDecision fraud" data-mark-fraud="${escapeHtml(item.txn.id)}">Flag fraud</button>`}</div>
   </li>`).join('') : '<li class="fraudEmpty">No purchases currently cross the review threshold.</li>';
   $('fraudList').querySelectorAll('[data-review-anomaly]').forEach((button) => button.addEventListener('click', () => openTransactionEditor(button.dataset.reviewAnomaly)));
+  $('fraudList').querySelectorAll('[data-mark-safe]').forEach((button) => button.addEventListener('click', () => setFraudStatus(button.dataset.markSafe, 'safe')));
+  $('fraudList').querySelectorAll('[data-mark-fraud]').forEach((button) => button.addEventListener('click', () => setFraudStatus(button.dataset.markFraud, 'fraud')));
+}
+
+async function setFraudStatus(id, status) {
+  if (!['', 'safe', 'fraud'].includes(status)) return;
+  const index = TXNS.findIndex((txn) => txn.id === id);
+  if (index < 0) return;
+  const updated = { ...TXNS[index], fraud_status: status };
+  try {
+    await api('/api/records', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ records: [{ blind_index: blindIndex(updated.id), sealed: seal(updated) }] }),
+    });
+    TXNS[index] = updated;
+    $('fraudActionNote').textContent = status === 'safe' ? 'Marked safe and removed from statistical review.' : 'Flagged as fraud by you.';
+    render();
+  } catch (error) {
+    $('fraudActionNote').textContent = error.message;
+  }
 }
 
 // Bank details exist only inside decrypted records. Net flows are derived
@@ -754,6 +781,7 @@ function openTransactionEditor(id) {
   $('editTags').value = txn.tags.join(', ');
   $('editTransfer').checked = txn.is_transfer;
   $('editExcluded').checked = txn.excluded;
+  $('editFraudStatus').value = txn.fraud_status;
   $('editSplits').value = txn.splits.map((part) => `${part.category}: ${part.amount.toFixed(2)}`).join('\n');
   $('editSplitHint').textContent = txn.amount > 0
     ? `Optional. One “Category: amount” per line; entries must total ${money(txn.amount)}.`
@@ -794,6 +822,7 @@ async function saveTransactionEdit(event) {
       ...txn, merchant, category: $('editCategory').value, notes, tags,
       splits: parseSplits($('editSplits').value, txn.amount),
       is_transfer: $('editTransfer').checked, excluded: $('editExcluded').checked,
+      fraud_status: $('editFraudStatus').value,
     };
     await api('/api/records', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -930,7 +959,8 @@ function render() {
 
   $('ledgerBody').innerHTML = TXNS.slice(-14).reverse().map((t) => {
     const anomaly = ANOMALIES.get(t.id);
-    const state = [anomaly ? `${anomaly.level} ${anomaly.score}` : '', t.is_transfer ? 'Transfer' : '', t.excluded ? 'Excluded' : '', t.splits.length ? `${t.splits.length} splits` : '', t.tags.length ? t.tags.join(', ') : ''].filter(Boolean).join(' · ');
+    const reviewState = t.fraud_status === 'fraud' ? 'Flagged fraud by you' : t.fraud_status === 'safe' ? 'Marked safe' : anomaly ? `${anomaly.level} ${anomaly.score}` : '';
+    const state = [reviewState, t.is_transfer ? 'Transfer' : '', t.excluded ? 'Excluded' : '', t.splits.length ? `${t.splits.length} splits` : '', t.tags.length ? t.tags.join(', ') : ''].filter(Boolean).join(' · ');
     const category = t.splits.length ? `Split (${t.splits.length})` : t.category;
     return `
     <tr class="${t.excluded ? 'excludedRow' : ''}">

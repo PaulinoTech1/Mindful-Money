@@ -528,6 +528,9 @@ class TestSecurityIncrement(ServerCase):
         self.assertIn("function robustZ", runtime)
         self.assertIn("history.length < 20", runtime)
         self.assertIn("A flag means statistically unusual, not confirmed fraud", html)
+        self.assertIn('id="editFraudStatus"', html)
+        self.assertIn("async function setFraudStatus", runtime)
+        self.assertIn("marked as fraud by you", runtime)
         browser_test = (Path(__file__).parent / "test_browser.py").read_text()
         self.assertIn("page.goto(base", browser_test)
 

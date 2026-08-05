@@ -284,6 +284,12 @@ signals. Every flag includes its contributing reasons and opens the encrypted
 transaction editor. No transaction, baseline, score, or flag is sent to the
 server.
 
+The user can mark a statistical candidate **Safe** or **Fraud**, and can apply
+the same review state to any transaction from the editor. Safe decisions are
+suppressed from future flags while remaining part of the legitimate baseline;
+user-confirmed fraud stays visible and is excluded from future baselines. The
+review state is stored only inside the transaction ciphertext.
+
 ## Files
 
 | File | Role |

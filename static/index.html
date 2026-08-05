@@ -113,6 +113,7 @@
         </div>
         <p>Compares each purchase with up to 180 days of earlier activity using robust amount deviation, empirical percentiles, merchant novelty, category and merchant baselines, and daily purchase velocity. At least 20 prior purchases are required.</p>
         <ul id="fraudList" class="fraudList"></ul>
+        <p class="fraudActionNote" id="fraudActionNote" aria-live="polite"></p>
         <p class="fraudCaveat">A flag means statistically unusual, not confirmed fraud. This browser-only model cannot see location, device, authorization, or card-network signals. Review the transaction and contact the institution if you do not recognize it.</p>
       </section>
 
@@ -203,6 +204,12 @@
       <p class="editorHint" id="editSplitHint"></p>
       <label class="editorCheck"><input id="editTransfer" type="checkbox"> Mark as transfer — exclude from income and spending</label>
       <label class="editorCheck"><input id="editExcluded" type="checkbox"> Exclude from reports</label>
+      <label for="editFraudStatus">Fraud review</label>
+      <select id="editFraudStatus">
+        <option value="">Unreviewed</option>
+        <option value="safe">Safe — suppress anomaly flags</option>
+        <option value="fraud">Fraud — flagged by me</option>
+      </select>
       <p class="editorError" id="editError" role="alert"></p>
       <div class="editorActions"><button class="sideAction" id="editCancel" type="button">Cancel</button><button class="primary" type="submit">Encrypt and save</button></div>
     </form>

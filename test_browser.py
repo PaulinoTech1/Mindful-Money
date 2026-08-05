@@ -187,6 +187,10 @@ def main() -> int:
             check(page.is_visible("#fraudWatch"), "browser-only unusual activity watch is visible")
             check("not confirmed fraud" in page.inner_text("#fraudWatch"), "detector presents a clear statistical caveat")
             check(len(page.query_selector_all("#fraudList [data-review-anomaly]")) > 0, "historical baseline produces explainable review candidates")
+            flagged_before = int(page.inner_text("#fraudCount"))
+            page.locator("#fraudList [data-mark-safe]").first.click()
+            page.wait_for_function(f"() => Number(document.querySelector('#fraudCount').textContent) === {flagged_before - 1}")
+            check("Marked safe" in page.inner_text("#fraudActionNote"), "user can validate a statistical flag as safe")
 
             # --- local assistant ---------------------------------------
             print("\n  Local assistant")
@@ -231,11 +235,13 @@ def main() -> int:
             page.fill("#editSplits", f"Groceries: {first_cents / 100:.2f}\nDining: {second_cents / 100:.2f}")
             page.check("#editTransfer")
             page.check("#editExcluded")
+            page.select_option("#editFraudStatus", "fraud")
             page.click("#transactionEditForm button[type=submit]")
             page.wait_for_selector("#transactionEditor", state="hidden")
             ledger_text = page.inner_text("#ledgerBody")
             check("Edited Merchant" in ledger_text, "merchant rename persists in the decrypted ledger")
-            check("Transfer" in ledger_text and "Excluded" in ledger_text and "2 splits" in ledger_text, "transfer, exclusion, tags, and splits are reflected")
+            check("Flagged fraud by you" in ledger_text and "Transfer" in ledger_text and "Excluded" in ledger_text and "2 splits" in ledger_text, "user fraud flag, transfer, exclusion, tags, and splits are reflected")
+            check("user fraud" in page.inner_text("#fraudList").lower(), "any transaction can be explicitly flagged as fraud")
             check(all("Private operator note" not in body and "Edited Merchant" not in body for body in request_bodies), "transaction edits reach the server only as ciphertext")
             page.screenshot(path=SHOTS / "2-dashboard.png", full_page=True)
 
