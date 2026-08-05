@@ -747,8 +747,27 @@ function toggleView() {
 }
 
 async function reset() {
+  if (!confirm('Clear every encrypted transaction from this vault? This cannot be undone.')) return;
   await api('/api/records', { method: 'DELETE' });
   location.reload();
+}
+
+async function resetPassphrase() {
+  if (!confirm('Resetting the vault passphrase permanently erases all encrypted financial records because the old key cannot be recovered. Continue?')) return;
+  const note = $('gateNote');
+  $('resetPassphraseBtn').disabled = true;
+  try {
+    await api('/api/records', { method: 'DELETE' });
+    KEYS = null; TXNS = [];
+    $('pass').value = '';
+    $('gate').querySelector('h1').textContent = 'Set a new passphrase';
+    note.textContent = 'Vault data erased. Enter a new passphrase, unlock, then reconnect the demo banks.';
+    $('pass').focus();
+  } catch (error) {
+    note.textContent = error.message;
+  } finally {
+    $('resetPassphraseBtn').disabled = false;
+  }
 }
 
 /* ---------- optional passkeys ---------- */
@@ -835,6 +854,7 @@ async function disablePasskeys() {
   $('syncBtn').addEventListener('click', connect);
   $('viewToggle').addEventListener('click', toggleView);
   $('resetBtn').addEventListener('click', reset);
+  $('resetPassphraseBtn').addEventListener('click', resetPassphrase);
   $('passkeyLoginBtn').addEventListener('click', loginPasskey);
   $('enablePasskeyBtn').addEventListener('click', registerPasskey);
   $('addPasskeyBtn').addEventListener('click', registerPasskey);

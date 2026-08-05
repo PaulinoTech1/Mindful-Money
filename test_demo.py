@@ -501,6 +501,9 @@ class TestSecurityIncrement(ServerCase):
         self.assertIn('/static/app.js', html)
         runtime = self.client.get("/static/app.js").get_data(as_text=True)
         self.assertIn("const apiFetch", runtime)
+        self.assertIn('id="resetPassphraseBtn"', html)
+        self.assertIn("async function resetPassphrase()", runtime)
+        self.assertIn("await api('/api/records', { method: 'DELETE' })", runtime)
         browser_test = (Path(__file__).parent / "test_browser.py").read_text()
         self.assertIn("page.goto(base", browser_test)
 

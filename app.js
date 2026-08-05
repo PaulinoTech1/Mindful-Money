@@ -704,8 +704,24 @@ function toggleView() {
 }
 
 async function reset() {
+  if (!confirm('Clear every encrypted transaction from this vault? This cannot be undone.')) return;
   await fetch('/api/records', { method: 'DELETE' });
   location.reload();
+}
+
+async function resetPassphrase() {
+  if (!confirm('Resetting the vault passphrase permanently erases all encrypted financial records because the old key cannot be recovered. Continue?')) return;
+  const note = $('gateNote');
+  $('resetPassphraseBtn').disabled = true;
+  try {
+    const response = await fetch('/api/records', { method: 'DELETE' });
+    if (!response.ok) throw new Error('Could not reset the vault.');
+    KEYS = null; TXNS = []; $('pass').value = '';
+    $('gate').querySelector('h1').textContent = 'Set a new passphrase';
+    note.textContent = 'Vault data erased. Enter a new passphrase, unlock, then reconnect the demo banks.';
+    $('pass').focus();
+  } catch (error) { note.textContent = error.message; }
+  finally { $('resetPassphraseBtn').disabled = false; }
 }
 
 /* ---------- boot ---------- */
@@ -719,6 +735,7 @@ async function reset() {
   $('syncBtn').addEventListener('click', connect);
   $('viewToggle').addEventListener('click', toggleView);
   $('resetBtn').addEventListener('click', reset);
+  $('resetPassphraseBtn').addEventListener('click', resetPassphrase);
   initChat();
   $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';
 })();
