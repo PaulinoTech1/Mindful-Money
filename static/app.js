@@ -109,6 +109,34 @@ const open = (hex) =>
 const blindIndex = (id) =>
   S.to_hex(S.crypto_generichash(32, S.from_string(id), KEYS.indexKey));
 
+// Empirical Shannon entropy of the characters entered. This is a local
+// estimate, not a password-cracking guarantee; no passphrase data is stored or
+// transmitted by this measurement.
+function updatePassphraseEntropy() {
+  const value = $('pass').value.trim();
+  const output = $('passEntropy');
+  if (!value.length) {
+    output.dataset.level = '';
+    output.textContent = 'Shannon entropy: 0.00 bits — enter a passphrase.';
+    return;
+  }
+  const chars = [...value];
+  const counts = new Map();
+  for (const char of chars) counts.set(char, (counts.get(char) || 0) + 1);
+  const bitsPerCharacter = [...counts.values()].reduce((sum, count) => {
+    const probability = count / chars.length;
+    return sum - probability * Math.log2(probability);
+  }, 0);
+  const entropy = bitsPerCharacter * chars.length;
+  const [level, message] = chars.length <= 8
+    ? ['weak', 'Lost kid, get a better passphrase']
+    : chars.length <= 14
+      ? ['decent', 'Decent, Buddy']
+      : ['good', "Good, but you're still Cooked."];
+  output.dataset.level = level;
+  output.textContent = `Shannon entropy: ${entropy.toFixed(2)} bits — ${message}`;
+}
+
 /* ---------- formatting ---------- */
 
 const money = (n, sign) => {
@@ -791,6 +819,7 @@ async function resetPassphrase() {
     await api('/api/records', { method: 'DELETE' });
     KEYS = null; TXNS = [];
     $('pass').value = '';
+    updatePassphraseEntropy();
     $('gate').querySelector('h1').textContent = 'Set a new passphrase';
     note.textContent = 'Vault data erased. Enter a new passphrase, unlock, then reconnect the demo banks.';
     $('pass').focus();
@@ -854,7 +883,7 @@ function lockVault() {
   Object.values(CHAT_CHARTS).forEach((c) => c.destroy());
   $('ledgerBody').textContent = ''; $('accountList').textContent = ''; $('dashboardAccounts').textContent = ''; $('chatMessages').textContent = ''; $('rawBody').textContent = '';
   ['dash','empty','serverview','security','stats','accounts','syncBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
-  document.body.classList.remove('sv'); $('pass').value = ''; $('lock').dataset.state = 'locked'; $('lockLabel').textContent = 'Locked';
+  document.body.classList.remove('sv'); $('pass').value = ''; updatePassphraseEntropy(); $('lock').dataset.state = 'locked'; $('lockLabel').textContent = 'Locked';
   $('unlockBtn').disabled = false;
   $('gate').hidden = false; $('gate').querySelector('h1').textContent = 'Unlock vault with passphrase';
 }
@@ -880,6 +909,7 @@ async function disablePasskeys() {
   await sodium.ready;
   S = sodium;
   $('unlockBtn').addEventListener('click', unlock);
+  $('pass').addEventListener('input', updatePassphraseEntropy);
   $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
   $('connectBtn').addEventListener('click', connect);
   $('syncBtn').addEventListener('click', connect);

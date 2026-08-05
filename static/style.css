@@ -110,6 +110,10 @@ h2 { color: var(--ink); font-size: 18px; margin: 0; }
 .passkeyItem button { background: transparent; border: 0; color: var(--blue); padding: 4px; }
 .lede { color: #294f70; font-size: 16px; line-height: 1.45; margin: 0 0 24px; max-width: 540px; }
 .formRow { display: flex; gap: 10px; }
+.entropyMeasure { color: #456985; display: block; font-size: 13px; margin-top: 9px; }
+.entropyMeasure[data-level="weak"] { color: #9b2f36; }
+.entropyMeasure[data-level="decent"] { color: #8a5b14; }
+.entropyMeasure[data-level="good"] { color: #18784e; }
 input {
   background: rgba(255,255,255,.9);
   border: 1px solid #8eb7d5;

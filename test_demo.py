@@ -513,6 +513,11 @@ class TestSecurityIncrement(ServerCase):
         self.assertIn("await api('/api/records', { method: 'DELETE' })", runtime)
         self.assertIn("crypto.getRandomValues", runtime)
         self.assertIn("CHAT_ATTITUDE", runtime)
+        self.assertIn('id="passEntropy"', html)
+        self.assertIn("function updatePassphraseEntropy()", runtime)
+        self.assertIn("Lost kid, get a better passphrase", runtime)
+        self.assertIn("Decent, Buddy", runtime)
+        self.assertIn("Good, but you're still Cooked.", runtime)
         browser_test = (Path(__file__).parent / "test_browser.py").read_text()
         self.assertIn("page.goto(base", browser_test)
 

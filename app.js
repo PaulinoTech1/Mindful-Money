@@ -80,6 +80,31 @@ const open = (hex) =>
 const blindIndex = (id) =>
   S.to_hex(S.crypto_generichash(32, S.from_string(id), KEYS.indexKey));
 
+function updatePassphraseEntropy() {
+  const value = $('pass').value.trim();
+  const output = $('passEntropy');
+  if (!value.length) {
+    output.dataset.level = '';
+    output.textContent = 'Shannon entropy: 0.00 bits — enter a passphrase.';
+    return;
+  }
+  const chars = [...value];
+  const counts = new Map();
+  for (const char of chars) counts.set(char, (counts.get(char) || 0) + 1);
+  const bitsPerCharacter = [...counts.values()].reduce((sum, count) => {
+    const probability = count / chars.length;
+    return sum - probability * Math.log2(probability);
+  }, 0);
+  const entropy = bitsPerCharacter * chars.length;
+  const [level, message] = chars.length <= 8
+    ? ['weak', 'Lost kid, get a better passphrase']
+    : chars.length <= 14
+      ? ['decent', 'Decent, Buddy']
+      : ['good', "Good, but you're still Cooked."];
+  output.dataset.level = level;
+  output.textContent = `Shannon entropy: ${entropy.toFixed(2)} bits — ${message}`;
+}
+
 /* ---------- formatting ---------- */
 
 const money = (n, sign) => {
@@ -747,7 +772,7 @@ async function resetPassphrase() {
   try {
     const response = await fetch('/api/records', { method: 'DELETE' });
     if (!response.ok) throw new Error('Could not reset the vault.');
-    KEYS = null; TXNS = []; $('pass').value = '';
+    KEYS = null; TXNS = []; $('pass').value = ''; updatePassphraseEntropy();
     $('gate').querySelector('h1').textContent = 'Set a new passphrase';
     note.textContent = 'Vault data erased. Enter a new passphrase, unlock, then reconnect the demo banks.';
     $('pass').focus();
@@ -761,6 +786,7 @@ async function resetPassphrase() {
   await sodium.ready;
   S = sodium;
   $('unlockBtn').addEventListener('click', unlock);
+  $('pass').addEventListener('input', updatePassphraseEntropy);
   $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
   $('connectBtn').addEventListener('click', connect);
   $('syncBtn').addEventListener('click', connect);

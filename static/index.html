@@ -52,6 +52,7 @@
         <input id="pass" type="password" placeholder="Any passphrase" autocomplete="off">
         <button class="primary" id="unlockBtn">Unlock</button>
       </div>
+      <output class="entropyMeasure" id="passEntropy" for="pass" aria-live="polite">Shannon entropy: 0.00 bits — enter a passphrase.</output>
       <button class="dangerAction" id="resetPassphraseBtn">Reset vault passphrase</button>
       <p class="hint" id="gateNote">Loading cryptography…</p>
     </section>
