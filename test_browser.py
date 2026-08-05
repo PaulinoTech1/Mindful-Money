@@ -184,6 +184,9 @@ def main() -> int:
             )
             user_view_text = page.inner_text("#dash")
             check("Blue Bottle Coffee" in user_view_text, "merchant names visible to the user")
+            check(page.is_visible("#fraudWatch"), "browser-only unusual activity watch is visible")
+            check("not confirmed fraud" in page.inner_text("#fraudWatch"), "detector presents a clear statistical caveat")
+            check(len(page.query_selector_all("#fraudList [data-review-anomaly]")) > 0, "historical baseline produces explainable review candidates")
 
             # --- local assistant ---------------------------------------
             print("\n  Local assistant")

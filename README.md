@@ -269,6 +269,21 @@ computing every aggregate locally stays comfortable. No server-side query
 capability is needed, which is fortunate — you couldn't build one without
 weakening the encryption.
 
+## Browser-only unusual activity detection
+
+The dashboard reviews purchases locally with an explainable statistical
+ensemble. Each purchase is compared only with earlier activity from the same
+account over a rolling 180-day window. Signals include log-amount robust
+z-scores (median/MAD with a standard-deviation fallback), empirical upper-tail
+percentile, merchant novelty, merchant and category amount deviation, and
+daily purchase velocity. Scoring starts only after 20 prior purchases.
+
+Results are labeled **Review** or **Unusual**, never "fraud": the browser does
+not have card authorization, device, location, identity, or network-level risk
+signals. Every flag includes its contributing reasons and opens the encrypted
+transaction editor. No transaction, baseline, score, or flag is sent to the
+server.
+
 ## Files
 
 | File | Role |

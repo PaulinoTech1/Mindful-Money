@@ -106,6 +106,16 @@
         <div class="accountCards" id="dashboardAccounts"></div>
       </section>
 
+      <section class="fraudWatch card" id="fraudWatch">
+        <div class="fraudHeader">
+          <div><div class="eyebrow">Browser-only statistical review</div><h2>Unusual activity watch</h2></div>
+          <div class="fraudFigure"><strong id="fraudCount">0</strong><span>flagged</span></div>
+        </div>
+        <p>Compares each purchase with up to 180 days of earlier activity using robust amount deviation, empirical percentiles, merchant novelty, category and merchant baselines, and daily purchase velocity. At least 20 prior purchases are required.</p>
+        <ul id="fraudList" class="fraudList"></ul>
+        <p class="fraudCaveat">A flag means statistically unusual, not confirmed fraud. This browser-only model cannot see location, device, authorization, or card-network signals. Review the transaction and contact the institution if you do not recognize it.</p>
+      </section>
+
       <div class="chartGrid">
         <article class="card cardWide"><h2>Income and spending by month</h2><div class="chart large"><canvas id="chMonthly"></canvas></div></article>
         <article class="card"><h2>Where the money goes</h2><div class="chart medium"><canvas id="chCategory"></canvas></div></article>

@@ -14,6 +14,7 @@ let CSRF = '';
 let PASSKEY_REQUIRED = false;
 let PASSKEY_AUTHENTICATED = false;
 let EDITING_TRANSACTION_ID = null;
+let ANOMALIES = new Map();
 
 const apiFetch = async (url, options = {}) => {
   const opts = { credentials: 'same-origin', ...options, headers: { ...(options.headers || {}) } };
@@ -301,6 +302,91 @@ function topMerchants(n = 8) {
 }
 
 const reportable = (t) => !t.excluded && !t.is_transfer;
+
+/* ---------- local unusual-purchase detection -------------------------- */
+
+const median = (values) => {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+};
+
+function robustZ(value, values) {
+  if (values.length < 3) return 0;
+  const center = median(values);
+  const mad = median(values.map((item) => Math.abs(item - center)));
+  if (mad > 1e-9) return 0.6745 * (value - center) / mad;
+  const mean = values.reduce((sum, item) => sum + item, 0) / values.length;
+  const deviation = Math.sqrt(values.reduce((sum, item) => sum + (item - mean) ** 2, 0) / values.length);
+  return deviation > 1e-9 ? (value - mean) / deviation : 0;
+}
+
+function detectAnomalies(transactions) {
+  const purchases = transactions.filter((t) => reportable(t) && t.amount > 0)
+    .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  const dayCounts = new Map();
+  for (const txn of purchases) dayCounts.set(txn.date, (dayCounts.get(txn.date) || 0) + 1);
+  const results = new Map();
+
+  for (let index = 0; index < purchases.length; index++) {
+    const txn = purchases[index];
+    const date = new Date(`${txn.date}T00:00:00Z`);
+    const history = purchases.slice(0, index).filter((prior) => {
+      const age = (date - new Date(`${prior.date}T00:00:00Z`)) / 86400000;
+      return age >= 0 && age <= 180 && prior.account === txn.account;
+    });
+    if (history.length < 20) continue;
+
+    const logAmount = Math.log1p(txn.amount);
+    const historyLogs = history.map((prior) => Math.log1p(prior.amount));
+    const amountZ = robustZ(logAmount, historyLogs);
+    const percentile = history.filter((prior) => prior.amount <= txn.amount).length / history.length;
+    const merchantHistory = history.filter((prior) => prior.merchant === txn.merchant);
+    const categoryHistory = history.filter((prior) => prior.category === txn.category);
+    const merchantZ = merchantHistory.length >= 3
+      ? robustZ(logAmount, merchantHistory.map((prior) => Math.log1p(prior.amount))) : 0;
+    const categoryZ = categoryHistory.length >= 8
+      ? robustZ(logAmount, categoryHistory.map((prior) => Math.log1p(prior.amount))) : 0;
+    const priorDayCounts = [...new Set(history.map((prior) => prior.date))].map((day) => dayCounts.get(day));
+    const velocityZ = priorDayCounts.length >= 7 ? robustZ(dayCounts.get(txn.date), priorDayCounts) : 0;
+
+    let score = Math.max(0, Math.min(40, amountZ / 6 * 40));
+    if (percentile >= 0.98) score += 15; else if (percentile >= 0.95) score += 8;
+    const newMerchant = merchantHistory.length === 0;
+    if (newMerchant && txn.amount > median(history.map((prior) => prior.amount))) score += 12;
+    score += Math.max(0, Math.min(15, categoryZ / 6 * 15));
+    score += Math.max(0, Math.min(15, merchantZ / 6 * 15));
+    score += Math.max(0, Math.min(10, velocityZ / 5 * 10));
+    score = Math.round(Math.min(100, score));
+    if (score < 45) continue;
+
+    const reasons = [];
+    if (amountZ >= 3) reasons.push('far above your usual purchase size');
+    if (percentile >= 0.98) reasons.push('in the top 2% of prior purchases');
+    else if (percentile >= 0.95) reasons.push('in the top 5% of prior purchases');
+    if (newMerchant) reasons.push('first purchase from this merchant');
+    if (categoryZ >= 3) reasons.push(`unusually high for ${txn.category}`);
+    if (merchantZ >= 3) reasons.push('different from this merchant’s normal amount');
+    if (velocityZ >= 3) reasons.push('more purchases than usual that day');
+    results.set(txn.id, { score, level: score >= 65 ? 'Unusual' : 'Review', reasons, baselineSize: history.length });
+  }
+  return results;
+}
+
+function renderFraudWatch() {
+  ANOMALIES = detectAnomalies(TXNS);
+  const ranked = [...ANOMALIES.entries()].map(([id, result]) => ({ txn: TXNS.find((t) => t.id === id), ...result }))
+    .filter((item) => item.txn).sort((a, b) => b.score - a.score).slice(0, 6);
+  $('fraudCount').textContent = String(ANOMALIES.size);
+  $('fraudList').innerHTML = ranked.length ? ranked.map((item) => `<li>
+    <button data-review-anomaly="${escapeHtml(item.txn.id)}">
+      <span><strong>${escapeHtml(item.txn.merchant)}</strong><small>${item.txn.date} · ${money(item.txn.amount)} · ${escapeHtml(item.reasons.join('; ') || 'combined statistical signals')}</small></span>
+      <b class="riskScore ${item.level.toLowerCase()}">${item.level} ${item.score}</b>
+    </button>
+  </li>`).join('') : '<li class="fraudEmpty">No purchases currently cross the review threshold.</li>';
+  $('fraudList').querySelectorAll('[data-review-anomaly]').forEach((button) => button.addEventListener('click', () => openTransactionEditor(button.dataset.reviewAnomaly)));
+}
 
 // Bank details exist only inside decrypted records. Net flows are derived
 // here from encrypted amounts and are never sent to or stored by the server.
@@ -840,8 +926,11 @@ function render() {
     },
   });
 
+  renderFraudWatch();
+
   $('ledgerBody').innerHTML = TXNS.slice(-14).reverse().map((t) => {
-    const state = [t.is_transfer ? 'Transfer' : '', t.excluded ? 'Excluded' : '', t.splits.length ? `${t.splits.length} splits` : '', t.tags.length ? t.tags.join(', ') : ''].filter(Boolean).join(' · ');
+    const anomaly = ANOMALIES.get(t.id);
+    const state = [anomaly ? `${anomaly.level} ${anomaly.score}` : '', t.is_transfer ? 'Transfer' : '', t.excluded ? 'Excluded' : '', t.splits.length ? `${t.splits.length} splits` : '', t.tags.length ? t.tags.join(', ') : ''].filter(Boolean).join(' · ');
     const category = t.splits.length ? `Split (${t.splits.length})` : t.category;
     return `
     <tr class="${t.excluded ? 'excludedRow' : ''}">
