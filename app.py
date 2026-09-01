@@ -4,36 +4,40 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import re
 import secrets
-import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, g, jsonify, request, send_from_directory, session
+from flask import Flask, jsonify, request, send_from_directory, session
 from flask.sessions import SessionInterface, SessionMixin
+from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.middleware.proxy_fix import ProxyFix
 from webauthn import (
     generate_authentication_options, generate_registration_options, options_to_json,
     verify_authentication_response, verify_registration_response,
 )
-from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+from webauthn.helpers import (
+    base64url_to_bytes, bytes_to_base64url, parse_authentication_credential_json, parse_authenticator_data,
+)
 from webauthn.helpers.exceptions import WebAuthnException
 from webauthn.helpers.structs import (
     AttestationConveyancePreference, AuthenticatorSelectionCriteria,
     PublicKeyCredentialDescriptor, ResidentKeyRequirement, UserVerificationRequirement,
 )
 
+import db as dbmod
 import fakebank
+import models
+import simplefin
 
-APP_ROOT = Path(__file__).resolve().parent
-DB = Path(os.environ.get("VAULT_DB_PATH", APP_ROOT / "demo.db"))
 STATIC = Path(__file__).parent / "static"
 CHALLENGE_TTL = int(os.environ.get("VAULT_CHALLENGE_TTL", "300"))
 SESSION_TTL = int(os.environ.get("VAULT_SESSION_TTL", str(8 * 60 * 60)))
@@ -45,6 +49,7 @@ MIN_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MIN_SEALED_HEX_LENGTH", "96"))
 MAX_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MAX_SEALED_HEX_LENGTH", "16384"))
 MAX_JSON_OBJECT_BYTES = int(os.environ.get("VAULT_MAX_JSON_OBJECT_BYTES", str(8 * 1024 * 1024)))
 MAX_LABEL_LENGTH = 80
+VAULT_STEPUP_WINDOW_SECONDS = int(os.environ.get("VAULT_STEPUP_WINDOW_SECONDS", "300"))
 COOKIE_NAME = "vault_session"
 TRUST_PROXY = os.environ.get("VAULT_TRUST_PROXY", "0") == "1"
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -62,7 +67,10 @@ def _configuration():
         raise RuntimeError("Production requires VAULT_AUTH_POLICY=required")
     secret, rp_id, origin = (os.environ.get(k) for k in ("VAULT_SECRET_KEY", "VAULT_RP_ID", "VAULT_ORIGIN"))
     if production:
-        missing = [n for n, v in (("VAULT_SECRET_KEY", secret), ("VAULT_RP_ID", rp_id), ("VAULT_ORIGIN", origin)) if not v]
+        missing = [n for n, v in (
+            ("VAULT_SECRET_KEY", secret), ("VAULT_RP_ID", rp_id), ("VAULT_ORIGIN", origin),
+            ("VAULT_DATABASE_URL", os.environ.get("VAULT_DATABASE_URL")),
+        ) if not v]
         if missing:
             raise RuntimeError("Missing production configuration: " + ", ".join(missing))
     origin = origin or "http://localhost:5000"
@@ -74,14 +82,6 @@ def _configuration():
     csp_mode = os.environ.get("VAULT_CSP_MODE", "enforce" if production else "report-only")
     if csp_mode not in {"enforce", "report-only"}:
         raise RuntimeError("VAULT_CSP_MODE must be enforce or report-only")
-    if production:
-        db_path = DB.resolve(strict=False)
-        if not DB.is_absolute() or db_path == APP_ROOT or APP_ROOT in db_path.parents:
-            raise RuntimeError("Production VAULT_DB_PATH must be absolute and outside application source")
-        if DB.is_symlink() or not DB.parent.exists() or DB.parent.is_symlink():
-            raise RuntimeError("Production database parent must exist and database path must not be a symlink")
-        if os.name == "posix" and DB.parent.stat().st_mode & 0o002:
-            raise RuntimeError("Production database parent must not be world-writable")
     return secret or secrets.token_hex(32), rp_id or "localhost", origin, os.environ.get("VAULT_RP_NAME", "Vault"), production, policy, csp_mode
 
 
@@ -135,139 +135,8 @@ RATE_LIMITS = {
     "logout": (int(os.environ.get("VAULT_RATE_LOGOUT", "30")), 60),
 }
 
-
-def _connect() -> sqlite3.Connection:
-    existed = DB.exists()
-    conn = sqlite3.connect(DB, timeout=5)
-    if PRODUCTION and not existed and os.name == "posix":
-        os.chmod(DB, 0o600)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    _migrate(conn)
-    return conn
-
-
-def db() -> sqlite3.Connection:
-    if "db" not in g:
-        g.db = _connect()
-    return g.db
-
-
-def _migrate(conn: sqlite3.Connection) -> None:
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS records (
-      id INTEGER PRIMARY KEY, blind_index TEXT NOT NULL UNIQUE,
-      sealed TEXT NOT NULL, bytes INTEGER NOT NULL, stored_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS vault_identity (
-      id INTEGER PRIMARY KEY CHECK (id=1), user_handle TEXT NOT NULL UNIQUE,
-      passkey_required INTEGER NOT NULL DEFAULT 0 CHECK(passkey_required IN (0,1)),
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS passkey_credentials (
-      id INTEGER PRIMARY KEY, identity_id INTEGER NOT NULL, credential_id TEXT NOT NULL UNIQUE,
-      credential_public_key BLOB NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0,
-      transports TEXT NOT NULL DEFAULT '[]', device_type TEXT, backed_up INTEGER,
-      label TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_used_at TEXT,
-      FOREIGN KEY(identity_id) REFERENCES vault_identity(id) ON DELETE CASCADE
-    );
-    CREATE TABLE IF NOT EXISTS server_sessions (
-      session_id_hash TEXT PRIMARY KEY, csrf_token TEXT NOT NULL, identity_id INTEGER,
-      authenticated_at REAL, vault_unlocked INTEGER NOT NULL DEFAULT 0,
-      active_ceremony_id TEXT, created_at REAL NOT NULL, last_seen_at REAL NOT NULL,
-      expires_at REAL NOT NULL, revoked_at REAL
-    );
-    CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON server_sessions(expires_at, last_seen_at);
-    CREATE TABLE IF NOT EXISTS webauthn_challenges (
-      ceremony_id TEXT PRIMARY KEY, session_id_hash TEXT NOT NULL, identity_id INTEGER,
-      kind TEXT NOT NULL CHECK(kind IN ('registration','authentication')),
-      challenge TEXT NOT NULL, created_at REAL NOT NULL, expires_at REAL NOT NULL, consumed_at REAL,
-      FOREIGN KEY(session_id_hash) REFERENCES server_sessions(session_id_hash)
-    );
-    CREATE INDEX IF NOT EXISTS idx_challenges_session ON webauthn_challenges(session_id_hash, ceremony_id);
-    CREATE TABLE IF NOT EXISTS rate_limits (
-      bucket_hash TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL, PRIMARY KEY(bucket_hash,window_start)
-    );
-    CREATE INDEX IF NOT EXISTS idx_rate_expiry ON rate_limits(expires_at);
-    """)
-    conn.execute("INSERT OR IGNORE INTO vault_identity(id,user_handle) VALUES(1,?)", (bytes_to_base64url(secrets.token_bytes(32)),))
-    conn.commit()
-
-
-class ServerSession(dict, SessionMixin):
-    def __init__(self, initial=None, sid=None, new=False):
-        super().__init__(initial or {})
-        self.sid, self.new, self.modified = sid, new, False
-
-
-def _sid_hash(sid: str) -> str:
-    return hashlib.sha256(sid.encode("ascii")).hexdigest()
-
-
-class SQLiteSessionInterface(SessionInterface):
-    def open_session(self, app, req):
-        sid = req.cookies.get(COOKIE_NAME, "")
-        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", sid):
-            return self._new()
-        now = time.time()
-        conn = _connect()
-        try:
-            row = conn.execute("SELECT * FROM server_sessions WHERE session_id_hash=?", (_sid_hash(sid),)).fetchone()
-        finally:
-            conn.close()
-        if not row or row["revoked_at"] is not None or row["expires_at"] <= now or row["last_seen_at"] + SESSION_IDLE_TTL <= now:
-            return self._new()
-        return ServerSession({
-            "csrf_token": row["csrf_token"], "identity_id": row["identity_id"],
-            "authenticated_at": row["authenticated_at"], "vault_unlocked": bool(row["vault_unlocked"]),
-            "active_ceremony_id": row["active_ceremony_id"], "created_at": row["created_at"],
-        }, sid=sid)
-
-    def _new(self):
-        now = time.time()
-        return ServerSession({"csrf_token": secrets.token_urlsafe(32), "created_at": now}, sid=secrets.token_urlsafe(32), new=True)
-
-    def save_session(self, app, sess, response):
-        now = time.time()
-        conn = _connect()
-        try:
-            if not sess:
-                if getattr(sess, "sid", None):
-                    conn.execute("UPDATE server_sessions SET revoked_at=? WHERE session_id_hash=?", (now, _sid_hash(sess.sid)))
-                conn.commit()
-                response.delete_cookie(COOKIE_NAME, path="/", secure=PRODUCTION, httponly=True, samesite="Strict")
-                return
-            created = float(sess.get("created_at") or now)
-            expires = min(created + SESSION_TTL, now + SESSION_IDLE_TTL)
-            conn.execute("""INSERT INTO server_sessions
-                (session_id_hash,csrf_token,identity_id,authenticated_at,vault_unlocked,active_ceremony_id,created_at,last_seen_at,expires_at,revoked_at)
-                VALUES(?,?,?,?,?,?,?,?,?,NULL)
-                ON CONFLICT(session_id_hash) DO UPDATE SET csrf_token=excluded.csrf_token,
-                identity_id=excluded.identity_id,authenticated_at=excluded.authenticated_at,
-                vault_unlocked=excluded.vault_unlocked,active_ceremony_id=excluded.active_ceremony_id,
-                last_seen_at=excluded.last_seen_at,expires_at=excluded.expires_at,revoked_at=NULL""",
-                (_sid_hash(sess.sid), sess.get("csrf_token"), sess.get("identity_id"), sess.get("authenticated_at"),
-                 int(bool(sess.get("vault_unlocked"))), sess.get("active_ceremony_id"), created, now, expires))
-            if secrets.randbelow(100) == 0:
-                conn.execute("DELETE FROM webauthn_challenges WHERE expires_at<? OR consumed_at<?", (now - 3600, now - 86400))
-                conn.execute("DELETE FROM server_sessions WHERE revoked_at<? OR expires_at<? OR last_seen_at<?", (now-86400, now-86400, now-SESSION_IDLE_TTL-86400))
-            conn.commit()
-        finally:
-            conn.close()
-        response.set_cookie(COOKIE_NAME, sess.sid, max_age=SESSION_TTL, httponly=True, secure=PRODUCTION, samesite="Strict", path="/")
-
-
-app.session_interface = SQLiteSessionInterface()
-
-
-@app.teardown_appcontext
-def _close(_exc):
-    conn = g.pop("db", None)
-    if conn is not None:
-        conn.close()
+db = dbmod.db
+dbmod.init_app(app)
 
 
 def api_error(message, status):
@@ -280,7 +149,7 @@ def too_large(_error):
     return api_error("Request body is too large", 413)
 
 
-@app.errorhandler(sqlite3.Error)
+@app.errorhandler(SQLAlchemyError)
 def database_error(_error):
     return api_error("The request could not be completed", 503)
 
@@ -300,6 +169,35 @@ def protect_unsafe_requests():
 def _client_log_id():
     value = request.remote_addr or "unknown"
     return hmac.new(RATE_KEY, value.encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:12]
+
+
+def _audit_event(event_type, credential_id=None, detail=None):
+    """Append-only audit trail. Never commits on its own -- relies on the
+    caller's existing commit so the audit row lands atomically with
+    whatever state transition it documents. identity_id is always 1: this
+    is a single-vault app, so there is only ever one possible subject.
+    Never pass a challenge, session token, or public key as detail."""
+    table = models.AuditEvent.__table__
+    db().execute(insert(table).values(
+        event_type=event_type, identity_id=1, client_ref=_client_log_id(),
+        credential_id=credential_id, detail=detail,
+    ))
+
+
+def _sign_count_regressed(credential_payload, stored_sign_count) -> bool:
+    """Independently replicate the webauthn library's own counter-regression
+    check so a SUSPICIOUS_COUNTER_EVENT can be audit-logged regardless of
+    which exception (if any) verify_authentication_response ends up raising
+    for this request. See webauthn.authentication.verify_authentication_response:
+    it raises a generic InvalidAuthenticationResponse for every failure mode,
+    with no distinct exception type for a counter regression specifically.
+    """
+    try:
+        parsed = parse_authentication_credential_json(credential_payload)
+        auth_data = parse_authenticator_data(parsed.response.authenticator_data)
+    except Exception:
+        return False
+    return (auth_data.sign_count > 0 or stored_sign_count > 0) and auth_data.sign_count <= stored_sign_count
 
 
 def _rate_group():
@@ -331,14 +229,17 @@ def apply_rate_limit():
     group = _rate_group()
     limit, seconds = RATE_LIMITS[group]
     now = int(time.time()); window = now - now % seconds; expires = window + seconds
-    conn = db(); conn.execute("BEGIN IMMEDIATE")
-    row = conn.execute("""INSERT INTO rate_limits(bucket_hash,window_start,count,expires_at) VALUES(?,?,1,?)
-        ON CONFLICT(bucket_hash,window_start) DO UPDATE SET count=count+1 RETURNING count""",
-        (_rate_subject(group), window, expires)).fetchone()
+    table = models.RateLimit.__table__
+    stmt = pg_insert(table).values(bucket_hash=_rate_subject(group), window_start=window, count=1, expires_at=expires)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["bucket_hash", "window_start"], set_=dict(count=table.c.count + 1),
+    ).returning(table.c.count)
+    conn = db()
+    count = conn.execute(stmt).scalar_one()
     if secrets.randbelow(100) == 0:
-        conn.execute("DELETE FROM rate_limits WHERE expires_at<?", (now,))
+        conn.execute(delete(table).where(table.c.expires_at < now))
     conn.commit()
-    if row["count"] > limit:
+    if count > limit:
         retry = max(1, expires-now)
         LOG.warning('event="rate_limited" group="%s" client="%s"', group, _client_log_id())
         response = api_error("Request rate limit exceeded", 429)
@@ -374,7 +275,8 @@ def security_headers(response):
 
 
 def identity():
-    return db().execute("SELECT * FROM vault_identity WHERE id=1").fetchone()
+    table = models.VaultIdentity.__table__
+    return db().execute(select(table).where(table.c.id == 1)).mappings().first()
 
 
 def auth_required():
@@ -397,10 +299,29 @@ def require_management():
     return None if session.get("vault_unlocked") else api_error("Unlock the vault with its passphrase first", 403)
 
 
+def require_recent_reauth():
+    """Extra freshness check for consequential passkey-management actions
+    (adding another passkey, removing one, disabling protection), layered
+    on top of require_management(). Only meaningful once at least one
+    passkey already exists and was used to authenticate this session --
+    first-time enrollment has no prior passkey ceremony to be "recent"
+    relative to, and stays gated by vault-unlock alone, matching how a
+    brand-new installation has no step-up history to check against."""
+    table = models.PasskeyCredential.__table__
+    has_existing = db().execute(select(func.count()).select_from(table).where(table.c.identity_id == 1)).scalar_one() > 0
+    if not has_existing:
+        return None
+    when = session.get("authenticated_at")
+    if not isinstance(when, (int, float)) or time.time() - when > VAULT_STEPUP_WINDOW_SECONDS:
+        return api_error("Recent passkey authentication required", 401)
+    return None
+
+
 def _rotate_session(**values):
     old_hash = _sid_hash(session.sid)
+    table = models.ServerSession.__table__
     conn = db()
-    conn.execute("UPDATE server_sessions SET revoked_at=? WHERE session_id_hash=?", (time.time(), old_hash))
+    conn.execute(update(table).where(table.c.session_id_hash == old_hash).values(revoked_at=time.time()))
     conn.commit()
     session.sid = secrets.token_urlsafe(32)
     session.clear()
@@ -426,10 +347,13 @@ def _json_object():
 
 def _new_challenge(kind):
     challenge, ceremony = secrets.token_bytes(32), secrets.token_urlsafe(32)
+    table = models.WebAuthnChallenge.__table__
     conn = db()
-    conn.execute("INSERT INTO webauthn_challenges VALUES(?,?,?,?,?,?,?,NULL)",
-                 (ceremony, _sid_hash(session.sid), 1 if kind == "registration" else None, kind,
-                  bytes_to_base64url(challenge), time.time(), time.time()+CHALLENGE_TTL))
+    conn.execute(insert(table).values(
+        ceremony_id=ceremony, session_id_hash=_sid_hash(session.sid),
+        identity_id=1 if kind == "registration" else None, kind=kind,
+        challenge=challenge, created_at=time.time(), expires_at=time.time() + CHALLENGE_TTL, consumed_at=None,
+    ))
     conn.commit()
     session["active_ceremony_id"] = ceremony
     return challenge
@@ -440,17 +364,100 @@ def _take_challenge(kind):
     if not ceremony:
         return None
     now, conn = time.time(), db()
-    conn.execute("BEGIN IMMEDIATE")
-    row = conn.execute("""UPDATE webauthn_challenges SET consumed_at=?
-        WHERE ceremony_id=? AND session_id_hash=? AND kind=? AND consumed_at IS NULL AND expires_at>?
-        RETURNING challenge""", (now, ceremony, _sid_hash(session.sid), kind, now)).fetchone()
+    table = models.WebAuthnChallenge.__table__
+    row = conn.execute(
+        update(table)
+        .where(
+            (table.c.ceremony_id == ceremony) & (table.c.session_id_hash == _sid_hash(session.sid))
+            & (table.c.kind == kind) & (table.c.consumed_at.is_(None)) & (table.c.expires_at > now)
+        )
+        .values(consumed_at=now)
+        .returning(table.c.challenge)
+    ).mappings().first()
     conn.commit()
     if not row:
         return None
-    try:
-        return base64url_to_bytes(row["challenge"])
-    except Exception:
-        return None
+    return bytes(row["challenge"])
+
+
+class ServerSession(dict, SessionMixin):
+    def __init__(self, initial=None, sid=None, new=False):
+        super().__init__(initial or {})
+        self.sid, self.new, self.modified = sid, new, False
+
+
+def _sid_hash(sid: str) -> str:
+    return hashlib.sha256(sid.encode("ascii")).hexdigest()
+
+
+class SQLAlchemySessionInterface(SessionInterface):
+    """Server-side sessions backed by Postgres.
+
+    Session open/save use their own dedicated connection, not the
+    request's g.db, so cookie/session persistence never depends on
+    whatever transaction state a view function left g.db in mid-request.
+    """
+
+    def open_session(self, app, req):
+        sid = req.cookies.get(COOKIE_NAME, "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", sid):
+            return self._new()
+        now = time.time()
+        table = models.ServerSession.__table__
+        with dbmod.get_engine().connect() as conn:
+            row = conn.execute(select(table).where(table.c.session_id_hash == _sid_hash(sid))).mappings().first()
+        if not row or row["revoked_at"] is not None or row["expires_at"] <= now or row["last_seen_at"] + SESSION_IDLE_TTL <= now:
+            return self._new()
+        return ServerSession({
+            "csrf_token": row["csrf_token"], "identity_id": row["identity_id"],
+            "authenticated_at": row["authenticated_at"], "vault_unlocked": bool(row["vault_unlocked"]),
+            "active_ceremony_id": row["active_ceremony_id"], "created_at": row["created_at"],
+        }, sid=sid)
+
+    def _new(self):
+        now = time.time()
+        return ServerSession({"csrf_token": secrets.token_urlsafe(32), "created_at": now}, sid=secrets.token_urlsafe(32), new=True)
+
+    def save_session(self, app, sess, response):
+        now = time.time()
+        table = models.ServerSession.__table__
+        challenges = models.WebAuthnChallenge.__table__
+        with dbmod.get_engine().begin() as conn:
+            if not sess:
+                if getattr(sess, "sid", None):
+                    conn.execute(update(table).where(table.c.session_id_hash == _sid_hash(sess.sid)).values(revoked_at=now))
+                response.delete_cookie(COOKIE_NAME, path="/", secure=PRODUCTION, httponly=True, samesite="Strict")
+                return
+            created = float(sess.get("created_at") or now)
+            expires = min(created + SESSION_TTL, now + SESSION_IDLE_TTL)
+            stmt = pg_insert(table).values(
+                session_id_hash=_sid_hash(sess.sid), csrf_token=sess.get("csrf_token"),
+                identity_id=sess.get("identity_id"), authenticated_at=sess.get("authenticated_at"),
+                vault_unlocked=bool(sess.get("vault_unlocked")), active_ceremony_id=sess.get("active_ceremony_id"),
+                created_at=created, last_seen_at=now, expires_at=expires, revoked_at=None,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["session_id_hash"],
+                set_=dict(
+                    csrf_token=stmt.excluded.csrf_token, identity_id=stmt.excluded.identity_id,
+                    authenticated_at=stmt.excluded.authenticated_at, vault_unlocked=stmt.excluded.vault_unlocked,
+                    active_ceremony_id=stmt.excluded.active_ceremony_id, last_seen_at=stmt.excluded.last_seen_at,
+                    expires_at=stmt.excluded.expires_at, revoked_at=stmt.excluded.revoked_at,
+                ),
+            )
+            conn.execute(stmt)
+            if secrets.randbelow(100) == 0:
+                conn.execute(delete(challenges).where(
+                    (challenges.c.expires_at < now - 3600) | (challenges.c.consumed_at < now - 86400)
+                ))
+                conn.execute(delete(table).where(
+                    (table.c.revoked_at < now - 86400) | (table.c.expires_at < now - 86400)
+                    | (table.c.last_seen_at < now - SESSION_IDLE_TTL - 86400)
+                ))
+        response.set_cookie(COOKIE_NAME, sess.sid, max_age=SESSION_TTL, httponly=True, secure=PRODUCTION, samesite="Strict", path="/")
+
+
+app.session_interface = SQLAlchemySessionInterface()
 
 
 @app.get("/")
@@ -473,15 +480,41 @@ def mark_unlocked():
 
 @app.post("/api/logout")
 def logout():
-    conn = db(); conn.execute("UPDATE server_sessions SET revoked_at=? WHERE session_id_hash=?", (time.time(), _sid_hash(session.sid))); conn.commit()
+    table = models.ServerSession.__table__
+    conn = db()
+    conn.execute(update(table).where(table.c.session_id_hash == _sid_hash(session.sid)).values(revoked_at=time.time()))
+    _audit_event("SESSION_REVOKED")
+    conn.commit()
     session.clear()
     LOG.info('event="session_revoked" client="%s"', _client_log_id())
     return jsonify({"signed_out": True})
 
+@app.get("/api/relay/sources")
+def relay_sources():
+    return jsonify({"simplefin_available": bool(os.environ.get("SIMPLEFIN_ACCESS_URL"))})
+
 @app.post("/api/relay")
 def relay():
     denied = require_access()
-    return denied or jsonify({"transactions": fakebank.generate(months=6)})
+    if denied: return denied
+    source = "fakebank"
+    if request.mimetype == "application/json" and request.data:
+        payload, error = _json_object()
+        if error: return error
+        if set(payload) - {"source"}: return api_error("Unknown field in relay request", 400)
+        source = payload.get("source", "fakebank")
+        if source not in {"fakebank", "simplefin"}: return api_error("Unknown transaction source", 400)
+    if source == "simplefin":
+        try:
+            transactions = simplefin.generate()
+        except simplefin.SimpleFinNotConfigured:
+            return api_error("SimpleFin is not configured on this server", 503)
+        except simplefin.SimpleFinError:
+            LOG.warning('event="simplefin_fetch_failed" client="%s"', _client_log_id())
+            return api_error("Could not fetch accounts from SimpleFin", 502)
+    else:
+        transactions = fakebank.generate(months=6)
+    return jsonify({"transactions": transactions})
 
 @app.post("/api/records")
 def put_records():
@@ -502,16 +535,25 @@ def put_records():
         if not isinstance(sealed, str) or not _LOWER_HEX.fullmatch(sealed) or len(sealed)%2 or not MIN_SEALED_HEX_LENGTH <= len(sealed) <= MAX_SEALED_HEX_LENGTH:
             return api_error("Invalid record", 400)
         seen.add(blind); validated.append((blind, sealed, len(bytes.fromhex(sealed))))
-    conn = db(); conn.execute("BEGIN IMMEDIATE")
+    table = models.Record.__table__
+    conn = db()
     existing = 0
     if seen:
-        placeholders = ",".join("?" for _ in seen)
-        existing = conn.execute(f"SELECT COUNT(*) c FROM records WHERE blind_index IN ({placeholders})", tuple(seen)).fetchone()["c"]
-    total = conn.execute("SELECT COUNT(*) c FROM records").fetchone()["c"]
+        existing = conn.execute(select(func.count()).select_from(table).where(table.c.blind_index.in_(seen))).scalar_one()
+    total = conn.execute(select(func.count()).select_from(table)).scalar_one()
     if total + len(validated) - existing > MAX_TOTAL_RECORDS:
         conn.rollback(); return api_error("Vault record quota exceeded", 409)
-    conn.executemany("""INSERT INTO records(blind_index,sealed,bytes,stored_at) VALUES(?,?,?,datetime('now','start of day'))
-        ON CONFLICT(blind_index) DO UPDATE SET sealed=excluded.sealed,bytes=excluded.bytes""", validated)
+    if validated:
+        # pg_insert(...).values([]) on an empty list degrades to a single
+        # DEFAULT VALUES row rather than a no-op, unlike the old
+        # executemany() -- guard explicitly so an empty batch stores nothing.
+        today = date.today()
+        stmt = pg_insert(table).values([
+            {"blind_index": blind, "sealed": sealed, "bytes": nbytes, "stored_at": today}
+            for blind, sealed, nbytes in validated
+        ])
+        stmt = stmt.on_conflict_do_update(index_elements=["blind_index"], set_=dict(sealed=stmt.excluded.sealed, bytes=stmt.excluded.bytes))
+        conn.execute(stmt)
     conn.commit()
     return jsonify({"stored": len(validated)})
 
@@ -519,38 +561,46 @@ def put_records():
 def get_records():
     denied = require_access()
     if denied: return denied
-    rows=db().execute("SELECT id,blind_index,sealed FROM records ORDER BY id").fetchall(); return jsonify({"records":[dict(r) for r in rows]})
+    table = models.Record.__table__
+    rows = db().execute(select(table.c.id, table.c.blind_index, table.c.sealed).order_by(table.c.id)).mappings().all()
+    return jsonify({"records": [dict(r) for r in rows]})
 
 @app.get("/api/server-view")
 def server_view():
     denied=require_access()
     if denied: return denied
-    conn=db(); total=conn.execute("SELECT COUNT(*) c FROM records").fetchone()["c"]
-    sizes=conn.execute("SELECT bytes,COUNT(*) n FROM records GROUP BY bytes ORDER BY bytes").fetchall(); days=conn.execute("SELECT stored_at d,COUNT(*) n FROM records GROUP BY stored_at ORDER BY stored_at").fetchall(); sample=conn.execute("SELECT blind_index,sealed FROM records ORDER BY id LIMIT 12").fetchall()
-    return jsonify({"record_count":total,"size_histogram":[dict(r) for r in sizes],"write_days":[dict(r) for r in days],"sample":[dict(r) for r in sample],"columns":["id","blind_index","sealed","bytes","stored_at"]})
+    table = models.Record.__table__
+    conn=db(); total=conn.execute(select(func.count()).select_from(table)).scalar_one()
+    sizes=conn.execute(select(table.c.bytes, func.count().label("n")).group_by(table.c.bytes).order_by(table.c.bytes)).mappings().all()
+    days=conn.execute(select(table.c.stored_at.label("d"), func.count().label("n")).group_by(table.c.stored_at).order_by(table.c.stored_at)).mappings().all()
+    sample=conn.execute(select(table.c.blind_index, table.c.sealed).order_by(table.c.id).limit(12)).mappings().all()
+    return jsonify({"record_count":total,"size_histogram":[dict(r) for r in sizes],"write_days":[{"d": r["d"].isoformat(), "n": r["n"]} for r in days],"sample":[dict(r) for r in sample],"columns":["id","blind_index","sealed","bytes","stored_at"]})
 
 @app.delete("/api/records")
 def reset():
     denied=require_access()
     if denied: return denied
-    conn=db(); conn.execute("DELETE FROM records"); conn.commit(); return jsonify({"reset":True})
+    table = models.Record.__table__
+    conn=db(); conn.execute(delete(table)); conn.commit(); return jsonify({"reset":True})
 
 @app.get("/api/passkeys/status")
 def passkey_status():
-    count=db().execute("SELECT COUNT(*) c FROM passkey_credentials WHERE identity_id=1").fetchone()["c"]
+    table = models.PasskeyCredential.__table__
+    count=db().execute(select(func.count()).select_from(table).where(table.c.identity_id==1)).scalar_one()
     return jsonify({"passkey_required":auth_required(),"authenticated":authenticated(),"has_usable_passkey":count>0})
 
 @app.post("/api/passkeys/register/options")
 def register_options():
-    denied=require_management()
+    denied=require_management() or require_recent_reauth()
     if denied: return denied
-    ident=identity(); credentials=db().execute("SELECT credential_id FROM passkey_credentials WHERE identity_id=1").fetchall()
-    options=generate_registration_options(rp_id=RP_ID,rp_name=RP_NAME,user_id=base64url_to_bytes(ident["user_handle"]),user_name="local-vault",challenge=_new_challenge("registration"),exclude_credentials=[PublicKeyCredentialDescriptor(id=base64url_to_bytes(r["credential_id"])) for r in credentials],authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED,user_verification=UserVerificationRequirement.REQUIRED),attestation=AttestationConveyancePreference.NONE)
+    table = models.PasskeyCredential.__table__
+    ident=identity(); credentials=db().execute(select(table.c.credential_id).where(table.c.identity_id==1)).mappings().all()
+    options=generate_registration_options(rp_id=RP_ID,rp_name=RP_NAME,user_id=bytes(ident["user_handle"]),user_name="local-vault",challenge=_new_challenge("registration"),exclude_credentials=[PublicKeyCredentialDescriptor(id=bytes(r["credential_id"])) for r in credentials],authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED,user_verification=UserVerificationRequirement.REQUIRED),attestation=AttestationConveyancePreference.NONE)
     return app.response_class(options_to_json(options),mimetype="application/json")
 
 @app.post("/api/passkeys/register/verify")
 def register_verify():
-    denied=require_management()
+    denied=require_management() or require_recent_reauth()
     if denied: return denied
     challenge=_take_challenge("registration")
     if challenge is None: return api_error("Passkey ceremony could not be verified",400)
@@ -559,13 +609,23 @@ def register_verify():
     credential=payload.get("credential"); label=payload.get("label","Passkey")
     if not isinstance(credential,dict) or not isinstance(label,str) or not label.strip() or len(label.strip())>MAX_LABEL_LENGTH: return api_error("Passkey registration could not be verified",400)
     label=label.strip()
+    conn=db()
     try:
         result=verify_registration_response(credential=credential,expected_challenge=challenge,expected_rp_id=RP_ID,expected_origin=ORIGIN,require_user_verification=True)
-        credential_id=bytes_to_base64url(result.credential_id); conn=db(); conn.execute("BEGIN IMMEDIATE")
-        conn.execute("INSERT INTO passkey_credentials(identity_id,credential_id,credential_public_key,sign_count,transports,device_type,backed_up,label) VALUES(1,?,?,?,?,?,?,?)",(credential_id,result.credential_public_key,result.sign_count,json.dumps((credential.get("response") or {}).get("transports",[])),str(result.credential_device_type),int(result.credential_backed_up),label))
-        conn.execute("UPDATE vault_identity SET passkey_required=1,updated_at=CURRENT_TIMESTAMP WHERE id=1"); conn.commit()
-    except sqlite3.IntegrityError: return api_error("Passkey registration conflict",409)
+        table = models.PasskeyCredential.__table__
+        conn.execute(insert(table).values(
+            identity_id=1, credential_id=result.credential_id, credential_public_key=result.credential_public_key,
+            sign_count=result.sign_count, transports=(credential.get("response") or {}).get("transports", []),
+            device_type=str(result.credential_device_type), backed_up=bool(result.credential_backed_up), label=label,
+        ))
+        identity_table = models.VaultIdentity.__table__
+        conn.execute(update(identity_table).where(identity_table.c.id==1).values(passkey_required=True, updated_at=func.now()))
+        _audit_event("PASSKEY_REGISTERED", credential_id=result.credential_id, detail={"label": label})
+        conn.commit()
+    except IntegrityError:
+        conn.rollback(); return api_error("Passkey registration conflict",409)
     except (WebAuthnException,ValueError,KeyError,TypeError):
+        conn.rollback()
         LOG.warning('event="authentication_failure" category="registration_verification" client="%s"', _client_log_id())
         return api_error("Passkey registration could not be verified",400)
     _rotate_session(identity_id=1,authenticated_at=time.time(),vault_unlocked=True)
@@ -574,9 +634,10 @@ def register_verify():
 
 @app.post("/api/passkeys/login/options")
 def login_options():
-    rows=db().execute("SELECT credential_id FROM passkey_credentials WHERE identity_id=1").fetchall()
+    table = models.PasskeyCredential.__table__
+    rows=db().execute(select(table.c.credential_id).where(table.c.identity_id==1)).mappings().all()
     if not rows: return api_error("Passkey sign-in is unavailable",409)
-    options=generate_authentication_options(rp_id=RP_ID,challenge=_new_challenge("authentication"),allow_credentials=[PublicKeyCredentialDescriptor(id=base64url_to_bytes(r["credential_id"])) for r in rows],user_verification=UserVerificationRequirement.REQUIRED)
+    options=generate_authentication_options(rp_id=RP_ID,challenge=_new_challenge("authentication"),allow_credentials=[PublicKeyCredentialDescriptor(id=bytes(r["credential_id"])) for r in rows],user_verification=UserVerificationRequirement.REQUIRED)
     return app.response_class(options_to_json(options),mimetype="application/json")
 
 @app.post("/api/passkeys/login/verify")
@@ -589,14 +650,26 @@ def login_verify():
     if not isinstance(credential,dict): return api_error("Passkey authentication could not be verified",400)
     credential_id=credential.get("id","")
     if not isinstance(credential_id,str) or not _B64URL.fullmatch(credential_id): return api_error("Passkey authentication could not be verified",400)
-    row=db().execute("SELECT * FROM passkey_credentials WHERE credential_id=? AND identity_id=1",(credential_id,)).fetchone()
-    if row is None: return api_error("Passkey authentication could not be verified",400)
     try:
-        result=verify_authentication_response(credential=credential,expected_challenge=challenge,expected_rp_id=RP_ID,expected_origin=ORIGIN,credential_public_key=row["credential_public_key"],credential_current_sign_count=row["sign_count"],require_user_verification=True)
+        credential_id_bytes=base64url_to_bytes(credential_id)
+    except Exception:
+        return api_error("Passkey authentication could not be verified",400)
+    table = models.PasskeyCredential.__table__
+    row=db().execute(select(table).where((table.c.credential_id==credential_id_bytes)&(table.c.identity_id==1))).mappings().first()
+    if row is None: return api_error("Passkey authentication could not be verified",400)
+    if _sign_count_regressed(credential, row["sign_count"]):
+        _audit_event("SUSPICIOUS_COUNTER_EVENT", credential_id=row["credential_id"], detail={"stored_sign_count": row["sign_count"]})
+        db().commit()
+        LOG.warning('event="suspicious_counter_event" client="%s"', _client_log_id())
+    try:
+        result=verify_authentication_response(credential=credential,expected_challenge=challenge,expected_rp_id=RP_ID,expected_origin=ORIGIN,credential_public_key=bytes(row["credential_public_key"]),credential_current_sign_count=row["sign_count"],require_user_verification=True)
     except (WebAuthnException,ValueError,KeyError,TypeError):
+        conn=db(); _audit_event("PASSKEY_AUTH_FAILURE", credential_id=row["credential_id"]); conn.commit()
         LOG.warning('event="authentication_failure" category="assertion_verification" client="%s"', _client_log_id())
         return api_error("Passkey authentication could not be verified",400)
-    conn=db(); conn.execute("UPDATE passkey_credentials SET sign_count=?,device_type=?,backed_up=?,last_used_at=CURRENT_TIMESTAMP WHERE id=?",(result.new_sign_count,str(result.credential_device_type),int(result.credential_backed_up),row["id"])); conn.commit()
+    conn=db(); conn.execute(update(table).where(table.c.id==row["id"]).values(sign_count=result.new_sign_count,device_type=str(result.credential_device_type),backed_up=bool(result.credential_backed_up),last_used_at=func.now()))
+    _audit_event("PASSKEY_AUTH_SUCCESS", credential_id=row["credential_id"])
+    conn.commit()
     _rotate_session(identity_id=1,authenticated_at=time.time())
     LOG.info('event="authentication_success" client="%s"', _client_log_id())
     return jsonify({"authenticated":True,"csrf_token":session["csrf_token"]})
@@ -605,7 +678,9 @@ def login_verify():
 def list_passkeys():
     denied=require_management()
     if denied: return denied
-    rows=db().execute("SELECT credential_id,label,device_type,backed_up,created_at,last_used_at FROM passkey_credentials WHERE identity_id=1 ORDER BY id").fetchall(); return jsonify({"passkeys":[dict(r) for r in rows]})
+    table = models.PasskeyCredential.__table__
+    rows=db().execute(select(table.c.credential_id,table.c.label,table.c.device_type,table.c.backed_up,table.c.created_at,table.c.last_used_at).where(table.c.identity_id==1).order_by(table.c.id)).mappings().all()
+    return jsonify({"passkeys":[{**dict(r), "credential_id": bytes_to_base64url(bytes(r["credential_id"]))} for r in rows]})
 
 def _valid_credential_id(value): return isinstance(value,str) and bool(_B64URL.fullmatch(value))
 
@@ -614,32 +689,49 @@ def rename_passkey(credential_id):
     denied=require_management()
     if denied: return denied
     if not _valid_credential_id(credential_id): return api_error("Unknown passkey",404)
+    try:
+        credential_id_bytes=base64url_to_bytes(credential_id)
+    except Exception:
+        return api_error("Unknown passkey",404)
     payload,error=_json_object()
     if error: return error
     label=payload.get("label")
     if set(payload)!={"label"} or not isinstance(label,str) or not label.strip() or len(label.strip())>MAX_LABEL_LENGTH: return api_error("Invalid passkey label",400)
-    cur=db().execute("UPDATE passkey_credentials SET label=? WHERE identity_id=1 AND credential_id=?",(label.strip(),credential_id)); db().commit(); return jsonify({"renamed":True}) if cur.rowcount else api_error("Unknown passkey",404)
+    table = models.PasskeyCredential.__table__
+    conn=db(); cur=conn.execute(update(table).where((table.c.identity_id==1)&(table.c.credential_id==credential_id_bytes)).values(label=label.strip())); conn.commit()
+    return jsonify({"renamed":True}) if cur.rowcount else api_error("Unknown passkey",404)
 
 @app.delete("/api/passkeys/<credential_id>")
 def remove_passkey(credential_id):
-    denied=require_management()
+    denied=require_management() or require_recent_reauth()
     if denied: return denied
     if not _valid_credential_id(credential_id): return api_error("Unknown passkey",404)
-    count=db().execute("SELECT COUNT(*) c FROM passkey_credentials WHERE identity_id=1").fetchone()["c"]
+    try:
+        credential_id_bytes=base64url_to_bytes(credential_id)
+    except Exception:
+        return api_error("Unknown passkey",404)
+    table = models.PasskeyCredential.__table__
+    conn=db()
+    count=conn.execute(select(func.count()).select_from(table).where(table.c.identity_id==1)).scalar_one()
     if auth_required() and count<=1: return api_error("Disable protection before removing the final passkey",409)
-    cur=db().execute("DELETE FROM passkey_credentials WHERE identity_id=1 AND credential_id=?",(credential_id,)); db().commit()
+    cur=conn.execute(delete(table).where((table.c.identity_id==1)&(table.c.credential_id==credential_id_bytes)))
+    if cur.rowcount: _audit_event("PASSKEY_REMOVED", credential_id=credential_id_bytes)
+    conn.commit()
     if cur.rowcount: LOG.info('event="passkey_removed" client="%s"', _client_log_id())
     return jsonify({"removed":True}) if cur.rowcount else api_error("Unknown passkey",404)
 
 @app.post("/api/passkeys/disable")
 def disable_passkeys():
-    denied=require_management()
+    denied=require_management() or require_recent_reauth()
     if denied: return denied
     payload,error=_json_object()
     if error: return error
     if payload!={"confirm_unlocked":True}: return api_error("Unlocked-vault confirmation is required",400)
     if AUTH_POLICY=="required": return api_error("Authentication is required by deployment policy",409)
-    db().execute("UPDATE vault_identity SET passkey_required=0,updated_at=CURRENT_TIMESTAMP WHERE id=1"); db().commit()
+    table = models.VaultIdentity.__table__
+    conn=db(); conn.execute(update(table).where(table.c.id==1).values(passkey_required=False, updated_at=func.now()))
+    _audit_event("PASSKEY_PROTECTION_DISABLED")
+    conn.commit()
     _rotate_session(vault_unlocked=True)
     LOG.info('event="passkey_protection_disabled" client="%s"', _client_log_id())
     return jsonify({"disabled":True,"csrf_token":session["csrf_token"]})

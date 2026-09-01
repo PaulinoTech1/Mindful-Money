@@ -9,12 +9,19 @@ test ! -e /etc/vault/vault.env || { echo "Refusing to overwrite /etc/vault/vault
 echo "Installing reviewed application files and protected state directories"
 install -d -o root -g root -m 0755 /opt/vault
 install -d -o root -g root -m 0700 /etc/vault
-install -d -o vault -g vault -m 0700 /var/lib/vault
 install -d -o vault -g vault -m 0700 /var/backups/vault
 install -o root -g root -m 0644 "$VAULT_SOURCE/app.py" /opt/vault/app.py
+install -o root -g root -m 0644 "$VAULT_SOURCE/db.py" /opt/vault/db.py
+install -o root -g root -m 0644 "$VAULT_SOURCE/models.py" /opt/vault/models.py
 install -o root -g root -m 0644 "$VAULT_SOURCE/fakebank.py" /opt/vault/fakebank.py
+install -o root -g root -m 0644 "$VAULT_SOURCE/simplefin.py" /opt/vault/simplefin.py
 install -o root -g root -m 0644 "$VAULT_SOURCE/requirements.txt" /opt/vault/requirements.txt
+install -o root -g root -m 0644 "$VAULT_SOURCE/alembic.ini" /opt/vault/alembic.ini
 install -d -o root -g root -m 0755 /opt/vault/static /opt/vault/static/vendor /opt/vault/deploy
+install -d -o root -g root -m 0755 /opt/vault/migrations /opt/vault/migrations/versions
+install -o root -g root -m 0644 "$VAULT_SOURCE/migrations/env.py" /opt/vault/migrations/env.py
+install -o root -g root -m 0644 "$VAULT_SOURCE/migrations/script.py.mako" /opt/vault/migrations/script.py.mako
+install -o root -g root -m 0644 "$VAULT_SOURCE"/migrations/versions/*.py /opt/vault/migrations/versions/
 install -o root -g root -m 0644 "$VAULT_SOURCE/static/index.html" /opt/vault/static/index.html
 install -o root -g root -m 0644 "$VAULT_SOURCE/static/style.css" /opt/vault/static/style.css
 install -o root -g root -m 0644 "$VAULT_SOURCE/static/app.js" /opt/vault/static/app.js

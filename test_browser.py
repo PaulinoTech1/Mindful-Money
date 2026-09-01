@@ -70,15 +70,33 @@ def main() -> int:
     headed = "--headed" in sys.argv
     SHOTS.mkdir(exist_ok=True)
     port = free_port()
-    db = HERE / "e2e-test.db"
-    db.unlink(missing_ok=True)
+
+    # Reuse the same disposable Postgres test database test_demo.py uses,
+    # truncated fresh -- there's no single file to delete/recreate anymore.
+    test_db_url = os.environ.get(
+        "VAULT_TEST_DATABASE_URL",
+        "postgresql+psycopg://vault:vault_dev_only_password@localhost:5432/vault_test",
+    )
+    from sqlalchemy import create_engine, text
+    sys.path.insert(0, str(HERE))
+    import models
+    engine = create_engine(test_db_url, future=True)
+    models.Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "TRUNCATE TABLE records, passkey_credentials, server_sessions, "
+            "webauthn_challenges, rate_limits, audit_events, vault_identity RESTART IDENTITY CASCADE"
+        ))
+    engine.dispose()
 
     server_env = os.environ.copy()
-    server_env.update({"VAULT_ORIGIN": f"http://localhost:{port}", "VAULT_RP_ID": "localhost", "VAULT_SECRET_KEY": "browser-test-secret-not-for-production", "VAULT_CSP_MODE": "enforce"})
+    server_env.update({
+        "VAULT_ORIGIN": f"http://localhost:{port}", "VAULT_RP_ID": "localhost",
+        "VAULT_SECRET_KEY": "browser-test-secret-not-for-production", "VAULT_CSP_MODE": "enforce",
+        "VAULT_DATABASE_URL": test_db_url,
+    })
     env_server = subprocess.Popen(
-        [sys.executable, "-c",
-         f"import app; app.DB = __import__('pathlib').Path(r'{db}'); "
-         f"app.app.run(port={port})"],
+        [sys.executable, "-c", f"import app; app.app.run(port={port})"],
         cwd=HERE, env=server_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -373,7 +391,6 @@ def main() -> int:
     finally:
         env_server.terminate()
         env_server.wait(timeout=10)
-        db.unlink(missing_ok=True)
 
     total = check.passed + check.failed
     color = "32" if not check.failed else "31"

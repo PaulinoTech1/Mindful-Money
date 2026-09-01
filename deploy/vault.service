@@ -12,8 +12,6 @@ EnvironmentFile=/etc/vault/vault.env
 ExecStart=/opt/vault/.venv/bin/gunicorn --config /opt/vault/deploy/gunicorn.conf.py app:app
 RuntimeDirectory=vault
 RuntimeDirectoryMode=0750
-StateDirectory=vault
-StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -32,8 +30,11 @@ RemoveIPC=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 SystemCallArchitectures=native
+# AF_UNIX only: correct when PostgreSQL is reached over its own Unix
+# domain socket on this host (the default, see deploy/DEPLOYMENT.md §3).
+# A remote/managed PostgreSQL reached over TCP needs AF_INET AF_INET6
+# added here -- a reviewed change, not a default.
 RestrictAddressFamilies=AF_UNIX
-ReadWritePaths=/var/lib/vault
 ReadWritePaths=/run/vault
 Restart=on-failure
 RestartSec=5s

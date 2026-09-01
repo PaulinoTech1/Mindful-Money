@@ -1,4 +1,11 @@
-"""Conservative single-node Gunicorn configuration for SQLite-backed Vault."""
+"""Conservative single-node Gunicorn configuration for Vault (PostgreSQL-backed).
+
+workers=1 is a starting point, not a database-imposed limit: PostgreSQL
+handles concurrent writers itself via MVCC and row-level locking, and
+db.py's per-process connection pool already assumes more than one
+in-flight request. Raising workers is safe; size workers * threads *
+pool_size comfortably under PostgreSQL's max_connections if you do.
+"""
 import grp
 import os
 bind = "unix:/run/vault/vault.sock"

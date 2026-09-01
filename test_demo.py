@@ -16,10 +16,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
 import sys
-import tempfile
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 import unittest
 from types import SimpleNamespace
@@ -31,10 +30,13 @@ import nacl.hash
 import nacl.pwhash
 from nacl.encoding import RawEncoder
 from nacl.public import PrivateKey, PublicKey, SealedBox
+from sqlalchemy import create_engine, text
 
 sys.path.insert(0, str(Path(__file__).parent))
 import app as server_app
+import db as dbmod
 import fakebank
+import models
 
 # Must match the constants in static/app.js.
 SALT_ENC = bytes([73, 26, 201, 4, 155, 88, 17, 240, 63, 129, 7, 198, 44, 90, 231, 12])
@@ -77,23 +79,63 @@ class BrowserSim:
         return [{"blind_index": self.blind_index(t["id"]), "sealed": self.seal(t)} for t in txns]
 
 
+TEST_DATABASE_URL = os.environ.get(
+    "VAULT_TEST_DATABASE_URL",
+    "postgresql+psycopg://vault:vault_dev_only_password@localhost:5432/vault_test",
+)
+_ALL_TABLES = (
+    "records", "vault_identity", "passkey_credentials", "server_sessions",
+    "webauthn_challenges", "rate_limits", "audit_events",
+)
+
+
+def whole_database_scan(engine) -> bytes:
+    """Postgres analogue of reading the whole SQLite file as raw bytes:
+    every text/bytea/jsonb cell across every table, concatenated. Used by
+    the privacy tests to assert plaintext never lands anywhere."""
+    with engine.connect() as conn:
+        columns = conn.execute(text(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND data_type IN "
+            "('text','character varying','character','bytea','jsonb','json')"
+        )).fetchall()
+        chunks = []
+        for table, column in columns:
+            for (value,) in conn.execute(text(f'SELECT "{column}" FROM "{table}"')).fetchall():
+                if value is not None:
+                    chunks.append(value if isinstance(value, (bytes, bytearray)) else str(value).encode())
+        return b"".join(chunks)
+
+
+_TEST_ENGINE = create_engine(TEST_DATABASE_URL, future=True)
+models.Base.metadata.create_all(_TEST_ENGINE)
+dbmod.rebind(TEST_DATABASE_URL)
+
+
 class ServerCase(unittest.TestCase):
-    """Base: each test gets an isolated temp database."""
+    """Base: each test gets an isolated, truncated Postgres database.
+
+    Module-level engine setup (above), not setUpClass/tearDownClass: this
+    repo's custom test runner (see main() below) calls .run() directly on
+    individual TestCase instances rather than through a TestSuite, so
+    class-level fixtures never fire. Module-level code always runs exactly
+    once regardless of how the suite is invoked (custom runner, plain
+    unittest, or pytest), which is what class fixtures would have relied on.
+    """
+
+    _engine = _TEST_ENGINE
 
     def setUp(self):
-        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        self._tmp.close()
-        self._orig_db = server_app.DB
-        server_app.DB = Path(self._tmp.name)
+        with self._engine.begin() as conn:
+            conn.execute(text(f"TRUNCATE TABLE {','.join(_ALL_TABLES)} RESTART IDENTITY CASCADE"))
         server_app.app.config["TESTING"] = True
         self.client = server_app.app.test_client()
 
-    def tearDown(self):
-        server_app.DB = self._orig_db
-        Path(self._tmp.name).unlink(missing_ok=True)
+    def raw_conn(self):
+        return self._engine.connect()
 
     def db_bytes(self) -> bytes:
-        return Path(self._tmp.name).read_bytes()
+        return whole_database_scan(self._engine)
 
     def security_headers(self):
         token = self.client.get("/api/session").get_json()["csrf_token"]
@@ -280,7 +322,8 @@ class TestOptionalPasskeys(ServerCase):
     def set_required(self, required=True):
         self.client.get("/api/passkeys/status")
         with server_app.app.app_context():
-            server_app.db().execute("UPDATE vault_identity SET passkey_required=? WHERE id=1", (int(required),))
+            table = models.VaultIdentity.__table__
+            server_app.db().execute(table.update().where(table.c.id == 1).values(passkey_required=required))
             server_app.db().commit()
 
     def authenticate(self, unlocked=False):
@@ -318,7 +361,8 @@ class TestOptionalPasskeys(ServerCase):
             sess["vault_unlocked"] = True
         self.client.post("/api/passkeys/register/options", headers=self.headers())
         with server_app.app.app_context():
-            server_app.db().execute("UPDATE webauthn_challenges SET expires_at=1")
+            table = models.WebAuthnChallenge.__table__
+            server_app.db().execute(table.update().values(expires_at=1))
             server_app.db().commit()
         self.assertEqual(self.client.post("/api/passkeys/register/verify", json={}, headers=self.headers()).status_code, 400)
 
@@ -335,7 +379,8 @@ class TestOptionalPasskeys(ServerCase):
 
     def test_unknown_credential_and_authentication_challenge_single_use(self):
         with server_app.app.app_context():
-            server_app.db().execute("INSERT INTO passkey_credentials(identity_id,credential_id,credential_public_key,label) VALUES(1,'Y3JlZA',X'01','Key')")
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
             server_app.db().commit()
         self.client.post("/api/passkeys/login/options", headers=self.headers())
         first = self.client.post("/api/passkeys/login/verify", json={"credential": {"id": "missing"}}, headers=self.headers())
@@ -351,7 +396,8 @@ class TestOptionalPasskeys(ServerCase):
     def test_last_passkey_cannot_be_removed(self):
         self.set_required(); self.authenticate(unlocked=True)
         with server_app.app.app_context():
-            server_app.db().execute("INSERT INTO passkey_credentials(identity_id,credential_id,credential_public_key,label) VALUES(1,'Y3JlZA',X'01','Only key')")
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Only key"))
             server_app.db().commit()
         response = self.client.delete("/api/passkeys/Y3JlZA", headers=self.headers())
         self.assertEqual(response.status_code, 409)
@@ -392,17 +438,15 @@ class TestSecurityIncrement(ServerCase):
         cookie = self.client.get_cookie(server_app.COOKIE_NAME)
         self.assertRegex(cookie.value, r"^[A-Za-z0-9_-]{43}$")
         self.assertNotIn("csrf", cookie.value.lower())
-        conn = sqlite3.connect(self._tmp.name)
-        row = conn.execute("SELECT csrf_token,session_id_hash FROM server_sessions").fetchone()
-        conn.close()
+        with self.raw_conn() as conn:
+            row = conn.execute(text("SELECT csrf_token,session_id_hash FROM server_sessions")).fetchone()
         self.assertIsNotNone(row)
         self.assertNotEqual(row[1], cookie.value)
 
     def test_expired_session_cookie_creates_a_new_session(self):
         first = self.client.get("/api/session").get_json()["csrf_token"]
-        conn = sqlite3.connect(self._tmp.name)
-        conn.execute("UPDATE server_sessions SET expires_at=0")
-        conn.commit(); conn.close()
+        with self._engine.begin() as conn:
+            conn.execute(text("UPDATE server_sessions SET expires_at=0"))
         second = self.client.get("/api/session").get_json()["csrf_token"]
         self.assertNotEqual(first, second)
 
@@ -495,10 +539,9 @@ class TestSecurityIncrement(ServerCase):
         with self.client.session_transaction() as sess:
             sess["vault_unlocked"] = True
         self.client.post("/api/passkeys/register/options", headers=self.security_headers())
-        conn = sqlite3.connect(self._tmp.name)
-        row = conn.execute("SELECT kind,challenge,session_id_hash,consumed_at FROM webauthn_challenges").fetchone()
-        sess_hash = conn.execute("SELECT session_id_hash FROM server_sessions WHERE active_ceremony_id IS NOT NULL").fetchone()[0]
-        conn.close()
+        with self.raw_conn() as conn:
+            row = conn.execute(text("SELECT kind,challenge,session_id_hash,consumed_at FROM webauthn_challenges")).fetchone()
+            sess_hash = conn.execute(text("SELECT session_id_hash FROM server_sessions WHERE active_ceremony_id IS NOT NULL")).fetchone()[0]
         self.assertEqual(row[0], "registration")
         self.assertEqual(row[2], sess_hash)
         self.assertIsNone(row[3])
@@ -585,19 +628,18 @@ class TestProductionHardening(ServerCase):
             self.assertEqual(fresh.get("/api/session").status_code, 200)
             replay = server_app.app.test_client(); replay.set_cookie(server_app.COOKIE_NAME, cookie)
             self.assertEqual(replay.get("/api/session").status_code, 429)
-            raw = Path(self._tmp.name).read_bytes()
+            raw = self.db_bytes()
             self.assertNotIn(cookie.encode(), raw)
         finally:
             server_app.RATE_LIMITS["session"] = original
 
     def test_expired_rate_buckets_are_cleanable(self):
         self.client.get("/api/session")
-        conn = sqlite3.connect(self._tmp.name)
-        conn.execute("UPDATE rate_limits SET expires_at=0")
-        conn.execute("DELETE FROM rate_limits WHERE expires_at<?", (int(__import__('time').time()),))
-        conn.commit()
-        self.assertEqual(conn.execute("SELECT COUNT(*) FROM rate_limits").fetchone()[0], 0)
-        conn.close()
+        with self._engine.begin() as conn:
+            conn.execute(text("UPDATE rate_limits SET expires_at=0"))
+            conn.execute(text("DELETE FROM rate_limits WHERE expires_at<:now"), {"now": int(__import__('time').time())})
+        with self.raw_conn() as conn:
+            self.assertEqual(conn.execute(text("SELECT COUNT(*) FROM rate_limits")).fetchone()[0], 0)
 
     def test_concurrent_rate_updates_are_atomic(self):
         original = server_app.RATE_LIMITS["relay"]
@@ -617,7 +659,8 @@ class TestProductionHardening(ServerCase):
 
     def test_failed_webauthn_attempt_consumes_failure_budget(self):
         with server_app.app.app_context():
-            server_app.db().execute("INSERT INTO passkey_credentials(identity_id,credential_id,credential_public_key,label) VALUES(1,'Y3JlZA',X'01','Key')")
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
             server_app.db().commit()
         headers = self.security_headers()
         self.client.post("/api/passkeys/login/options", headers=headers)
@@ -648,10 +691,16 @@ class TestProductionHardening(ServerCase):
         self.assertIn("User=vault", unit); self.assertIn("Group=vault", unit)
         self.assertIn("NoNewPrivileges=true", unit); self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("UMask=0077", unit)
-        self.assertEqual(unit.count("ReadWritePaths="), 2)
+        # Only /run/vault (the Gunicorn socket) -- the app holds no local
+        # data directory of its own now that state lives in PostgreSQL.
+        self.assertEqual(unit.count("ReadWritePaths="), 1)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX", unit)
+        self.assertNotIn("StateDirectory=", unit)
         self.assertNotIn("chmod -R", script); self.assertNotIn("chown -R", script)
         self.assertIn("REPLACE_WITH", env)
         self.assertNotRegex(env, r"VAULT_SECRET_KEY=(?!REPLACE)")
+        self.assertIn("VAULT_DATABASE_URL", env)
+        self.assertNotIn("VAULT_DB_PATH", env)
         source = (root / "app.py").read_text()
         self.assertRegex(source, r'if __name__ == "__main__":\s+if PRODUCTION:')
 
@@ -668,21 +717,22 @@ class TestProductionHardening(ServerCase):
         self.assertFalse(server_app.TRUST_PROXY)
 
     def test_production_configuration_headers_and_fail_closed(self):
+        # Importing app.py doesn't itself open a database connection (the
+        # SQLAlchemy engine is created lazily), so this only needs
+        # VAULT_DATABASE_URL to be present, not reachable.
         code = "import app; c=app.app.test_client(); r=c.get('/'); print(r.headers.get('Content-Security-Policy','')); print(r.headers.get('Strict-Transport-Security',''))"
-        with tempfile.TemporaryDirectory() as folder:
-            os.chmod(folder, 0o700)
-            env = os.environ.copy(); env.update({
-                "VAULT_ENV":"production", "VAULT_AUTH_POLICY":"required",
-                "VAULT_ORIGIN":"https://vault.example.com", "VAULT_RP_ID":"vault.example.com",
-                "VAULT_SECRET_KEY":"production-test-secret", "VAULT_DB_PATH":str(Path(folder)/"vault.db"),
-                "VAULT_CSP_MODE":"enforce",
-            })
-            result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent, env=env, text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("upgrade-insecure-requests", result.stdout)
-            self.assertIn("max-age=31536000", result.stdout)
+        env = os.environ.copy(); env.update({
+            "VAULT_ENV":"production", "VAULT_AUTH_POLICY":"required",
+            "VAULT_ORIGIN":"https://vault.example.com", "VAULT_RP_ID":"vault.example.com",
+            "VAULT_SECRET_KEY":"production-test-secret", "VAULT_DATABASE_URL":TEST_DATABASE_URL,
+            "VAULT_CSP_MODE":"enforce",
+        })
+        result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent, env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("upgrade-insecure-requests", result.stdout)
+        self.assertIn("max-age=31536000", result.stdout)
         bad = os.environ.copy(); bad.update({"VAULT_ENV":"production"})
-        for key in ("VAULT_AUTH_POLICY","VAULT_ORIGIN","VAULT_RP_ID","VAULT_SECRET_KEY","VAULT_DB_PATH"):
+        for key in ("VAULT_AUTH_POLICY","VAULT_ORIGIN","VAULT_RP_ID","VAULT_SECRET_KEY","VAULT_DATABASE_URL"):
             bad.pop(key, None)
         result = subprocess.run([sys.executable, "-c", "import app"], cwd=Path(__file__).parent, env=bad, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
@@ -727,9 +777,8 @@ class TestPrivacyGuarantee(ServerCase):
         directly instead -- combined with the merchant scan above, coverage is
         complete and neither test is flaky."""
         self.full_flow()
-        conn = sqlite3.connect(self._tmp.name)
-        rows = conn.execute("SELECT blind_index, sealed FROM records").fetchall()
-        conn.close()
+        with self.raw_conn() as conn:
+            rows = conn.execute(text("SELECT blind_index, sealed FROM records")).fetchall()
 
         self.assertGreater(len(rows), 200)
         for blind, sealed in rows:
@@ -786,6 +835,207 @@ class TestPrivacyGuarantee(ServerCase):
         self.assertTrue(all(v[0] or v[1] for v in by_month.values()))
 
 
+# ---------------------------------------------------------------- audit log
+
+
+def _fake_authenticator_data(sign_count: int) -> bytes:
+    """32-byte rp_id_hash + 1-byte flags (user-present only, no attested
+    credential data or extensions) + 4-byte big-endian sign count -- the
+    minimum 37-byte layout parse_authenticator_data accepts."""
+    return b"\x00" * 32 + b"\x01" + sign_count.to_bytes(4, "big")
+
+
+def _fake_authentication_credential_json(sign_count: int, credential_id: str = "cred-id") -> dict:
+    import base64
+
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    return {
+        "id": credential_id,
+        "rawId": b64(credential_id.encode()),
+        "type": "public-key",
+        "response": {
+            "clientDataJSON": b64(b"{}"),
+            "authenticatorData": b64(_fake_authenticator_data(sign_count)),
+            "signature": b64(b"sig"),
+        },
+    }
+
+
+class TestAuditLog(ServerCase):
+    def headers(self):
+        return self.security_headers()
+
+    def audit_rows(self):
+        with self.raw_conn() as conn:
+            return conn.execute(text(
+                "SELECT event_type, client_ref, credential_id, detail FROM audit_events ORDER BY id"
+            )).mappings().all()
+
+    def test_passkey_registration_is_audited(self):
+        with self.client.session_transaction() as sess:
+            sess["vault_unlocked"] = True
+        self.client.post("/api/passkeys/register/options", headers=self.headers())
+        verified = SimpleNamespace(credential_id=b"audit-cred", credential_public_key=b"pub", sign_count=0, credential_device_type="single_device", credential_backed_up=False)
+        with patch.object(server_app, "verify_registration_response", return_value=verified):
+            self.client.post("/api/passkeys/register/verify", json={"credential": {"response": {"transports": []}}, "label": "Laptop"}, headers=self.headers())
+        rows = self.audit_rows()
+        self.assertEqual([r["event_type"] for r in rows], ["PASSKEY_REGISTERED"])
+        self.assertEqual(bytes(rows[0]["credential_id"]), b"audit-cred")
+        self.assertEqual(rows[0]["detail"], {"label": "Laptop"})
+
+    def test_passkey_removal_is_audited(self):
+        with server_app.app.app_context():
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
+            server_app.db().commit()
+        with self.client.session_transaction() as sess:
+            sess["vault_unlocked"] = True
+            sess["authenticated_at"] = __import__("time").time()  # step-up freshness needs a recent passkey auth
+        self.client.delete("/api/passkeys/Y3JlZA", headers=self.headers())
+        rows = self.audit_rows()
+        self.assertEqual([r["event_type"] for r in rows], ["PASSKEY_REMOVED"])
+        self.assertEqual(bytes(rows[0]["credential_id"]), b"cred")
+
+    def test_passkey_auth_success_and_failure_are_audited(self):
+        with server_app.app.app_context():
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
+            server_app.db().commit()
+        self.client.post("/api/passkeys/login/options", headers=self.headers())
+        first = self.client.post("/api/passkeys/login/verify", json={"credential": {"id": "missing"}}, headers=self.headers())
+        self.assertEqual(first.status_code, 400)
+        rows = self.audit_rows()
+        self.assertEqual(rows, [], "an unrecognized credential id never reaches a stored row to audit against")
+
+        self.client.post("/api/passkeys/login/options", headers=self.headers())
+        payload = _fake_authentication_credential_json(sign_count=5, credential_id="Y3JlZA")
+        with patch.object(server_app, "verify_authentication_response", side_effect=server_app.WebAuthnException("bad signature")):
+            self.client.post("/api/passkeys/login/verify", json={"credential": payload}, headers=self.headers())
+        rows = self.audit_rows()
+        self.assertEqual([r["event_type"] for r in rows], ["PASSKEY_AUTH_FAILURE"])
+
+        self.client.post("/api/passkeys/login/options", headers=self.headers())
+        verified = SimpleNamespace(new_sign_count=6, credential_device_type="single_device", credential_backed_up=False)
+        with patch.object(server_app, "verify_authentication_response", return_value=verified):
+            self.client.post("/api/passkeys/login/verify", json={"credential": payload}, headers=self.headers())
+        rows = self.audit_rows()
+        self.assertEqual([r["event_type"] for r in rows], ["PASSKEY_AUTH_FAILURE", "PASSKEY_AUTH_SUCCESS"])
+
+    def test_suspicious_counter_event_is_audited_even_when_verification_fails(self):
+        with server_app.app.app_context():
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key", sign_count=10))
+            server_app.db().commit()
+        self.client.post("/api/passkeys/login/options", headers=self.headers())
+        regressed = _fake_authentication_credential_json(sign_count=3, credential_id="Y3JlZA")
+        with patch.object(server_app, "verify_authentication_response", side_effect=server_app.WebAuthnException("bad")):
+            self.client.post("/api/passkeys/login/verify", json={"credential": regressed}, headers=self.headers())
+        rows = self.audit_rows()
+        self.assertEqual([r["event_type"] for r in rows], ["SUSPICIOUS_COUNTER_EVENT", "PASSKEY_AUTH_FAILURE"])
+        self.assertEqual(rows[0]["detail"], {"stored_sign_count": 10})
+
+    def test_session_revoked_is_audited(self):
+        token = self.client.get("/api/session").get_json()["csrf_token"]
+        self.client.post("/api/logout", headers={"Origin": server_app.ORIGIN, "X-CSRF-Token": token})
+        rows = self.audit_rows()
+        self.assertEqual([r["event_type"] for r in rows], ["SESSION_REVOKED"])
+
+    def test_passkey_protection_disabled_is_audited(self):
+        with server_app.app.app_context():
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
+            server_app.db().commit()
+        with self.client.session_transaction() as sess:
+            sess["vault_unlocked"] = True
+            sess["authenticated_at"] = time.time()
+        self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers())
+        rows = self.audit_rows()
+        self.assertEqual([r["event_type"] for r in rows], ["PASSKEY_PROTECTION_DISABLED"])
+
+    def test_audit_events_contain_no_secrets(self):
+        """Extends this suite's no-secrets-in-storage philosophy to the
+        audit table specifically: a row documenting a registration should
+        never contain the public key, challenge, or CSRF token, even
+        though the public key itself is legitimately stored elsewhere
+        (passkey_credentials) -- WebAuthn public keys need integrity, not
+        secrecy, but the audit trail has no reason to duplicate them."""
+        with self.client.session_transaction() as sess:
+            sess["vault_unlocked"] = True
+        self.client.post("/api/passkeys/register/options", headers=self.headers())
+        verified = SimpleNamespace(credential_id=b"audit-cred-2", credential_public_key=b"super-secret-public-key-bytes", sign_count=0, credential_device_type="single_device", credential_backed_up=False)
+        with patch.object(server_app, "verify_registration_response", return_value=verified):
+            self.client.post("/api/passkeys/register/verify", json={"credential": {"response": {"transports": []}}, "label": "Laptop"}, headers=self.headers())
+        csrf = self.client.get("/api/session").get_json()["csrf_token"]
+        with self.raw_conn() as conn:
+            audit_only = b"".join(
+                str(dict(r)).encode() for r in conn.execute(text("SELECT * FROM audit_events")).mappings().all()
+            )
+        self.assertNotIn(b"super-secret-public-key-bytes", audit_only)
+        self.assertNotIn(csrf.encode(), audit_only)
+
+
+# ---------------------------------------------------------------- step-up auth
+
+
+class TestStepUpAuthentication(ServerCase):
+    """Adding another passkey, removing one, or disabling protection all
+    require passkey authentication within VAULT_STEPUP_WINDOW_SECONDS --
+    but only once a passkey already exists. First-time enrollment has no
+    prior ceremony to be "recent" relative to, so it must stay reachable
+    with vault-unlock alone."""
+
+    def headers(self):
+        return self.security_headers()
+
+    def seed_existing_passkey(self):
+        with server_app.app.app_context():
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
+            server_app.db().commit()
+
+    def unlock(self, authenticated_at=None):
+        with self.client.session_transaction() as sess:
+            sess["vault_unlocked"] = True
+            if authenticated_at is not None:
+                sess["authenticated_at"] = authenticated_at
+
+    def test_first_enrollment_needs_no_step_up(self):
+        self.unlock(authenticated_at=None)
+        self.assertEqual(self.client.post("/api/passkeys/register/options", headers=self.headers()).status_code, 200)
+
+    def test_adding_another_passkey_requires_recent_authentication(self):
+        self.seed_existing_passkey()
+        self.unlock(authenticated_at=None)
+        self.assertEqual(self.client.post("/api/passkeys/register/options", headers=self.headers()).status_code, 401)
+
+    def test_adding_another_passkey_succeeds_with_fresh_authentication(self):
+        self.seed_existing_passkey()
+        self.unlock(authenticated_at=time.time())
+        self.assertEqual(self.client.post("/api/passkeys/register/options", headers=self.headers()).status_code, 200)
+
+    def test_removal_rejects_stale_authentication(self):
+        self.seed_existing_passkey()
+        self.unlock(authenticated_at=time.time() - server_app.VAULT_STEPUP_WINDOW_SECONDS - 1)
+        self.assertEqual(self.client.delete("/api/passkeys/Y3JlZA", headers=self.headers()).status_code, 401)
+
+    def test_removal_succeeds_with_fresh_authentication(self):
+        self.seed_existing_passkey()
+        self.unlock(authenticated_at=time.time())
+        self.assertEqual(self.client.delete("/api/passkeys/Y3JlZA", headers=self.headers()).status_code, 200)
+
+    def test_disable_rejects_stale_authentication(self):
+        self.seed_existing_passkey()
+        self.unlock(authenticated_at=time.time() - server_app.VAULT_STEPUP_WINDOW_SECONDS - 1)
+        response = self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers())
+        self.assertEqual(response.status_code, 401)
+
+    def test_disable_succeeds_with_fresh_authentication(self):
+        self.seed_existing_passkey()
+        self.unlock(authenticated_at=time.time())
+        response = self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers())
+        self.assertEqual(response.status_code, 200)
+
+
 # ---------------------------------------------------------------- runner
 
 REPORT = [
@@ -796,6 +1046,8 @@ REPORT = [
     ("Security increment", TestSecurityIncrement),
     ("Production hardening", TestProductionHardening),
     ("Privacy guarantee", TestPrivacyGuarantee),
+    ("Audit log", TestAuditLog),
+    ("Step-up authentication", TestStepUpAuthentication),
 ]
 
 

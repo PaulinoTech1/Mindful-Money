@@ -4,11 +4,18 @@ A privacy-first finance tracker where the server stores your transactions and
 cannot read them. Fake bank data, real cryptography, charts computed entirely
 in your browser.
 
+Storage is PostgreSQL, not a bundled file — bring up a local instance first
+(the included `docker-compose.yml` is dev/test-only; see
+[`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md) for production):
+
 ```bash
+docker compose up -d
 python -m venv .venv
 # Windows: .venv\Scripts\activate
 # macOS/Linux: source .venv/bin/activate
 python -m pip install -r requirements.txt
+export VAULT_DATABASE_URL=postgresql+psycopg://vault:vault_dev_only_password@localhost:5432/vault_dev
+alembic upgrade head
 python app.py
 # open http://localhost:5000
 ```
@@ -45,6 +52,34 @@ server view, and assistant content as far as JavaScript permits, but preserves
 the passkey session. **Sign out** performs the same lock and invalidates the
 server session, returning to the passkey screen when protection is enabled.
 
+### Step-up authentication for passkey management
+
+Adding another passkey, removing one, or disabling protection all require a
+passkey authentication within `VAULT_STEPUP_WINDOW_SECONDS` (default 300) of
+the request — a stale session that's merely "authenticated" per the normal
+eight-hour session lifetime isn't enough for these specifically. This only
+applies once a passkey already exists: first-time enrollment has no prior
+passkey ceremony to be "recent" relative to, and stays gated by vault-unlock
+alone, exactly as before.
+
+### Audit log
+
+`audit_events` is an append-only table recording `PASSKEY_REGISTERED`,
+`PASSKEY_REMOVED`, `PASSKEY_AUTH_SUCCESS`, `PASSKEY_AUTH_FAILURE`,
+`PASSKEY_PROTECTION_DISABLED`, `SESSION_REVOKED`, and
+`SUSPICIOUS_COUNTER_EVENT`. Each row has a timestamp,
+event type, the same HMAC-truncated client reference used for rate-limit
+bucketing (not a raw IP), and — where relevant — a credential ID and a small
+JSON detail blob. Never a challenge, session token, CSRF token, or public
+key: the audit trail documents that something happened, not the
+cryptographic material involved.
+
+A counter regression (an authenticator reporting a `signCount` that isn't
+greater than what's on file, one signal of possible credential cloning) is
+detected independently of whatever the `webauthn` library's own verification
+raises, so it's audit-logged even on requests that also fail verification for
+an unrelated reason.
+
 ### WebAuthn configuration
 
 Development uses `http://localhost:5000` with RP ID `localhost`; the equivalent
@@ -68,7 +103,7 @@ Host header.
 ### Server-side authorization state
 
 The browser cookie contains only a random 256-bit opaque identifier. Its
-SHA-256 hash and the minimal session fields are stored in SQLite in
+SHA-256 hash and the minimal session fields are stored in PostgreSQL in
 `server_sessions`; no passphrase, encryption key, plaintext, or credential
 response is session data. Sessions have an eight-hour absolute lifetime and a
 30-minute idle lifetime by default. Logout revokes the row immediately, and
@@ -78,7 +113,9 @@ Secure in production. Expired and revoked rows are cleaned opportunistically.
 
 WebAuthn challenges live in `webauthn_challenges`, are bound to the initiating
 server session and ceremony kind, expire after five minutes, and are consumed
-with a conditional SQLite update before the first verification attempt. A
+with a conditional `UPDATE ... RETURNING` before the first verification
+attempt — a single atomic statement under PostgreSQL's MVCC, with no
+explicit locking needed. A
 failed attempt consumes the challenge too, and all missing, mismatched,
 expired, or consumed ceremonies produce the same generic error.
 
@@ -112,13 +149,16 @@ Configuration overrides are `VAULT_SESSION_TTL`, `VAULT_SESSION_IDLE_TTL`,
 `VAULT_MAX_SEALED_HEX_LENGTH`. `VAULT_HOST` and `VAULT_PORT` control the dev
 listener; optional policy rejects a non-loopback host.
 
-The database migrates in place on first access using idempotent `CREATE TABLE
-IF NOT EXISTS` statements. Existing `records` rows and their encryption format
-are not rewritten. The migration adds one `vault_identity` row for this
-prototype's single local vault and a `passkey_credentials` table containing
-credential IDs, public keys, counters, transports, backup/device state, labels,
-and timestamps, plus server session and challenge tables. Existing record rows
-and ciphertext are never rewritten. `passkey_required` changes to true only in the same transaction
+Schema changes are Alembic migrations (`alembic upgrade head`), not something
+the app does at runtime. The one thing the app still does on first request is
+idempotently seed this prototype's single `vault_identity` row if it's
+missing — a cheap `INSERT ... ON CONFLICT DO NOTHING`, not a schema change.
+`passkey_credentials` holds credential IDs and public keys as raw bytes (not
+base64url text — nothing about them needs text-safe encoding once SQLite's
+TEXT-only columns are no longer the storage layer), counters, transports,
+backup/device state, labels, and timestamps, alongside server session and
+challenge tables. Existing record rows and ciphertext are never rewritten by
+a migration. `passkey_required` changes to true only in the same transaction
 that commits a successfully verified credential.
 
 Set any passphrase, click **Connect demo bank**. Six months of transactions get
@@ -127,16 +167,23 @@ browser, and stored as ciphertext. The demo banks are Scammers Inc, Wells
 Foreclosure and DC Unc. The checking feed includes a fixed $423.23 monthly
 Fans Only subscription charge.
 
-No network access required. Chart.js and libsodium are vendored in
-`static/vendor/` rather than loaded from a CDN — a tool that promises the
-server can't read your data shouldn't hand a third party the ability to swap
-out its own crypto library.
+No *external* network access required — PostgreSQL is a local (or
+operator-controlled) service, not a third party. Chart.js and libsodium are
+vendored in `static/vendor/` rather than loaded from a CDN — a tool that
+promises the server can't read your data shouldn't hand a third party the
+ability to swap out its own crypto library.
 
 ## Tests
 
+Needs the same PostgreSQL instance as above (`docker compose up -d`), plus a
+`vault_test` database — the compose file creates one alongside `vault_dev`.
+`ServerCase` truncates its tables between tests, so `VAULT_TEST_DATABASE_URL`
+(defaults to `vault_test` on the same local instance) must point somewhere
+disposable, never at a real deployment.
+
 ```bash
 python -m pip install -r requirements.txt
-python test_demo.py         # unit, crypto, privacy, WebAuthn/session tests
+python test_demo.py         # unit, crypto, privacy, WebAuthn/session/audit tests
 python test_browser.py      # real Chromium UI and virtual WebAuthn
 ```
 
@@ -155,7 +202,7 @@ HSTS. `VAULT_CSP_MODE=report-only|enforce` selects the CSP header; production
 defaults to enforcement. `VAULT_TRUST_PROXY=1` trusts exactly one controlled
 proxy hop and must never be used with directly exposed Gunicorn.
 
-Persistent SQLite rate-limit defaults are: general API 120/minute, session
+Persistent PostgreSQL rate-limit defaults are: general API 120/minute, session
 60/minute, login options 20/5 minutes, login verification 10/10 minutes,
 registration 10/hour, uploads 10/minute, relay 6/minute, record deletion
 3/hour, passkey administration 5/hour, and logout 30/minute. Corresponding
@@ -214,15 +261,18 @@ is precise and cannot flake. A test you learn to ignore is worse than no test.
    merchant totals or net cash flow. The assistant is deterministic browser
    code over the decrypted in-memory transactions; it makes no chat request,
    calls no model or API, and sends no plaintext to the server.
-6. Close it in a terminal:
+6. Close it in a terminal — there's no single database file to `strings`
+   anymore, so query the columns directly instead:
 
 ```bash
-grep -c "Blue Bottle" demo.db     # 0
-strings demo.db | grep -v '^[0-9a-f]*$' | head
+psql postgresql://vault:vault_dev_only_password@localhost:5432/vault_dev \
+    -At -c "SELECT sealed FROM records" | grep -c "Blue Bottle"     # 0
+psql postgresql://vault:vault_dev_only_password@localhost:5432/vault_dev \
+    -At -c "SELECT blind_index, sealed FROM records" | grep -v '^[0-9a-f,]*$' | head
 ```
 
-Verified: all 26 merchant names absent from the database file. The only
-readable strings are the schema.
+Verified: all 26 merchant names absent, and every `blind_index`/`sealed`
+value is pure hex.
 
 ## Why the encryption happens in the browser
 
@@ -311,8 +361,35 @@ context, projections, and results never leave the browser.
 |---|---|
 | `static/app.js` | Key derivation, sealing, categorization, all chart math |
 | `app.py` | Blob store and relay. No crypto, no keys |
+| `models.py` | SQLAlchemy models for the PostgreSQL schema |
+| `db.py` | Request-scoped engine/session lifecycle |
+| `migrations/` | Alembic migrations (`alembic upgrade head`) |
 | `fakebank.py` | Stand-in for the bank feed. Swap in the Plaid adapter here |
+| `simplefin.py` | SimpleFin Protocol adapter — normalizes a real (or demo) linked bridge into the same transaction shape as `fakebank.generate()` |
 | `static/style.css` | Ledger aesthetic — Georgia's old-style figures, no webfonts |
+
+## Connecting a real feed with SimpleFin
+
+Set `SIMPLEFIN_ACCESS_URL` to a claimed SimpleFin access URL
+(`https://<user>:<pass>@bridge.simplefin.org/simplefin`) to enable a second
+**Connect via SimpleFin** button alongside the demo bank. `GET
+/api/relay/sources` reports whether it is configured; the browser hides the
+button when it is not. `POST /api/relay` accepts an optional
+`{"source": "simplefin"}` body — omitted or `"fakebank"` keeps the existing
+generated demo feed, `"simplefin"` fetches the last 90 days (SimpleFin's
+range cap) from every linked account.
+
+SimpleFin's amount sign convention is inflow-positive; `simplefin.py` negates
+it on the way in so it matches this app's spend-positive, income-negative
+convention documented in `fakebank.py`. Basic-auth credentials embedded in the
+access URL are extracted and sent as an `Authorization` header — Python's
+`urllib` does not parse userinfo out of the URL itself the way curl does.
+Cloudflare, which fronts the SimpleFin bridge, also blocks the default
+`urllib` User-Agent as bot traffic, so requests send a custom one.
+
+The access URL is a bearer credential for a real (or demo) linked bridge; keep
+it out of version control (`.env` is already gitignored) and treat it the way
+you would any other aggregator token.
 
 ## Demo shortcuts to remove
 
@@ -326,8 +403,8 @@ who have not enabled it, and is deliberately restricted to loopback development.
 3. **No recovery.** Forget the passphrase, lose the data. That's the honest
    consequence of the design; a real build adds a 24-word recovery phrase
    wrapping a second copy of the private key.
-4. **Aggregator tokens** aren't wrapped here because there aren't any. When
-   `fakebank` becomes Plaid, seal the access token under a KMS key.
+4. **Aggregator tokens aren't wrapped.** `SIMPLEFIN_ACCESS_URL` sits in plain
+   process environment / `.env`. A real build seals it under a KMS key instead.
 5. **Flask dev server.** Obviously.
 
 Additional threat-model limits remain: this is a single-vault prototype with
@@ -342,5 +419,6 @@ and operational monitoring before production use.
 
 ## Next
 
-Swap `fakebank.generate()` for the Plaid adapter from the earlier pipeline
-work. Nothing downstream changes — the shapes already match.
+SimpleFin now covers the "connect a real aggregator" case; Plaid remains the
+option for institutions SimpleFin doesn't reach. Nothing downstream changes
+either way — the shapes already match.

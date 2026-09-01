@@ -13,6 +13,7 @@ let CHARTS = {};
 let CSRF = '';
 let PASSKEY_REQUIRED = false;
 let PASSKEY_AUTHENTICATED = false;
+let SIMPLEFIN_AVAILABLE = false;
 let EDITING_TRANSACTION_ID = null;
 let ANOMALIES = new Map();
 
@@ -176,6 +177,8 @@ async function unlock() {
   $('statKey').textContent = S.to_hex(KEYS.publicKey).slice(0, 12);
   $('stats').hidden = false;
   $('syncBtn').hidden = false;
+  $('connectSimplefinBtn').hidden = !SIMPLEFIN_AVAILABLE;
+  $('syncSimplefinBtn').hidden = !SIMPLEFIN_AVAILABLE;
   $('resetBtn').hidden = false;
   $('gate').hidden = true;
   $('security').hidden = false;
@@ -229,13 +232,16 @@ async function load(duringUnlock = false) {
   render();
 }
 
-async function connect() {
-  $('connectBtn').disabled = true;
-  $('syncBtn').disabled = true;
-  $('connectNote').textContent = 'Fetching from bank\u2026';
+async function connect(source = 'fakebank') {
+  [$('connectBtn'), $('syncBtn'), $('connectSimplefinBtn'), $('syncSimplefinBtn')].forEach((b) => { b.disabled = true; });
+  $('connectNote').textContent = source === 'simplefin' ? 'Fetching from SimpleFin\u2026' : 'Fetching from bank\u2026';
 
   // The server relays plaintext in this response and stores none of it.
-  const { transactions } = await api('/api/relay', { method: 'POST' });
+  const { transactions } = await api('/api/relay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source }),
+  });
 
   $('connectNote').textContent = `Encrypting ${transactions.length} transactions in your browser\u2026`;
   await new Promise((r) => setTimeout(r, 30));
@@ -257,8 +263,7 @@ async function connect() {
   });
 
   $('connectNote').textContent = '';
-  $('connectBtn').disabled = false;
-  $('syncBtn').disabled = false;
+  [$('connectBtn'), $('syncBtn'), $('connectSimplefinBtn'), $('syncSimplefinBtn')].forEach((b) => { b.disabled = false; });
   await load();
 }
 
@@ -449,7 +454,7 @@ function renderAccounts() {
     const meta = accountMeta(id, rows);
     const contributions = rows.filter(reportable).reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
     const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
-    const retirement = meta.type !== 'Checking';
+    const retirement = ['IRA', '401(k)'].includes(meta.type);
     const amount = retirement ? contributions : net;
     const amountLabel = retirement ? 'Contributed' : 'Net flow';
     const width = totalVisible ? Math.max(5, Math.round((contributions / totalVisible) * 100)) : 5;
@@ -1202,7 +1207,7 @@ function lockVault() {
   Object.values(CHARTS).forEach((c) => c.destroy()); CHARTS = {};
   Object.values(CHAT_CHARTS).forEach((c) => c.destroy());
   $('ledgerBody').textContent = ''; $('accountList').textContent = ''; $('dashboardAccounts').textContent = ''; $('chatMessages').textContent = ''; $('rawBody').textContent = '';
-  ['dash','empty','serverview','security','stats','accounts','syncBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
+  ['dash','empty','serverview','security','stats','accounts','syncBtn','syncSimplefinBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
   document.body.classList.remove('sv'); $('pass').value = ''; updatePassphraseEntropy(); $('lock').dataset.state = 'locked'; $('lockLabel').textContent = 'Locked';
   $('unlockBtn').disabled = false;
   $('gate').hidden = false; $('gate').querySelector('h1').textContent = 'Unlock vault with passphrase';
@@ -1226,13 +1231,16 @@ async function disablePasskeys() {
 (async () => {
   const sessionInfo = await api('/api/session'); CSRF = sessionInfo.csrf_token;
   const status = await api('/api/passkeys/status'); PASSKEY_REQUIRED = status.passkey_required; PASSKEY_AUTHENTICATED = status.authenticated;
+  const sources = await api('/api/relay/sources'); SIMPLEFIN_AVAILABLE = sources.simplefin_available;
   await sodium.ready;
   S = sodium;
   $('unlockBtn').addEventListener('click', unlock);
   $('pass').addEventListener('input', updatePassphraseEntropy);
   $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
-  $('connectBtn').addEventListener('click', connect);
-  $('syncBtn').addEventListener('click', connect);
+  $('connectBtn').addEventListener('click', () => connect('fakebank'));
+  $('syncBtn').addEventListener('click', () => connect('fakebank'));
+  $('connectSimplefinBtn').addEventListener('click', () => connect('simplefin'));
+  $('syncSimplefinBtn').addEventListener('click', () => connect('simplefin'));
   $('viewToggle').addEventListener('click', toggleView);
   $('resetBtn').addEventListener('click', reset);
   $('resetPassphraseBtn').addEventListener('click', resetPassphrase);
