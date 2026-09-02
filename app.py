@@ -37,9 +37,11 @@ import db as dbmod
 import fakebank
 import models
 import simplefin
+import zkp_verifier
 
 STATIC = Path(__file__).parent / "static"
 CHALLENGE_TTL = int(os.environ.get("VAULT_CHALLENGE_TTL", "300"))
+ZKP_CHALLENGE_TTL = int(os.environ.get("VAULT_ZKP_CHALLENGE_TTL", "300"))
 SESSION_TTL = int(os.environ.get("VAULT_SESSION_TTL", str(8 * 60 * 60)))
 SESSION_IDLE_TTL = int(os.environ.get("VAULT_SESSION_IDLE_TTL", "1800"))
 MAX_REQUEST_BYTES = int(os.environ.get("VAULT_MAX_REQUEST_BYTES", str(8 * 1024 * 1024)))
@@ -121,6 +123,7 @@ if TRUST_PROXY:
 logging.basicConfig(level=os.environ.get("VAULT_LOG_LEVEL", "INFO"), format="%(message)s")
 LOG = logging.getLogger("vault.security")
 LOG.info('event="startup" environment="%s" auth_policy="%s" csp_mode="%s" proxy_trust="%s"', "production" if PRODUCTION else "development", AUTH_POLICY, CSP_MODE, int(TRUST_PROXY))
+LOG.info('event="zkp_artifacts_available" available="%s"', int(zkp_verifier.artifacts_available()))
 RATE_KEY = hmac.new(SECRET.encode(), b"vault-rate-limit-v1", hashlib.sha256).digest()
 RATE_LIMITS = {
     "general": (int(os.environ.get("VAULT_RATE_GENERAL", "120")), 60),
@@ -131,6 +134,10 @@ RATE_LIMITS = {
     "upload": (int(os.environ.get("VAULT_RATE_UPLOAD", "10")), 60),
     "relay": (int(os.environ.get("VAULT_RATE_RELAY", "6")), 60),
     "delete": (int(os.environ.get("VAULT_RATE_DELETE", "3")), 3600),
+    "zkp_challenge": (int(os.environ.get("VAULT_RATE_ZKP_CHALLENGE", "20")), 300),
+    # Proof verification shells out to `bb` -- meaningfully more expensive
+    # than ordinary form validation, hence a tighter budget than "upload".
+    "zkp_verify": (int(os.environ.get("VAULT_RATE_ZKP_VERIFY", "10")), 300),
     "passkey_admin": (int(os.environ.get("VAULT_RATE_PASSKEY_ADMIN", "5")), 3600),
     "logout": (int(os.environ.get("VAULT_RATE_LOGOUT", "30")), 60),
 }
@@ -209,6 +216,8 @@ def _rate_group():
     if path == "/api/records" and method == "POST": return "upload"
     if path == "/api/records" and method == "DELETE": return "delete"
     if path == "/api/relay": return "relay"
+    if path == "/api/zkp/challenge": return "zkp_challenge"
+    if path == "/api/records/manual": return "zkp_verify"
     if path == "/api/logout": return "logout"
     if (path.startswith("/api/passkeys/") and method in {"PATCH", "DELETE"}) or path == "/api/passkeys/disable": return "passkey_admin"
     return "general"
@@ -509,6 +518,12 @@ def relay():
             transactions = simplefin.generate()
         except simplefin.SimpleFinNotConfigured:
             return api_error("SimpleFin is not configured on this server", 503)
+        except simplefin.SimpleFinAccessRevoked:
+            LOG.warning('event="simplefin_fetch_failed" reason="access_revoked" client="%s"', _client_log_id())
+            return api_error(
+                "SimpleFin declined this connection. The stored access URL may have been "
+                "claimed elsewhere or revoked -- disable it and set up SimpleFin again.", 502,
+            )
         except simplefin.SimpleFinError:
             LOG.warning('event="simplefin_fetch_failed" client="%s"', _client_log_id())
             return api_error("Could not fetch accounts from SimpleFin", 502)
@@ -556,6 +571,168 @@ def put_records():
         conn.execute(stmt)
     conn.commit()
     return jsonify({"stored": len(validated)})
+
+@app.post("/api/zkp/challenge")
+def zkp_challenge():
+    """Issue a one-time challenge for a manual-expense ZK proof. See
+    zkp/README.md and zkp_verifier.py. The client uses `challenge` and
+    `record_id` (both server-generated randomness, hex-encoded) as public
+    circuit inputs; Flask re-checks both against this row before ever
+    calling the verifier -- see zkp_proof_reject below."""
+    denied = require_access()
+    if denied: return denied
+    payload, error = _json_object()
+    if error: return error
+    if set(payload) != {"purpose"}: return api_error("Unknown field in challenge request", 400)
+    if payload["purpose"] != "manual_expense_create":
+        return api_error("Unsupported challenge purpose", 400)
+    if not zkp_verifier.artifacts_available():
+        LOG.warning('event="zkp_challenge_unavailable" client="%s"', _client_log_id())
+        return api_error("Encrypted-record validation is temporarily unavailable", 503)
+
+    challenge_id = secrets.token_urlsafe(32)
+    # 31 bytes, not 32: kept strictly below the BN254 scalar field modulus
+    # (~2^254) so the client's big-endian byte-to-Field encoding can never
+    # wrap. record_id is intentionally short (16 bytes) -- it only needs
+    # to be unguessable, not compressed, so no hash is used; see
+    # zkp_verifier.py's module docstring.
+    challenge_bytes = secrets.token_bytes(31)
+    record_id_bytes = secrets.token_bytes(16)
+    now = time.time()
+    table = models.ZkpChallenge.__table__
+    conn = db()
+    conn.execute(insert(table).values(
+        challenge_id=challenge_id, session_id_hash=_sid_hash(session.sid),
+        challenge=challenge_bytes, record_id=record_id_bytes,
+        purpose="manual_expense_create", circuit_version=zkp_verifier.CIRCUIT_VERSION,
+        schema_version=zkp_verifier.SCHEMA_VERSION, created_at=now, expires_at=now + ZKP_CHALLENGE_TTL,
+    ))
+    conn.commit()
+    return jsonify({
+        "challenge_id": challenge_id,
+        "challenge": challenge_bytes.hex(),
+        "record_id": record_id_bytes.hex(),
+        "schema_version": zkp_verifier.SCHEMA_VERSION,
+        "circuit_version": zkp_verifier.CIRCUIT_VERSION,
+        "expires_in": ZKP_CHALLENGE_TTL,
+        "categories": list(zkp_verifier.CATEGORY_IDS),
+    })
+
+def _claim_zkp_challenge(challenge_id):
+    """Atomically claim a challenge (single UPDATE ... RETURNING, matching
+    _take_challenge()'s existing pattern above): consumed exactly once,
+    with no SELECT-then-UPDATE race between two concurrent submissions of
+    the same challenge_id. Consuming happens BEFORE proof verification,
+    not after: a wasted challenge on an invalid/failed proof is cheap
+    (the client just requests another one) and this keeps single-use
+    genuinely race-free, which matters more here than being lenient about
+    failed attempts. See zkp/README.md."""
+    now = time.time()
+    table = models.ZkpChallenge.__table__
+    conn = db()
+    row = conn.execute(
+        update(table)
+        .where(
+            (table.c.challenge_id == challenge_id) & (table.c.session_id_hash == _sid_hash(session.sid))
+            & (table.c.purpose == "manual_expense_create") & (table.c.consumed_at.is_(None))
+            & (table.c.expires_at > now)
+        )
+        .values(consumed_at=now)
+        .returning(table.c.challenge, table.c.record_id, table.c.schema_version, table.c.circuit_version)
+    ).mappings().first()
+    conn.commit()
+    return row
+
+@app.post("/api/records/manual")
+def create_manual_expense_zkp():
+    """ZK-proof-gated manual expense creation. See zkp/README.md for the
+    full design and its documented limitation: a valid proof here does NOT
+    prove the ciphertext in this same request contains the record the
+    proof was computed over -- Flask cannot decrypt `sealed` to check that.
+    See that document's "What this circuit does and does not prove"."""
+    denied = require_access()
+    if denied: return denied
+    payload, error = _json_object()
+    if error: return error
+    expected = {"challenge_id", "blind_index", "sealed", "commitment", "proof", "public_inputs"}
+    if set(payload) != expected: return api_error("Invalid manual expense submission", 400)
+
+    challenge_id, blind, sealed, commitment, proof_hex, public_inputs = (
+        payload["challenge_id"], payload["blind_index"], payload["sealed"],
+        payload["commitment"], payload["proof"], payload["public_inputs"],
+    )
+    if not isinstance(challenge_id, str) or not challenge_id or len(challenge_id) > 128:
+        return api_error("Invalid manual expense submission", 400)
+    if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind):
+        return api_error("Invalid record", 400)
+    if not isinstance(sealed, str) or not _LOWER_HEX.fullmatch(sealed) or len(sealed) % 2 \
+            or not MIN_SEALED_HEX_LENGTH <= len(sealed) <= MAX_SEALED_HEX_LENGTH:
+        return api_error("Invalid record", 400)
+    if not isinstance(commitment, str) or not _LOWER_HEX_64.fullmatch(commitment):
+        return api_error("Invalid record", 400)
+    if not isinstance(proof_hex, str) or not _LOWER_HEX.fullmatch(proof_hex) or len(proof_hex) % 2:
+        return api_error("Unable to validate the encrypted record.", 400)
+    if not isinstance(public_inputs, dict) or set(public_inputs) != {"challenge", "record_id", "schema_version"}:
+        return api_error("Unable to validate the encrypted record.", 400)
+    if public_inputs["schema_version"] != zkp_verifier.SCHEMA_VERSION:
+        return api_error("Unable to validate the encrypted record.", 400)
+
+    claimed = _claim_zkp_challenge(challenge_id)
+    if claimed is None:
+        LOG.warning('event="zkp_challenge_rejected" client="%s"', _client_log_id())
+        return api_error("Unable to validate the encrypted record.", 400)
+
+    # Independently re-check every public input against what THIS server
+    # issued for THIS challenge -- never trust the client's copy of them,
+    # even though the proof also constrains them. Any mismatch here means
+    # the proof (if valid at all) was computed for a different context.
+    if (
+        public_inputs["challenge"] != bytes(claimed["challenge"]).hex()
+        or public_inputs["record_id"] != bytes(claimed["record_id"]).hex()
+        or claimed["circuit_version"] != zkp_verifier.CIRCUIT_VERSION
+    ):
+        LOG.warning('event="zkp_context_mismatch" client="%s"', _client_log_id())
+        return api_error("Unable to validate the encrypted record.", 400)
+
+    try:
+        proof_bytes = bytes.fromhex(proof_hex)
+    except ValueError:
+        return api_error("Unable to validate the encrypted record.", 400)
+
+    try:
+        result = zkp_verifier.verify_proof(proof_bytes)
+    except zkp_verifier.CircuitArtifactsUnavailable:
+        LOG.warning('event="zkp_verifier_unavailable" client="%s"', _client_log_id())
+        return api_error("Unable to validate the encrypted record.", 503)
+    except zkp_verifier.ZkpVerificationError:
+        LOG.warning('event="zkp_proof_malformed" client="%s"', _client_log_id())
+        return api_error("Unable to validate the encrypted record.", 400)
+
+    if not result.valid:
+        LOG.warning(
+            'event="zkp_proof_invalid" client="%s" duration_ms="%d"',
+            _client_log_id(), int(result.duration_seconds * 1000),
+        )
+        return api_error("Unable to validate the encrypted record.", 400)
+
+    table = models.Record.__table__
+    conn = db()
+    today = date.today()
+    stmt = pg_insert(table).values(
+        blind_index=blind, sealed=sealed, bytes=len(bytes.fromhex(sealed)), stored_at=today,
+        commitment=commitment, circuit_version=zkp_verifier.CIRCUIT_VERSION,
+    )
+    stmt = stmt.on_conflict_do_update(index_elements=["blind_index"], set_=dict(
+        sealed=stmt.excluded.sealed, bytes=stmt.excluded.bytes,
+        commitment=stmt.excluded.commitment, circuit_version=stmt.excluded.circuit_version,
+    ))
+    conn.execute(stmt)
+    conn.commit()
+    LOG.info(
+        'event="manual_expense_created_zkp" client="%s" duration_ms="%d"',
+        _client_log_id(), int(result.duration_seconds * 1000),
+    )
+    return jsonify({"stored": True})
 
 @app.get("/api/records")
 def get_records():

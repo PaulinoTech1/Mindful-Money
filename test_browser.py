@@ -376,6 +376,108 @@ def main() -> int:
             check(all(PASSPHRASE not in body for body in request_bodies), "passphrase never appears in network request bodies")
             cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": authenticator})
 
+            # --- manual expense entry -------------------------------------
+            print("\n  Manual expense entry")
+            invalid = page.evaluate("""() => {
+                const name = (v) => { try { validateExpenseName(v); return null; } catch (e) { return e.message; } };
+                const amt = (v) => { try { validateExpenseAmount(v); return null; } catch (e) { return e.message; } };
+                const cat = (v) => { try { validateExpenseCategory(v); return null; } catch (e) { return e.message; } };
+                return {
+                    emptyName: name(''), whitespaceName: name('   '), nullName: name(null),
+                    arrayName: name([]), objectName: name({}), tooLongName: name('a'.repeat(121)),
+                    okName: name("Bob's Burgers"),
+                    emptyAmount: amt(''), zeroAmount: amt('0'), negativeAmount: amt('-1'),
+                    nanAmount: amt('NaN'), infAmount: amt('Infinity'), expAmount: amt('1e10'),
+                    hexAmount: amt('0x20'), currencyAmount: amt('$10'), commaAmount: amt('1,000.00'),
+                    precisionAmount: amt('12.345'), boolAmount: amt(true), arrayAmount: amt([]),
+                    tooBigAmount: amt('1000000000.00'), okAmount: amt('12.34'),
+                    forgedCategory: cat('<script>alert(1)</script>'), okCategory: cat('Groceries'),
+                    blankCategory: cat(''),
+                };
+            }""")
+            check(invalid["emptyName"] is not None, "empty expense name rejected")
+            check(invalid["whitespaceName"] is not None, "whitespace-only expense name rejected")
+            check(invalid["nullName"] is not None, "null expense name rejected")
+            check(invalid["arrayName"] is not None, "array expense name rejected")
+            check(invalid["objectName"] is not None, "object expense name rejected")
+            check(invalid["tooLongName"] is not None, "121-character expense name rejected")
+            check(invalid["okName"] is None, "apostrophe in a legitimate name is accepted", str(invalid["okName"]))
+            check(invalid["emptyAmount"] is not None, "empty amount rejected")
+            check(invalid["zeroAmount"] is not None, "zero amount rejected")
+            check(invalid["negativeAmount"] is not None, "negative amount rejected")
+            check(invalid["nanAmount"] is not None, "NaN amount rejected")
+            check(invalid["infAmount"] is not None, "Infinity amount rejected")
+            check(invalid["expAmount"] is not None, "exponent-notation amount rejected")
+            check(invalid["hexAmount"] is not None, "hex amount rejected")
+            check(invalid["currencyAmount"] is not None, "currency-symbol amount rejected")
+            check(invalid["commaAmount"] is not None, "thousands-separator amount rejected")
+            check(invalid["precisionAmount"] is not None, "3-decimal amount rejected outright, not silently rounded")
+            check(invalid["boolAmount"] is not None, "boolean amount rejected (bool is not treated as numeric)")
+            check(invalid["arrayAmount"] is not None, "array amount rejected")
+            check(invalid["tooBigAmount"] is not None, "amount above the configured maximum rejected")
+            check(invalid["okAmount"] is None, "well-formed amount accepted", str(invalid["okAmount"]))
+            check(invalid["forgedCategory"] is not None, "arbitrary/forged category string rejected")
+            check(invalid["okCategory"] is None, "allowlisted category accepted")
+            check(invalid["blankCategory"] is None, "blank category accepted as 'no category'")
+
+            records_before = int(page.inner_text("#statRecords"))
+            before_manual_requests = list(request_bodies)
+            page.click("#addExpenseBtn")
+            page.wait_for_selector("#addExpenseDialog[open]")
+            xss_name = "<img src=x onerror=alert(1)>"
+            page.fill("#addExpenseName", xss_name)
+            page.fill("#addExpenseAmount", "45.67")
+            page.select_option("#addExpenseCategory", label="Dining")
+            fired = []
+            page.once("dialog", lambda d: (fired.append(d.message), d.dismiss()))
+            page.click("#addExpenseForm button[type=submit]")
+            page.wait_for_selector("#addExpenseDialog", state="hidden")
+            check(int(page.inner_text("#statRecords")) == records_before + 1, "manual expense adds exactly one record")
+            check(not fired, "no alert() fired from the injected expense name", str(fired))
+            ledger_text = page.inner_text("#ledgerBody")
+            check(xss_name in ledger_text, "XSS-payload expense name renders as literal visible text")
+            check(page.query_selector("#ledgerBody img") is None, "payload never became a live <img> element")
+            check(
+                all(xss_name not in body for body in request_bodies[len(before_manual_requests):]),
+                "manual expense name reaches the server only as ciphertext, never plaintext",
+            )
+            manual_entry = page.evaluate("() => { const t = TXNS.find(x => x.merchant.includes('img src')); return t && {source: t.source, category: t.category, account: t.account}; }")
+            check(manual_entry and manual_entry["source"] == "manual", "manual entry is tagged source=manual, not forgeable as simplefin/fakebank")
+            check(manual_entry and manual_entry["category"] == "Dining", "selected category is preserved")
+            check("Manual entries" in page.inner_text("#accounts"), "manual entries show as their own account group, not mixed into a bank's")
+
+            # Two deliberate, separately-submitted identical expenses must
+            # both be kept -- no content-based deduplication.
+            for _ in range(2):
+                page.click("#addExpenseBtn")
+                page.wait_for_selector("#addExpenseDialog[open]")
+                page.fill("#addExpenseName", "Coffee")
+                page.fill("#addExpenseAmount", "3.50")
+                page.click("#addExpenseForm button[type=submit]")
+                page.wait_for_selector("#addExpenseDialog", state="hidden")
+            check(
+                int(page.inner_text("#statRecords")) == records_before + 3,
+                "two deliberately identical manual expenses are both kept, not deduplicated",
+            )
+
+            # A double-click / resubmit race must not create two records
+            # from one logical submission.
+            page.click("#addExpenseBtn")
+            page.wait_for_selector("#addExpenseDialog[open]")
+            page.fill("#addExpenseName", "Race condition test")
+            page.fill("#addExpenseAmount", "9.99")
+            page.evaluate("""() => {
+                const form = document.getElementById('addExpenseForm');
+                form.dispatchEvent(new Event('submit', { cancelable: true }));
+                form.dispatchEvent(new Event('submit', { cancelable: true }));
+            }""")
+            page.wait_for_selector("#addExpenseDialog", state="hidden")
+            page.wait_for_timeout(500)
+            check(
+                int(page.inner_text("#statRecords")) == records_before + 4,
+                "a double-submit race is not turned into two records by the in-flight guard",
+            )
+
             # --- mobile --------------------------------------------------
             print("\n  Responsive")
             page.set_viewport_size({"width": 390, "height": 844})

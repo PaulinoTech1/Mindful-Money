@@ -269,7 +269,7 @@ class TestServerAPI(ServerCase):
         self.assertGreater(len(txns), 200)
         self.assertEqual(
             set(txns[0]), {"id", "merchant", "amount", "date", "pending", "account",
-                           "bank", "account_label", "account_type"}
+                           "bank", "account_label", "account_type", "source"}
         )
 
     def test_relay_persists_nothing(self):

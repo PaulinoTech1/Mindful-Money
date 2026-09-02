@@ -107,6 +107,7 @@ def generate(months: int = 6) -> list[dict]:
                 "bank": meta["bank"],
                 "account_label": meta["label"],
                 "account_type": meta["type"],
+                "source": "fakebank",
             }
         )
         if not (account == "demo_checking" and merchant == "Fans Only"):

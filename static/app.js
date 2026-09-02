@@ -87,6 +87,150 @@ const categorize = (merchant) => {
   return 'Uncategorized';
 };
 
+/* ---------- manual expense entry ----------------------------------------
+   The server (app.py's put_records) only ever sees ciphertext -- it can
+   check that a record LOOKS like a sealed box (hex, length bounds) but
+   has no way to validate an expense's business content, because it never
+   has the key to read it. That makes these validators the sole trust
+   boundary for manual-entry content, not merely UX convenience: anything
+   that reaches seal()/blindIndex() below is exactly what will be stored,
+   with no server-side layer able to catch a mistake here. See app.py's
+   put_records() for what the server *can* still enforce (record shape,
+   batch size, per-vault quota) -- that stays unchanged and still applies
+   to manual records exactly like every other record. */
+
+const MANUAL_CATEGORIES = new Set([
+  'Housing', 'Groceries', 'Dining', 'Transport', 'Utilities', 'Subscriptions',
+  'Shopping', 'Health & insurance', 'Investing', 'Income', 'Uncategorized',
+]);
+const MANUAL_AMOUNT_MAX = 999999999.99;
+const MANUAL_AMOUNT_PATTERN = /^\d{1,9}(?:\.\d{1,2})?$/;
+
+function validateExpenseName(raw) {
+  if (typeof raw !== 'string') throw new Error('Expense name is required.');
+  const trimmed = raw.normalize('NFC').trim();
+  if (!trimmed) throw new Error('Expense name is required.');
+  for (const ch of trimmed) {
+    const point = ch.codePointAt(0);
+    if (point < 0x20 || point === 0x7f) throw new Error('Expense name contains an invalid character.');
+  }
+  if ([...trimmed].length > 120) throw new Error('Expense name must be 120 characters or fewer.');
+  return trimmed;
+}
+
+// Deliberately a strict allowlist pattern, not a blacklist: it defines what
+// a valid amount string looks like (ASCII digits, one optional '.', 1-2
+// fraction digits) rather than trying to reject "$", ",", "e", "Infinity",
+// "NaN", hex, etc. one at a time. Never routes through parseFloat/Number
+// before this check, so binary-float parsing of hostile input never happens.
+function validateExpenseAmount(raw) {
+  if (typeof raw !== 'string') throw new Error('Amount is required.');
+  const trimmed = raw.trim();
+  if (!trimmed) throw new Error('Amount is required.');
+  if (!MANUAL_AMOUNT_PATTERN.test(trimmed)) {
+    throw new Error('Enter a monetary amount such as 12.34. Maximum two decimal places.');
+  }
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || value <= 0) throw new Error('Enter an amount greater than 0.');
+  if (value > MANUAL_AMOUNT_MAX) throw new Error(`Enter an amount between 0.01 and ${MANUAL_AMOUNT_MAX.toFixed(2)}.`);
+  return value;
+}
+
+// Returns undefined for "no category" (the same representation bank-synced
+// transactions use before categorize() fills one in at load()) rather than
+// "", so there is exactly one canonical uncategorized state, not two.
+function validateExpenseCategory(raw) {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  if (typeof raw !== 'string' || !MANUAL_CATEGORIES.has(raw)) {
+    throw new Error('Select a valid category or leave this field blank.');
+  }
+  return raw;
+}
+
+let EXPENSE_SUBMIT_IN_FLIGHT = false;
+
+function openAddExpenseDialog() {
+  $('addExpenseForm').reset();
+  $('addExpenseError').textContent = '';
+  [$('addExpenseName'), $('addExpenseAmount')].forEach((el) => el.removeAttribute('aria-invalid'));
+  $('addExpenseDialog').showModal();
+  $('addExpenseName').focus();
+}
+
+async function submitManualExpense(event) {
+  event.preventDefault();
+  if (EXPENSE_SUBMIT_IN_FLIGHT) return;
+  const error = $('addExpenseError');
+  const nameField = $('addExpenseName'), amountField = $('addExpenseAmount');
+  error.textContent = '';
+  nameField.removeAttribute('aria-invalid');
+  amountField.removeAttribute('aria-invalid');
+
+  let name, amount, category;
+  try {
+    name = validateExpenseName(nameField.value);
+  } catch (e) {
+    nameField.setAttribute('aria-invalid', 'true');
+    error.textContent = e.message;
+    return;
+  }
+  try {
+    amount = validateExpenseAmount(amountField.value);
+  } catch (e) {
+    amountField.setAttribute('aria-invalid', 'true');
+    error.textContent = e.message;
+    return;
+  }
+  try {
+    category = validateExpenseCategory($('addExpenseCategory').value);
+  } catch (e) {
+    error.textContent = e.message;
+    return;
+  }
+
+  EXPENSE_SUBMIT_IN_FLIGHT = true;
+  const submitButton = $('addExpenseForm').querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  try {
+    // Explicit allowlist of user-facing fields (name, amount, category)
+    // merged into a record built entirely from trusted, non-form values --
+    // id, date, account*, and source are never taken from user input, so
+    // there is no way for a submission to forge provenance (e.g. claim
+    // source: "simplefin") or overwrite another record's id.
+    const manual = {
+      id: `manual_${crypto.randomUUID()}`,
+      merchant: name,
+      amount,
+      date: new Date().toISOString().slice(0, 10),
+      pending: false,
+      account: 'manual',
+      bank: 'Manual entries',
+      account_label: 'Manual entries',
+      account_type: 'Manual',
+      source: 'manual',
+      ...(category !== undefined ? { category } : {}),
+    };
+    await api('/api/records', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ records: [{ blind_index: blindIndex(manual.id), sealed: seal(manual) }] }),
+    });
+    TXNS.push({
+      ...manual, category: manual.category || categorize(manual.merchant),
+      notes: '', tags: [], splits: [], is_transfer: false, excluded: false, fraud_status: '',
+    });
+    TXNS.sort((a, b) => a.date.localeCompare(b.date));
+    $('statRecords').textContent = TXNS.length;
+    $('addExpenseDialog').close();
+    renderAccounts();
+    render();
+  } catch (e) {
+    error.textContent = e.message || 'Could not save this expense. Try again.';
+  } finally {
+    EXPENSE_SUBMIT_IN_FLIGHT = false;
+    submitButton.disabled = false;
+  }
+}
+
 /* ---------- crypto ---------- */
 
 async function deriveKeys(passphrase) {
@@ -172,6 +316,11 @@ async function unlock() {
     return;
   }
 
+  const username = $('username').value.trim();
+  if (username) localStorage.setItem('vault_username', username); else localStorage.removeItem('vault_username');
+  $('userGreeting').textContent = username ? `Welcome, ${username}` : '';
+  $('userGreeting').hidden = !username;
+
   $('lock').dataset.state = 'open';
   $('lockLabel').textContent = 'Unlocked';
   $('statKey').textContent = S.to_hex(KEYS.publicKey).slice(0, 12);
@@ -179,6 +328,7 @@ async function unlock() {
   $('syncBtn').hidden = false;
   $('connectSimplefinBtn').hidden = !SIMPLEFIN_AVAILABLE;
   $('syncSimplefinBtn').hidden = !SIMPLEFIN_AVAILABLE;
+  $('addExpenseBtn').hidden = false;
   $('resetBtn').hidden = false;
   $('gate').hidden = true;
   $('security').hidden = false;
@@ -443,8 +593,8 @@ function renderAccounts() {
     const meta = accountMeta(id, rows);
     const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
     return `<div class="accountItem">
-      <div class="accountBank">${meta.bank}</div>
-      <div class="accountLabel">${meta.type} · ${meta.label}<span>${rows.length} records</span></div>
+      <div class="accountBank">${escapeHtml(meta.bank)}</div>
+      <div class="accountLabel">${escapeHtml(meta.type)} · ${escapeHtml(meta.label)}<span>${rows.length} records</span></div>
       <div class="accountFlow">Net flow ${money(net, true)}</div>
     </div>`;
   }).join('');
@@ -459,9 +609,9 @@ function renderAccounts() {
     const amountLabel = retirement ? 'Contributed' : 'Net flow';
     const width = totalVisible ? Math.max(5, Math.round((contributions / totalVisible) * 100)) : 5;
     return `<article class="accountCard ${retirement ? 'retirement' : 'checking'}">
-      <div class="accountCardTop"><span class="accountCardType">${meta.type}</span><span class="accountCardBadge">${rows.length} records</span></div>
-      <div class="accountCardBank">${meta.bank}</div>
-      <div class="accountCardLabel">${meta.label}</div>
+      <div class="accountCardTop"><span class="accountCardType">${escapeHtml(meta.type)}</span><span class="accountCardBadge">${rows.length} records</span></div>
+      <div class="accountCardBank">${escapeHtml(meta.bank)}</div>
+      <div class="accountCardLabel">${escapeHtml(meta.label)}</div>
       <div class="accountCardAmount"><small>${amountLabel}</small>${money(amount, true)}</div>
       <div class="accountCardMeta">${retirement ? 'Retirement contributions' : 'Everyday account movement'}</div>
       <progress class="accountBar" aria-label="${width}% of deposits" max="100" value="${width}"></progress>
@@ -1207,8 +1357,9 @@ function lockVault() {
   Object.values(CHARTS).forEach((c) => c.destroy()); CHARTS = {};
   Object.values(CHAT_CHARTS).forEach((c) => c.destroy());
   $('ledgerBody').textContent = ''; $('accountList').textContent = ''; $('dashboardAccounts').textContent = ''; $('chatMessages').textContent = ''; $('rawBody').textContent = '';
-  ['dash','empty','serverview','security','stats','accounts','syncBtn','syncSimplefinBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
+  ['dash','empty','serverview','security','stats','accounts','syncBtn','syncSimplefinBtn','addExpenseBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
   document.body.classList.remove('sv'); $('pass').value = ''; updatePassphraseEntropy(); $('lock').dataset.state = 'locked'; $('lockLabel').textContent = 'Locked';
+  $('userGreeting').hidden = true;
   $('unlockBtn').disabled = false;
   $('gate').hidden = false; $('gate').querySelector('h1').textContent = 'Unlock vault with passphrase';
 }
@@ -1234,9 +1385,11 @@ async function disablePasskeys() {
   const sources = await api('/api/relay/sources'); SIMPLEFIN_AVAILABLE = sources.simplefin_available;
   await sodium.ready;
   S = sodium;
+  $('username').value = localStorage.getItem('vault_username') || '';
   $('unlockBtn').addEventListener('click', unlock);
   $('pass').addEventListener('input', updatePassphraseEntropy);
   $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+  $('username').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
   $('connectBtn').addEventListener('click', () => connect('fakebank'));
   $('syncBtn').addEventListener('click', () => connect('fakebank'));
   $('connectSimplefinBtn').addEventListener('click', () => connect('simplefin'));
@@ -1253,6 +1406,10 @@ async function disablePasskeys() {
   $('transactionEditForm').addEventListener('submit', saveTransactionEdit);
   $('editCancel').addEventListener('click', () => $('transactionEditor').close());
   $('editCancelX').addEventListener('click', () => $('transactionEditor').close());
+  $('addExpenseBtn').addEventListener('click', openAddExpenseDialog);
+  $('addExpenseForm').addEventListener('submit', submitManualExpense);
+  $('addExpenseCancel').addEventListener('click', () => $('addExpenseDialog').close());
+  $('addExpenseCancelX').addEventListener('click', () => $('addExpenseDialog').close());
   initChat();
   if (PASSKEY_REQUIRED && !PASSKEY_AUTHENTICATED) { $('gate').hidden = true; $('passkeyGate').hidden = false; }
   else $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';

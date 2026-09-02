@@ -1,0 +1,279 @@
+/* Manual-expense ZK-proof client.
+ *
+ * STATUS: written, NOT wired into static/app.js's live "Add manual
+ * expense" flow, and NOT executed anywhere in this repository -- see
+ * ../../zkp/README.md, "Status". It needs a compiled circuit artifact
+ * (../../zkp/manual_expense/target/manual_expense.json, produced by
+ * `nargo compile` on Linux/macOS/WSL) that does not exist yet, because
+ * Barretenberg has no native Windows build and this repo's dev sandbox is
+ * native Windows. The existing (non-ZK) manual-expense flow in
+ * static/app.js is unaffected and still works.
+ *
+ * API confidence, so a future reader knows what to re-verify first:
+ *   - Noir/UltraHonkBackend import shape, `new Noir(circuit)`,
+ *     `new UltraHonkBackend(circuit.bytecode)`, `noir.execute(inputs)`,
+ *     `backend.generateProof(witness)`, `backend.verifyProof(proof)`:
+ *     CONFIRMED verbatim from the official example app
+ *     https://github.com/noir-lang/tiny-noirjs-app (fetched directly
+ *     while writing this file), pinned to @noir-lang/noir_js 1.0.0-beta.20
+ *     / @aztec/bb.js 3.0.0-nightly.20251104 -- see package.json and
+ *     ../../zkp/README.md for the version-pin rationale.
+ *   - `Barretenberg.new()` and `.poseidon2Hash(fields)`: found via
+ *     secondary sources (search results referencing barretenberg/ts and a
+ *     zk-mixer tutorial using `bb.poseidon2Hash([nullifier, secret])`),
+ *     NOT confirmed against primary @aztec/bb.js TypeScript definitions
+ *     in this session. Re-verify the exact factory/method name against
+ *     the pinned bb.js version's type definitions before relying on this
+ *     in production; that is the one genuinely unconfirmed API surface in
+ *     this file.
+ *
+ * Trust boundary: everything below runs in the browser. Flask (see
+ * app.py's /api/zkp/challenge and /api/records/manual) never receives
+ * anything from here except challenge_id, blind_index, sealed (opaque
+ * ciphertext), commitment (a public Poseidon2 output -- not a secret),
+ * proof bytes, and public_inputs (challenge/record_id/schema_version,
+ * server-issued values echoed back for Flask's own independent check --
+ * see app.py). name, amount_cents, category_id, and commitment_blinding
+ * never leave this file. Do not log any of `inputs` below.
+ */
+
+import { UltraHonkBackend } from '@aztec/bb.js';
+import { Barretenberg } from '@aztec/bb.js';
+import { Noir } from '@noir-lang/noir_js';
+import initNoirC from '@noir-lang/noirc_abi';
+import initACVM from '@noir-lang/acvm_js';
+import acvmWasmUrl from '@noir-lang/acvm_js/web/acvm_js_bg.wasm?url';
+import noircWasmUrl from '@noir-lang/noirc_abi/web/noirc_abi_wasm_bg.wasm?url';
+import circuit from '../../zkp/manual_expense/target/manual_expense.json';
+
+export const CIRCUIT_VERSION = 'manual-expense-v1';
+export const SCHEMA_VERSION = 1;
+const MAX_NAME_BYTES = 120;
+// Order matters: index == the circuit's category_id. Must stay in exact
+// sync with MANUAL_CATEGORIES in static/app.js, CATEGORY_IDS in
+// zkp_verifier.py, and CATEGORY_COUNT's implicit ordering in main.nr.
+const CATEGORY_IDS = [
+  'Housing', 'Groceries', 'Dining', 'Transport', 'Utilities', 'Subscriptions',
+  'Shopping', 'Health & insurance', 'Investing', 'Income', 'Uncategorized',
+];
+// Same 29-byte ASCII label as DOMAIN_SEPARATOR in main.nr. Recomputed
+// here independently (not copy-pasted as a hex literal) so a future edit
+// to the label can't silently desync the two without also changing this
+// literal string.
+const DOMAIN_SEPARATOR_LABEL = 'PAULINOTECH_MANUAL_EXPENSE_V1';
+
+let wasmReady = null;
+function ensureWasmReady() {
+  if (!wasmReady) {
+    wasmReady = Promise.all([initACVM(fetch(acvmWasmUrl)), initNoirC(fetch(noircWasmUrl))]);
+  }
+  return wasmReady;
+}
+
+let barretenbergInstance = null;
+async function getBarretenberg() {
+  // See the file-level comment: this factory call is the one API surface
+  // in this file not confirmed against a primary source this session.
+  if (!barretenbergInstance) barretenbergInstance = await Barretenberg.new();
+  return barretenbergInstance;
+}
+
+function fieldFromLabel(label) {
+  const bytes = new TextEncoder().encode(label);
+  let hex = '0x';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+const DOMAIN_SEPARATOR = fieldFromLabel(DOMAIN_SEPARATOR_LABEL);
+
+// ---- canonicalization -----------------------------------------------
+// Mirrors main.nr's witness shape exactly. Does NOT re-implement
+// validateExpenseName/Amount/Category from static/app.js -- callers must
+// run those first. This only turns already-validated values into the
+// circuit's fixed-size representation, and fails loudly (not silently)
+// if a value somehow doesn't fit, rather than truncating or padding past
+// what the circuit actually proves.
+
+function nameToFixedBuffer(name) {
+  const bytes = Array.from(new TextEncoder().encode(name.normalize('NFC')));
+  if (bytes.length < 1 || bytes.length > MAX_NAME_BYTES) {
+    // The UI's "1 to 120 characters" is a code-point bound
+    // (validateExpenseName); this is a byte bound. Most names never hit
+    // this gap, but multi-byte UTF-8 can -- see ../../zkp/README.md.
+    throw new Error('Expense name does not fit the proof’s 120-byte bound.');
+  }
+  const padded = bytes.concat(Array(MAX_NAME_BYTES - bytes.length).fill(0));
+  return { name_bytes: padded, name_length: bytes.length };
+}
+
+// Takes the ORIGINAL validated decimal string (e.g. "12.34"), not the
+// Number validateExpenseAmount() also returns -- deriving cents from a
+// JS Number would reintroduce exactly the binary-float risk this design
+// exists to avoid.
+function amountStringToCents(rawAmountString) {
+  const match = /^(\d{1,9})(?:\.(\d{1,2}))?$/.exec(rawAmountString.trim());
+  if (!match) throw new Error('Amount is not a validated decimal string.');
+  const whole = BigInt(match[1]);
+  const frac = (match[2] || '').padEnd(2, '0');
+  const cents = whole * 100n + BigInt(frac);
+  if (cents <= 0n) throw new Error('Amount must be greater than zero.');
+  return cents;
+}
+
+function categoryToWitness(categoryNameOrUndefined) {
+  if (categoryNameOrUndefined === undefined) return { category_id: 0, has_category: false };
+  const id = CATEGORY_IDS.indexOf(categoryNameOrUndefined);
+  if (id < 0) throw new Error('Unknown category.');
+  return { category_id: id, has_category: true };
+}
+
+// 128 bits of browser CSPRNG entropy, matching this design's documented
+// minimum -- see the project delivery report, "Circuit design" (blinding).
+function randomBlindingField() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let hex = '0x';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
+function hexToField(hex) {
+  return hex.startsWith('0x') ? hex : `0x${hex}`;
+}
+
+function bytesToHex(bytes) {
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/**
+ * Compute the same Poseidon2 commitment main.nr's `main` asserts,
+ * independent of running the circuit. Used both before proving (to
+ * supply the `commitment` public input the circuit checks) and by
+ * verifyStoredRecord() below (to re-check a decrypted record's stored
+ * commitment on every read, without re-proving anything).
+ *
+ * Preimage order MUST exactly match main.nr's `preimage` array -- this is
+ * the one place that ordering is duplicated outside the circuit; a
+ * mismatch here would make every proof fail closed (safe) rather than
+ * silently verify the wrong thing, but keep the two in sync deliberately.
+ */
+async function computeCommitment({ nameBytes, nameLength, amountCents, categoryId, blinding, challenge, recordIdHash }) {
+  const bb = await getBarretenberg();
+  const preimage = [
+    DOMAIN_SEPARATOR,
+    hexToField(challenge),
+    hexToField(recordIdHash),
+    `0x${SCHEMA_VERSION.toString(16)}`,
+    blinding,
+    `0x${amountCents.toString(16)}`,
+    `0x${categoryId.toString(16)}`,
+    `0x${nameLength.toString(16)}`,
+    ...nameBytes.map((b) => `0x${b.toString(16)}`),
+  ];
+  // See the file-level comment: exact bb.js return shape (Fr vs string)
+  // not confirmed against primary docs this session -- normalize
+  // defensively either way.
+  const result = await bb.poseidon2Hash(preimage);
+  return typeof result === 'string' ? result : `0x${result.toString(16)}`;
+}
+
+/** Thin wrapper over POST /api/zkp/challenge -- see app.py. `apiFetch`
+ * is static/app.js's existing `api()` helper, passed in rather than
+ * imported, so this module has no hard dependency on app.js's globals. */
+export async function requestChallenge(apiFetch) {
+  return apiFetch('/api/zkp/challenge', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ purpose: 'manual_expense_create' }),
+  });
+}
+
+/**
+ * Full prove step for one manual expense. `validated` = the output of
+ * static/app.js's validateExpenseName/validateExpenseAmount/
+ * validateExpenseCategory, PLUS the original raw amount string (needed
+ * for exact-decimal cents conversion -- see amountStringToCents).
+ * `challengeResponse` = requestChallenge()'s result.
+ *
+ * Returns { commitment, blinding, proof, publicInputs } ready to submit
+ * to POST /api/records/manual alongside blind_index/sealed (produced by
+ * static/app.js's existing blindIndex()/seal(), unchanged) -- `blinding`
+ * must be included in the sealed plaintext record (see
+ * ../../zkp/README.md, "AES-GCM record" / this app's sealed-box
+ * equivalent) so a legitimate client can recompute the commitment later.
+ */
+export async function proveManualExpense(challengeResponse, validated) {
+  await ensureWasmReady();
+
+  const { name_bytes, name_length } = nameToFixedBuffer(validated.name);
+  const cents = amountStringToCents(validated.rawAmount);
+  const { category_id, has_category } = categoryToWitness(validated.category);
+  const blinding = randomBlindingField();
+  const challenge = hexToField(challengeResponse.challenge);
+  const recordIdHash = hexToField(challengeResponse.record_id);
+
+  const commitment = await computeCommitment({
+    nameBytes: name_bytes, nameLength: name_length, amountCents: cents,
+    categoryId: category_id, blinding, challenge, recordIdHash,
+  });
+
+  const inputs = {
+    name_bytes, name_length,
+    amount_cents: cents.toString(),
+    category_id: category_id.toString(),
+    has_category,
+    commitment_blinding: blinding,
+    challenge, record_id_hash: recordIdHash,
+    schema_version: SCHEMA_VERSION.toString(),
+    commitment,
+  };
+
+  const noir = new Noir(circuit);
+  const backend = new UltraHonkBackend(circuit.bytecode);
+  const { witness } = await noir.execute(inputs);
+  const proof = await backend.generateProof(witness);
+  const verifiedLocally = await backend.verifyProof(proof);
+  if (!verifiedLocally) {
+    // Should be unreachable if the constraints above are satisfiable --
+    // a local self-check failing means something in this file's witness
+    // construction is wrong, not that the user's input was invalid.
+    throw new Error('Local proof self-check failed.');
+  }
+
+  return {
+    commitment,
+    blinding,
+    proof: bytesToHex(proof.proof),
+    publicInputs: {
+      challenge: challengeResponse.challenge,
+      record_id: challengeResponse.record_id,
+      schema_version: SCHEMA_VERSION,
+    },
+  };
+}
+
+/**
+ * Client retrieval verification (see ../../zkp/README.md). Call this
+ * after decrypting a manual-expense record and BEFORE rendering it.
+ * Recomputes the commitment from the decrypted plaintext (which must
+ * include `commitment_blinding`, per proveManualExpense's contract) and
+ * compares it against the record's stored `commitment`. On any mismatch,
+ * the caller MUST treat the record as an integrity failure: do not
+ * render it, do not silently repair it. This is the layer that would
+ * catch the proof/ciphertext-mismatch scenario documented in
+ * ../../zkp/README.md and test_zkp_server.py -- Flask cannot detect it at
+ * ingestion time, but a legitimate client detects it here on read.
+ */
+export async function verifyStoredRecord(decryptedRecord, storedCommitmentHex, publicContext) {
+  const recomputed = await computeCommitment({
+    nameBytes: nameToFixedBuffer(decryptedRecord.merchant).name_bytes,
+    nameLength: nameToFixedBuffer(decryptedRecord.merchant).name_length,
+    amountCents: amountStringToCents(decryptedRecord.amount.toFixed(2)),
+    categoryId: categoryToWitness(decryptedRecord.category).category_id,
+    blinding: hexToField(decryptedRecord.commitment_blinding),
+    challenge: hexToField(publicContext.challenge),
+    recordIdHash: hexToField(publicContext.record_id),
+  });
+  const normalize = (h) => h.replace(/^0x/, '').toLowerCase();
+  return normalize(recomputed) === normalize(storedCommitmentHex);
+}

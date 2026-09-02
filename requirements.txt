@@ -1,4 +1,5 @@
 Flask>=3.1,<4
+pydantic>=2,<3
 PyNaCl>=1.5
 webauthn>=2.7,<3
 gunicorn>=23,<24; platform_system != "Windows"

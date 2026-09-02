@@ -60,6 +60,44 @@ class Record(Base):
     # Day granularity only, matching the old datetime('now','start of day')
     # truncation -- this only ever drives a GROUP BY write-day histogram.
     stored_at: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    # Both NULL for every record that did not go through the ZK-proof-gated
+    # manual-expense path (SimpleFin, fakebank, and the plain manual-entry
+    # path all leave these NULL). `commitment` is a public Poseidon2 output
+    # -- see zkp/manual_expense/src/main.nr -- never a secret, safe to
+    # store in the clear; it reveals nothing about name/amount/category
+    # without the private blinding value, which never leaves the browser.
+    commitment: Mapped[str | None] = mapped_column(String(64))
+    circuit_version: Mapped[str | None] = mapped_column(String(40))
+
+
+class ZkpChallenge(Base):
+    """One-time, single-use challenges binding a manual-expense ZK proof to
+    a specific authenticated session, record, and expiry. See app.py's
+    /api/zkp/challenge and /api/records/manual, and zkp_verifier.py."""
+
+    __tablename__ = "zkp_challenges"
+
+    challenge_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    session_id_hash: Mapped[str] = mapped_column(
+        ForeignKey("server_sessions.session_id_hash"), nullable=False, index=True
+    )
+    # Raw bytes, encoded to a Field client-side -- never itself secret, but
+    # kept unguessable (secrets.token_bytes) so a proof cannot be replayed
+    # against a challenge nobody issued.
+    challenge: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # Random bytes Flask generates and the client must prove against
+    # (record_id_hash public input) -- see the module docstring in
+    # zkp_verifier.py for why this is a direct field encoding, not a hash.
+    record_id: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    purpose: Mapped[str] = mapped_column(
+        Enum("manual_expense_create", name="zkp_challenge_purpose", native_enum=False, create_constraint=True),
+        nullable=False,
+    )
+    circuit_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Double, nullable=False, index=True)
+    consumed_at: Mapped[float | None] = mapped_column(Double)
 
 
 class PasskeyCredential(Base):
