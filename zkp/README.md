@@ -1,6 +1,6 @@
-# Manual-expense zero-knowledge validation
+# Manual-transaction zero-knowledge validation
 
-`manual-expense-v1` proves that a hidden manual-expense record satisfies
+`manual-transaction-v2` proves that a hidden manual income or expense record satisfies
 the application's schema and range rules. The server verifies the proof
 before storing the opaque ciphertext and never receives the plaintext,
 encryption key, passphrase, or private witness.
@@ -24,6 +24,8 @@ The following checks passed on 2026-09-03:
   `@aztec/bb.js` 5.1.0
 - native `bb` 5.1.0 verification of that bb.js proof using the committed VK
 - 28 Flask/server verifier tests
+- 114 browser end-to-end checks, including encrypted income/expense entry and
+  strict type-specific category dropdowns with `Other`
 - `npm audit --omit=dev`: zero production dependency advisories
 
 The full npm audit reports six low-severity advisories under the official
@@ -56,9 +58,9 @@ assets so that capability is available without weakening CSP.
 Committed artifact SHA-256 values:
 
 ```text
-manual_expense.json  f8577b04b5ced4823c79beb822572f7f2a377de0c6acefc84771c1437e1023e9
-vk                   aa119aab46bb92a9be27db89819221c703141ff4412e0be509e86d2fbc34730e
-vk_hash              bbb2fe47eed1e3acc28d636bd884ee40ade721e68b1456ed7eb094c72846a7f5
+manual_expense.json  cb0d6e69e917ff28ca54b043bfd86b0a2d71d4ea53dafb0f6a1af07dc0f27511
+vk                   0a091b74379aa3fcca4d37b469ecf4400fb225045b3bdada6269298a975854cd
+vk_hash              c0453957ec104b991d9f7b1993fb2d0deaa2ce7f52689f2b918658f74c796dc9
 ```
 
 Regenerate the ACIR and VK together after any circuit, dependency, or
@@ -79,13 +81,17 @@ Public statement, in the exact order emitted by the compiled ABI:
 
 1. server-issued `challenge`
 2. server-issued `record_id_hash`
-3. `schema_version == 1`
+3. `schema_version == 2`
 4. public return value `commitment`
 
 The circuit enforces a non-empty, well-formed UTF-8, canonical zero-padded
 name; rejects ASCII controls, invalid/overlong sequences, surrogates, and
 outer ASCII spaces; bounds the amount to 1..99,999,999,999 cents; checks
-category membership; and fixes the schema version. It returns:
+category membership; distinguishes income categories from expense categories;
+and fixes the schema version. Expense category ids are 0..9 and income category
+ids are 10..15. Each type has a separate internal `Other` id, so choosing
+`Other` still binds the transaction type even though both display the same
+user-facing label. It returns:
 
 ```text
 Poseidon2(domain_separator, challenge, record_id_hash, schema_version,
@@ -107,7 +113,8 @@ logic.
 ## Browser request flow
 
 1. Call `requestChallenge(api)`.
-2. Call `proveManualExpense(challenge, validatedRecord)`.
+2. Call `proveManualTransaction(challenge, validatedRecord)` (the legacy
+   `proveManualExpense` export remains as an alias).
 3. Add the returned `blinding` and `publicContext` to the plaintext record.
 4. Encrypt that plaintext using the existing browser-only encryption code.
 5. Submit this shape to `POST /api/records/manual`:
@@ -188,7 +195,9 @@ relation itself (or use a ZK-friendly authenticated-encryption design);
 AES-GCM/sealed-box ciphertext cannot be bound merely by adding its hash as
 a public input.
 
-The current live `static/app.js` manual-entry path is still the original
-non-ZK path. The ZK module and endpoints are complete and tested, but UI
-wiring should remain feature-gated until the proving bundle's roughly
-3.4 MB gzip download and browser memory/latency are acceptable for alpha.
+The live `static/app.js` manual-entry form now accepts either income or expense,
+uses a strict type-specific category list with `Other`, and stores the selected
+type only inside the encrypted record. Its storage path is still non-ZK. The ZK
+module and endpoints are complete and tested, but UI wiring should remain
+feature-gated until the proving bundle's roughly 3.4 MB gzip download and browser
+memory/latency are acceptable for alpha.

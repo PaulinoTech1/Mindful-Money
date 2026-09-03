@@ -1,4 +1,4 @@
-"""Server-side cryptographic verifier for manual-expense ZK proofs.
+"""Server-side cryptographic verifier for manual-transaction ZK proofs.
 
 See zkp/README.md for the full design writeup. Trust boundary this module
 enforces:
@@ -13,7 +13,7 @@ enforces:
         v
     valid / invalid, nothing else
 
-This module NEVER receives, computes, or has access to: plaintext expense
+This module NEVER receives, computes, or has access to: plaintext transaction
 fields, the client-side encryption key, or any private circuit witness --
 none of those ever leave the browser (see static/zkp/manual_expense_client.js).
 It also never accepts a verification key from a caller; only the file at
@@ -50,15 +50,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-CIRCUIT_VERSION = "manual-expense-v1"
-SCHEMA_VERSION = 1
+CIRCUIT_VERSION = "manual-transaction-v2"
+SCHEMA_VERSION = 2
 
 # Must stay in exact sync with the CATEGORY_COUNT ordering in
 # zkp/manual_expense/src/main.nr and MANUAL_CATEGORIES in static/app.js.
 # Index in this tuple == the circuit's category_id witness value.
 CATEGORY_IDS = (
     "Housing", "Groceries", "Dining", "Transport", "Utilities", "Subscriptions",
-    "Shopping", "Health & insurance", "Investing", "Income", "Uncategorized",
+    "Shopping", "Health & insurance", "Investing", "Other (expense)",
+    "Salary", "Freelance", "Investment income", "Refund", "Gift", "Other (income)",
 )
 
 BB_EXECUTABLE = os.environ.get("ZKP_BB_EXECUTABLE") or shutil.which("bb") or "bb"
@@ -216,10 +217,9 @@ def verify_proof(proof_bytes: bytes, public_inputs: list[str] | tuple[str, ...])
 
 def category_id_for(name: str | None) -> tuple[int, bool]:
     """(category_id, has_category) matching the circuit's witness shape,
-    from the same canonical category string static/app.js's
-    validateExpenseCategory already produces. Raises ValueError for
-    anything not in CATEGORY_IDS -- callers must treat that as a 400, not
-    silently default to "Uncategorized"."""
+    using the circuit's internal labels. The two Other labels are distinct
+    because their ids bind income vs expense. Raises ValueError for anything
+    not in CATEGORY_IDS -- callers must fail closed rather than defaulting."""
     if name is None:
         return 0, False
     try:

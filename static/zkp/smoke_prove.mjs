@@ -31,7 +31,7 @@ try {
     commitment_blinding: '0x33',
     challenge: '0x11',
     record_id_hash: '0x22',
-    schema_version: '1',
+    schema_version: '2',
   });
   const proofData = await backend.generateProof(witness);
   if (!(await backend.verifyProof(proofData))) throw new Error('bb.js rejected its generated proof');
@@ -42,9 +42,9 @@ try {
   if (proofData.publicInputs[3].toLowerCase() !== commitment) {
     throw new Error('public commitment is not the fourth proof public input');
   }
-  const domain = `0x${Buffer.from('PAULINOTECH_MANUAL_EXPENSE_V1', 'utf8').toString('hex')}`;
+  const domain = `0x${Buffer.from('PAULINOTECH_MANUAL_TX_V2', 'utf8').toString('hex')}`;
   const preimage = [
-    domain, '0x11', '0x22', 1n, '0x33', 4599n, 1n, 1n, 6n,
+    domain, '0x11', '0x22', 2n, '0x33', 4599n, 1n, 1n, 6n,
     ...name.map((byte) => BigInt(byte)),
   ];
   const nativeCommitment = await bb.poseidon2Hash({ inputs: preimage.map(fieldBytes) });

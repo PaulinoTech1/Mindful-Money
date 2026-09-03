@@ -224,7 +224,13 @@ td.num { color: #233d54; text-align: right; }
 .transactionEditor::backdrop { background: rgba(5,31,50,.55); }
 .transactionEditor form { display: grid; gap: 7px; }
 .transactionEditor label:not(.editorCheck) { color: #456985; font-size: 12px; font-weight: 600; margin-top: 5px; }
-.transactionEditor input:not([type="checkbox"]), .transactionEditor select, .transactionEditor textarea { background: #fff; border: 1px solid #8eb7d5; border-radius: 5px; box-sizing: border-box; color: var(--ink); font: inherit; padding: 9px 11px; resize: vertical; width: 100%; }
+.transactionEditor input:not([type="checkbox"]):not([type="radio"]), .transactionEditor select, .transactionEditor textarea { background: #fff; border: 1px solid #8eb7d5; border-radius: 5px; box-sizing: border-box; color: var(--ink); font: inherit; padding: 9px 11px; resize: vertical; width: 100%; }
+.transactionType { border: 0; margin: 4px 0 2px; padding: 0; }
+.transactionType legend { color: #456985; font-size: 12px; font-weight: 600; margin-bottom: 7px; }
+.transactionTypeOptions { display: grid; gap: 8px; grid-template-columns: 1fr 1fr; }
+.transactionTypeOptions label { align-items: center; background: #fff; border: 1px solid #8eb7d5; border-radius: 5px; cursor: pointer; display: flex; font-size: 13px !important; gap: 8px; margin: 0 !important; padding: 9px 11px; }
+.transactionTypeOptions label:has(input:checked) { background: #e1f2fa; border-color: #3f91c4; color: #174f75; }
+.transactionTypeOptions input { accent-color: #176aa6; box-shadow: none; margin: 0; padding: 0; width: auto; }
 .editorHeader { align-items: start; display: flex; justify-content: space-between; margin-bottom: 4px; }
 .editorHeader h2 { font-size: 23px; margin-top: 2px; }
 .editorClose { background: transparent; border: 0; color: #557b96; cursor: pointer; font-size: 25px; }

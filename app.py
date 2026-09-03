@@ -653,7 +653,7 @@ def put_records():
 
 @app.post("/api/zkp/challenge")
 def zkp_challenge():
-    """Issue a one-time challenge for a manual-expense ZK proof. See
+    """Issue a one-time challenge for a manual-transaction ZK proof. See
     zkp/README.md and zkp_verifier.py. The client uses `challenge` and
     `record_id` (both server-generated randomness, hex-encoded) as public
     circuit inputs; Flask re-checks both against this row before ever
@@ -725,7 +725,7 @@ def _claim_zkp_challenge(challenge_id, identity_id):
 
 @app.post("/api/records/manual")
 def create_manual_expense_zkp():
-    """ZK-proof-gated manual expense creation. See zkp/README.md for the
+    """ZK-proof-gated manual transaction creation. See zkp/README.md for the
     full design and its documented limitation: a valid proof here does NOT
     prove the ciphertext in this same request contains the record the
     proof was computed over -- Flask cannot decrypt `sealed` to check that.
@@ -736,14 +736,14 @@ def create_manual_expense_zkp():
     payload, error = _json_object()
     if error: return error
     expected = {"challenge_id", "blind_index", "sealed", "commitment", "proof", "public_inputs"}
-    if set(payload) != expected: return api_error("Invalid manual expense submission", 400)
+    if set(payload) != expected: return api_error("Invalid manual transaction submission", 400)
 
     challenge_id, blind, sealed, commitment, proof_hex, public_inputs = (
         payload["challenge_id"], payload["blind_index"], payload["sealed"],
         payload["commitment"], payload["proof"], payload["public_inputs"],
     )
     if not isinstance(challenge_id, str) or not challenge_id or len(challenge_id) > 128:
-        return api_error("Invalid manual expense submission", 400)
+        return api_error("Invalid manual transaction submission", 400)
     if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind):
         return api_error("Invalid record", 400)
     if not isinstance(sealed, str) or not _LOWER_HEX.fullmatch(sealed) or len(sealed) % 2 \
@@ -817,7 +817,7 @@ def create_manual_expense_zkp():
     conn.execute(stmt)
     conn.commit()
     LOG.info(
-        'event="manual_expense_created_zkp" client="%s" duration_ms="%d"',
+        'event="manual_transaction_created_zkp" client="%s" duration_ms="%d"',
         _client_log_id(), int(result.duration_seconds * 1000),
     )
     return jsonify({"stored": True})

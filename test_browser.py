@@ -373,12 +373,13 @@ def main() -> int:
             check(page.is_visible("#gate") and not page.is_visible("#passkeyGate"), "lock clears vault but preserves passkey session")
             page.fill("#pass", PASSPHRASE); page.click("#unlockBtn"); page.wait_for_selector("#dash:not([hidden])", timeout=30000)
 
-            # --- manual expense entry -------------------------------------
-            print("\n  Manual expense entry")
+            # --- manual income / expense entry ----------------------------
+            print("\n  Manual transaction entry")
             invalid = page.evaluate("""() => {
-                const name = (v) => { try { validateExpenseName(v); return null; } catch (e) { return e.message; } };
-                const amt = (v) => { try { validateExpenseAmount(v); return null; } catch (e) { return e.message; } };
-                const cat = (v) => { try { validateExpenseCategory(v); return null; } catch (e) { return e.message; } };
+                const name = (v) => { try { validateTransactionName(v); return null; } catch (e) { return e.message; } };
+                const amt = (v) => { try { validateTransactionAmount(v); return null; } catch (e) { return e.message; } };
+                const type = (v) => { try { validateTransactionType(v); return null; } catch (e) { return e.message; } };
+                const cat = (v, t) => { try { validateTransactionCategory(v, t); return null; } catch (e) { return e.message; } };
                 return {
                     emptyName: name(''), whitespaceName: name('   '), nullName: name(null),
                     arrayName: name([]), objectName: name({}), tooLongName: name('a'.repeat(121)),
@@ -388,16 +389,20 @@ def main() -> int:
                     hexAmount: amt('0x20'), currencyAmount: amt('$10'), commaAmount: amt('1,000.00'),
                     precisionAmount: amt('12.345'), boolAmount: amt(true), arrayAmount: amt([]),
                     tooBigAmount: amt('1000000000.00'), okAmount: amt('12.34'),
-                    forgedCategory: cat('<script>alert(1)</script>'), okCategory: cat('Groceries'),
-                    blankCategory: cat(''),
+                    forgedType: type('transfer'), okExpenseType: type('expense'), okIncomeType: type('income'),
+                    forgedCategory: cat('<script>alert(1)</script>', 'expense'),
+                    okExpenseCategory: cat('Groceries', 'expense'), okIncomeCategory: cat('Salary', 'income'),
+                    otherExpense: cat('Other', 'expense'), otherIncome: cat('Other', 'income'),
+                    incomeCategoryOnExpense: cat('Salary', 'expense'), expenseCategoryOnIncome: cat('Dining', 'income'),
+                    blankCategory: cat('', 'expense'),
                 };
             }""")
-            check(invalid["emptyName"] is not None, "empty expense name rejected")
-            check(invalid["whitespaceName"] is not None, "whitespace-only expense name rejected")
-            check(invalid["nullName"] is not None, "null expense name rejected")
-            check(invalid["arrayName"] is not None, "array expense name rejected")
-            check(invalid["objectName"] is not None, "object expense name rejected")
-            check(invalid["tooLongName"] is not None, "121-character expense name rejected")
+            check(invalid["emptyName"] is not None, "empty transaction name rejected")
+            check(invalid["whitespaceName"] is not None, "whitespace-only transaction name rejected")
+            check(invalid["nullName"] is not None, "null transaction name rejected")
+            check(invalid["arrayName"] is not None, "array transaction name rejected")
+            check(invalid["objectName"] is not None, "object transaction name rejected")
+            check(invalid["tooLongName"] is not None, "121-character transaction name rejected")
             check(invalid["okName"] is None, "apostrophe in a legitimate name is accepted", str(invalid["okName"]))
             check(invalid["emptyAmount"] is not None, "empty amount rejected")
             check(invalid["zeroAmount"] is not None, "zero amount rejected")
@@ -413,14 +418,26 @@ def main() -> int:
             check(invalid["arrayAmount"] is not None, "array amount rejected")
             check(invalid["tooBigAmount"] is not None, "amount above the configured maximum rejected")
             check(invalid["okAmount"] is None, "well-formed amount accepted", str(invalid["okAmount"]))
+            check(invalid["forgedType"] is not None, "arbitrary transaction type rejected")
+            check(invalid["okExpenseType"] is None and invalid["okIncomeType"] is None, "income and expense are the only allowed transaction types")
             check(invalid["forgedCategory"] is not None, "arbitrary/forged category string rejected")
-            check(invalid["okCategory"] is None, "allowlisted category accepted")
-            check(invalid["blankCategory"] is None, "blank category accepted as 'no category'")
+            check(invalid["okExpenseCategory"] is None, "allowlisted expense category accepted")
+            check(invalid["okIncomeCategory"] is None, "allowlisted income category accepted")
+            check(invalid["otherExpense"] is None and invalid["otherIncome"] is None, "Other is available for both transaction types")
+            check(invalid["incomeCategoryOnExpense"] is not None, "income-only category rejected for expenses")
+            check(invalid["expenseCategoryOnIncome"] is not None, "expense-only category rejected for income")
+            check(invalid["blankCategory"] is not None, "manual transactions require a category")
 
             records_before = int(page.inner_text("#statRecords"))
             before_manual_requests = list(request_bodies)
             page.click("#addExpenseBtn")
             page.wait_for_selector("#addExpenseDialog[open]")
+            expense_categories = page.locator("#addExpenseCategory option").all_text_contents()
+            account_options = page.locator("#addExpenseAccount option").all_text_contents()
+            check("Scammers Inc" in account_options, "manual transaction destination lists the checking account")
+            page.select_option("#addExpenseAccount", index=0)
+            check("Other" in expense_categories and "Dining" in expense_categories, "expense dropdown has discrete categories including Other")
+            check("Salary" not in expense_categories, "income-only categories are absent from the expense dropdown")
             xss_name = "<img src=x onerror=alert(1)>"
             page.fill("#addExpenseName", xss_name)
             page.fill("#addExpenseAmount", "45.67")
@@ -433,19 +450,38 @@ def main() -> int:
             page.click("#addExpenseForm button[type=submit]")
             page.wait_for_selector("#addExpenseDialog", state="hidden")
             check(int(page.inner_text("#statRecords")) == records_before + 1, "manual expense adds exactly one record")
-            check(not fired, "no alert() fired from the injected expense name", str(fired))
+            check(not fired, "no alert() fired from the injected transaction name", str(fired))
             page.remove_listener("dialog", capture_xss_dialog)
             ledger_text = page.inner_text("#ledgerBody")
-            check(xss_name in ledger_text, "XSS-payload expense name renders as literal visible text")
+            check(xss_name in ledger_text, "XSS-payload transaction name renders as literal visible text")
             check(page.query_selector("#ledgerBody img") is None, "payload never became a live <img> element")
             check(
                 all(xss_name not in body for body in request_bodies[len(before_manual_requests):]),
-                "manual expense name reaches the server only as ciphertext, never plaintext",
+                "manual transaction name reaches the server only as ciphertext, never plaintext",
             )
-            manual_entry = page.evaluate("() => { const t = TXNS.find(x => x.merchant.includes('img src')); return t && {source: t.source, category: t.category, account: t.account}; }")
+            manual_entry = page.evaluate("() => { const t = TXNS.find(x => x.merchant.includes('img src')); return t && {source: t.source, category: t.category, account: t.account, type: t.transaction_type, amount: t.amount}; }")
             check(manual_entry and manual_entry["source"] == "manual", "manual entry is tagged source=manual, not forgeable as simplefin/fakebank")
             check(manual_entry and manual_entry["category"] == "Dining", "selected category is preserved")
-            check("Manual entries" in page.inner_text("#accounts"), "manual entries show as their own account group, not mixed into a bank's")
+            check(manual_entry and manual_entry["type"] == "expense" and manual_entry["amount"] == 45.67, "manual expense preserves the ledger's positive expense convention")
+            check(manual_entry and manual_entry["account"] == "demo_checking", "manual expense is assigned to the selected checking account")
+            check("Manual entries" not in page.inner_text("#accounts"), "manual expense is not placed in a separate account")
+
+            # Switching type replaces the dropdown with a distinct income
+            # allowlist, still including the shared Other choice.
+            page.click("#addExpenseBtn")
+            page.wait_for_selector("#addExpenseDialog[open]")
+            page.check('input[name="addExpenseType"][value="income"]')
+            income_categories = page.locator("#addExpenseCategory option").all_text_contents()
+            check("Salary" in income_categories and "Other" in income_categories, "income dropdown has discrete categories including Other")
+            check("Dining" not in income_categories, "expense-only categories are absent from the income dropdown")
+            page.fill("#addExpenseName", "Paycheck")
+            page.fill("#addExpenseAmount", "1000.00")
+            page.select_option("#addExpenseCategory", label="Salary")
+            page.click("#addExpenseForm button[type=submit]")
+            page.wait_for_selector("#addExpenseDialog", state="hidden")
+            income_entry = page.evaluate("() => { const t = TXNS.find(x => x.merchant === 'Paycheck'); return t && {type: t.transaction_type, category: t.category, amount: t.amount}; }")
+            check(income_entry and income_entry["type"] == "income", "manual income stores an explicit encrypted transaction type")
+            check(income_entry and income_entry["category"] == "Salary" and income_entry["amount"] == -1000, "manual income uses its selected category and the ledger's negative income convention")
 
             # Two deliberate, separately-submitted identical expenses must
             # both be kept -- no content-based deduplication.
@@ -457,7 +493,7 @@ def main() -> int:
                 page.click("#addExpenseForm button[type=submit]")
                 page.wait_for_selector("#addExpenseDialog", state="hidden")
             check(
-                int(page.inner_text("#statRecords")) == records_before + 3,
+                int(page.inner_text("#statRecords")) == records_before + 4,
                 "two deliberately identical manual expenses are both kept, not deduplicated",
             )
 
@@ -475,7 +511,7 @@ def main() -> int:
             page.wait_for_selector("#addExpenseDialog", state="hidden")
             page.wait_for_timeout(500)
             check(
-                int(page.inner_text("#statRecords")) == records_before + 4,
+                int(page.inner_text("#statRecords")) == records_before + 5,
                 "a double-submit race is not turned into two records by the in-flight guard",
             )
 

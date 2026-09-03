@@ -83,6 +83,12 @@ const CAT_COLOR = {
   'Health & insurance': '#3a7a7a',
   'Investing':          '#8a5b31',
   'Income':             '#1f6b54',
+  'Salary':             '#1f6b54',
+  'Freelance':          '#2e7b66',
+  'Investment income':  '#557c3e',
+  'Refund':             '#437c91',
+  'Gift':               '#7a567e',
+  'Other':              '#74879a',
   'Uncategorized':      '#74879a',
 };
 
@@ -91,10 +97,10 @@ const categorize = (merchant) => {
   return 'Uncategorized';
 };
 
-/* ---------- manual expense entry ----------------------------------------
+/* ---------- manual transaction entry ------------------------------------
    The server (app.py's put_records) only ever sees ciphertext -- it can
    check that a record LOOKS like a sealed box (hex, length bounds) but
-   has no way to validate an expense's business content, because it never
+   has no way to validate a transaction's business content, because it never
    has the key to read it. That makes these validators the sole trust
    boundary for manual-entry content, not merely UX convenience: anything
    that reaches seal()/blindIndex() below is exactly what will be stored,
@@ -103,22 +109,29 @@ const categorize = (merchant) => {
    batch size, per-vault quota) -- that stays unchanged and still applies
    to manual records exactly like every other record. */
 
-const MANUAL_CATEGORIES = new Set([
-  'Housing', 'Groceries', 'Dining', 'Transport', 'Utilities', 'Subscriptions',
-  'Shopping', 'Health & insurance', 'Investing', 'Income', 'Uncategorized',
-]);
+const MANUAL_TRANSACTION_TYPES = new Set(['expense', 'income']);
+const MANUAL_CATEGORY_OPTIONS = Object.freeze({
+  expense: Object.freeze([
+    'Housing', 'Groceries', 'Dining', 'Transport', 'Utilities', 'Subscriptions',
+    'Shopping', 'Health & insurance', 'Investing', 'Other',
+  ]),
+  income: Object.freeze([
+    'Salary', 'Freelance', 'Investment income', 'Refund', 'Gift', 'Other',
+  ]),
+});
+const MANUAL_CATEGORIES = new Set(Object.values(MANUAL_CATEGORY_OPTIONS).flat());
 const MANUAL_AMOUNT_MAX = 999999999.99;
 const MANUAL_AMOUNT_PATTERN = /^\d{1,9}(?:\.\d{1,2})?$/;
 
-function validateExpenseName(raw) {
-  if (typeof raw !== 'string') throw new Error('Expense name is required.');
+function validateTransactionName(raw) {
+  if (typeof raw !== 'string') throw new Error('Transaction name is required.');
   const trimmed = raw.normalize('NFC').trim();
-  if (!trimmed) throw new Error('Expense name is required.');
+  if (!trimmed) throw new Error('Transaction name is required.');
   for (const ch of trimmed) {
     const point = ch.codePointAt(0);
-    if (point < 0x20 || point === 0x7f) throw new Error('Expense name contains an invalid character.');
+    if (point < 0x20 || point === 0x7f) throw new Error('Transaction name contains an invalid character.');
   }
-  if ([...trimmed].length > 120) throw new Error('Expense name must be 120 characters or fewer.');
+  if ([...trimmed].length > 120) throw new Error('Transaction name must be 120 characters or fewer.');
   return trimmed;
 }
 
@@ -127,7 +140,7 @@ function validateExpenseName(raw) {
 // fraction digits) rather than trying to reject "$", ",", "e", "Infinity",
 // "NaN", hex, etc. one at a time. Never routes through parseFloat/Number
 // before this check, so binary-float parsing of hostile input never happens.
-function validateExpenseAmount(raw) {
+function validateTransactionAmount(raw) {
   if (typeof raw !== 'string') throw new Error('Amount is required.');
   const trimmed = raw.trim();
   if (!trimmed) throw new Error('Amount is required.');
@@ -140,63 +153,115 @@ function validateExpenseAmount(raw) {
   return value;
 }
 
-// Returns undefined for "no category" (the same representation bank-synced
-// transactions use before categorize() fills one in at load()) rather than
-// "", so there is exactly one canonical uncategorized state, not two.
-function validateExpenseCategory(raw) {
-  if (raw === undefined || raw === null || raw === '') return undefined;
-  if (typeof raw !== 'string' || !MANUAL_CATEGORIES.has(raw)) {
-    throw new Error('Select a valid category or leave this field blank.');
+function validateTransactionType(raw) {
+  if (typeof raw !== 'string' || !MANUAL_TRANSACTION_TYPES.has(raw)) {
+    throw new Error('Select either income or expense.');
   }
   return raw;
 }
 
-let EXPENSE_SUBMIT_IN_FLIGHT = false;
+function validateTransactionCategory(raw, transactionType) {
+  const type = validateTransactionType(transactionType);
+  if (typeof raw !== 'string' || !MANUAL_CATEGORIES.has(raw)
+      || !MANUAL_CATEGORY_OPTIONS[type].includes(raw)) {
+    throw new Error(`Select a valid ${type} category.`);
+  }
+  return raw;
+}
 
-function openAddExpenseDialog() {
+function selectedManualTransactionType() {
+  return document.querySelector('input[name="addExpenseType"]:checked')?.value;
+}
+
+function updateManualCategoryOptions() {
+  const type = validateTransactionType(selectedManualTransactionType());
+  const select = $('addExpenseCategory');
+  select.replaceChildren();
+  for (const category of MANUAL_CATEGORY_OPTIONS[type]) {
+    const option = document.createElement('option');
+    option.value = category;
+    option.textContent = category;
+    select.append(option);
+  }
+  $('addExpenseCategoryHint').textContent = `Choose one ${type} category. Use Other when none of the named options fit.`;
+}
+
+function updateManualAccountOptions() {
+  const select = $('addExpenseAccount');
+  select.replaceChildren();
+  for (const [id, rows] of accountGroups()) {
+    const meta = accountMeta(id, rows);
+    const option = document.createElement('option');
+    option.value = id;
+    option.textContent = `${meta.bank} - ${meta.type} · ${meta.label}`;
+    select.append(option);
+  }
+  select.disabled = select.options.length === 0;
+}
+
+function validateManualAccount(raw) {
+  if (typeof raw !== 'string' || !raw || !accountGroups().has(raw)) {
+    throw new Error('Select a destination account.');
+  }
+  return raw;
+}
+
+let TRANSACTION_SUBMIT_IN_FLIGHT = false;
+
+function openAddTransactionDialog() {
   $('addExpenseForm').reset();
   $('addExpenseError').textContent = '';
   [$('addExpenseName'), $('addExpenseAmount')].forEach((el) => el.removeAttribute('aria-invalid'));
+  updateManualCategoryOptions();
+  updateManualAccountOptions();
   $('addExpenseDialog').showModal();
   $('addExpenseName').focus();
 }
 
-async function submitManualExpense(event) {
+async function submitManualTransaction(event) {
   event.preventDefault();
-  if (EXPENSE_SUBMIT_IN_FLIGHT) return;
+  if (TRANSACTION_SUBMIT_IN_FLIGHT) return;
   const error = $('addExpenseError');
   const nameField = $('addExpenseName'), amountField = $('addExpenseAmount');
   error.textContent = '';
   nameField.removeAttribute('aria-invalid');
   amountField.removeAttribute('aria-invalid');
 
-  let name, amount, category;
+  let name, amount, category, transactionType, account;
   try {
-    name = validateExpenseName(nameField.value);
+    transactionType = validateTransactionType(selectedManualTransactionType());
+    name = validateTransactionName(nameField.value);
   } catch (e) {
     nameField.setAttribute('aria-invalid', 'true');
     error.textContent = e.message;
     return;
   }
   try {
-    amount = validateExpenseAmount(amountField.value);
+    amount = validateTransactionAmount(amountField.value);
   } catch (e) {
     amountField.setAttribute('aria-invalid', 'true');
     error.textContent = e.message;
     return;
   }
   try {
-    category = validateExpenseCategory($('addExpenseCategory').value);
+    category = validateTransactionCategory($('addExpenseCategory').value, transactionType);
   } catch (e) {
     error.textContent = e.message;
     return;
   }
+  try {
+    account = validateManualAccount($('addExpenseAccount').value);
+  } catch (e) {
+    $('addExpenseAccount').setAttribute('aria-invalid', 'true');
+    error.textContent = e.message;
+    return;
+  }
 
-  EXPENSE_SUBMIT_IN_FLIGHT = true;
+  TRANSACTION_SUBMIT_IN_FLIGHT = true;
   const submitButton = $('addExpenseForm').querySelector('button[type="submit"]');
   submitButton.disabled = true;
   try {
-    // Explicit allowlist of user-facing fields (name, amount, category)
+    // Explicit allowlist of user-facing fields (type, name, amount, category)
     // merged into a record built entirely from trusted, non-form values --
     // id, date, account*, and source are never taken from user input, so
     // there is no way for a submission to forge provenance (e.g. claim
@@ -204,22 +269,23 @@ async function submitManualExpense(event) {
     const manual = {
       id: `manual_${crypto.randomUUID()}`,
       merchant: name,
-      amount,
+      // This app's existing ledger convention uses positive values for
+      // expenses and negative values for income.
+      amount: transactionType === 'income' ? -amount : amount,
       date: new Date().toISOString().slice(0, 10),
       pending: false,
-      account: 'manual',
-      bank: 'Manual entries',
-      account_label: 'Manual entries',
-      account_type: 'Manual',
+      account,
+      ...accountMeta(account, accountGroups().get(account)),
       source: 'manual',
-      ...(category !== undefined ? { category } : {}),
+      transaction_type: transactionType,
+      category,
     };
     await api('/api/records', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ records: [{ blind_index: blindIndex(manual.id), sealed: seal(manual) }] }),
     });
     TXNS.push({
-      ...manual, category: manual.category || categorize(manual.merchant),
+      ...manual,
       notes: '', tags: [], splits: [], is_transfer: false, excluded: false, fraud_status: '',
     });
     TXNS.sort((a, b) => a.date.localeCompare(b.date));
@@ -228,9 +294,9 @@ async function submitManualExpense(event) {
     renderAccounts();
     render();
   } catch (e) {
-    error.textContent = e.message || 'Could not save this expense. Try again.';
+    error.textContent = e.message || 'Could not save this transaction. Try again.';
   } finally {
-    EXPENSE_SUBMIT_IN_FLIGHT = false;
+    TRANSACTION_SUBMIT_IN_FLIGHT = false;
     submitButton.disabled = false;
   }
 }
@@ -1443,8 +1509,9 @@ async function disablePasskeys() {
   $('transactionEditForm').addEventListener('submit', saveTransactionEdit);
   $('editCancel').addEventListener('click', () => $('transactionEditor').close());
   $('editCancelX').addEventListener('click', () => $('transactionEditor').close());
-  $('addExpenseBtn').addEventListener('click', openAddExpenseDialog);
-  $('addExpenseForm').addEventListener('submit', submitManualExpense);
+  $('addExpenseBtn').addEventListener('click', openAddTransactionDialog);
+  $('addExpenseForm').addEventListener('submit', submitManualTransaction);
+  document.querySelectorAll('input[name="addExpenseType"]').forEach((radio) => radio.addEventListener('change', updateManualCategoryOptions));
   $('addExpenseCancel').addEventListener('click', () => $('addExpenseDialog').close());
   $('addExpenseCancelX').addEventListener('click', () => $('addExpenseDialog').close());
   initChat();

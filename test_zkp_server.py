@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the manual-expense ZK-proof challenge/verification endpoints.
+"""Tests for the manual-transaction ZK-proof challenge/verification endpoints.
 
     python3 test_zkp_server.py
     pytest test_zkp_server.py
@@ -349,12 +349,13 @@ class TestZkpVerifierModule(ServerCase):
         self.assertTrue(result.valid)
 
     def test_category_id_round_trip_matches_static_app_js_taxonomy(self):
-        # Keep this list in exact sync with MANUAL_CATEGORIES in
-        # static/app.js and CATEGORY_COUNT's ordering in main.nr -- this
-        # test is the tripwire if one of the three ever drifts.
+        # Flattened category ids bind both category and transaction type.
+        # Other deliberately has separate expense/income ids even though
+        # static/app.js displays the same user-facing label for both.
         expected = (
             "Housing", "Groceries", "Dining", "Transport", "Utilities", "Subscriptions",
-            "Shopping", "Health & insurance", "Investing", "Income", "Uncategorized",
+            "Shopping", "Health & insurance", "Investing", "Other (expense)",
+            "Salary", "Freelance", "Investment income", "Refund", "Gift", "Other (income)",
         )
         self.assertEqual(zkp_verifier.CATEGORY_IDS, expected)
         for i, name in enumerate(expected):

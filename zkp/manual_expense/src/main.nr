@@ -1,5 +1,5 @@
-// PaulinoTech Mindful Money -- manual expense record commitment circuit.
-// circuit_version: "manual-expense-v1"
+// PaulinoTech Mindful Money -- manual transaction commitment circuit.
+// circuit_version: "manual-transaction-v2"
 //
 // Proves, without revealing them:
 //   "I know a name/amount/category/blinding tuple that satisfies this
@@ -30,22 +30,23 @@
 use poseidon::poseidon2::Poseidon2;
 
 global MAX_NAME_BYTES: u32 = 120;
-// Housing, Groceries, Dining, Transport, Utilities, Subscriptions,
-// Shopping, "Health & insurance", Investing, Income, Uncategorized --
-// must stay in exact sync with MANUAL_CATEGORIES in static/app.js and
-// CATEGORY_IDS in zkp_verifier.py. Changing the taxonomy is a breaking
-// circuit change (new circuit_version), not a config tweak.
-global CATEGORY_COUNT: u64 = 11;
+// Expense ids 0..9: Housing, Groceries, Dining, Transport, Utilities,
+// Subscriptions, Shopping, "Health & insurance", Investing, Other.
+// Income ids 10..15: Salary, Freelance, Investment income, Refund, Gift,
+// Other. The separate Other ids bind the transaction type even though the
+// browser displays the same label. Must stay in exact sync with the client
+// and zkp_verifier.py. Taxonomy changes require a new circuit version.
+global CATEGORY_COUNT: u64 = 16;
 // $999,999,999.99 in cents -- must stay in sync with MANUAL_AMOUNT_MAX in
 // static/app.js.
 global MAX_AMOUNT_CENTS: u64 = 99999999999;
-global SCHEMA_VERSION: u64 = 1;
-// Big-endian integer encoding of the 29 ASCII bytes "PAULINOTECH_MANUAL_EXPENSE_V1"
+global SCHEMA_VERSION: u64 = 2;
+// Big-endian integer encoding of the ASCII bytes "PAULINOTECH_MANUAL_TX_V2"
 // (< the BN254 scalar field modulus). Recompute with:
-//   python3 -c "print(hex(int.from_bytes(b'PAULINOTECH_MANUAL_EXPENSE_V1','big')))"
+//   python3 -c "print(hex(int.from_bytes(b'PAULINOTECH_MANUAL_TX_V2','big')))"
 // Never reuse this constant for a different record type's commitment --
 // that is the entire point of domain separation.
-global DOMAIN_SEPARATOR: Field = 0x5041554c494e4f544543485f4d414e55414c5f455850454e53455f5631;
+global DOMAIN_SEPARATOR: Field = 0x5041554c494e4f544543485f4d414e55414c5f54585f5632;
 global PREIMAGE_LEN: u32 = MAX_NAME_BYTES + 9;
 
 fn main(
@@ -65,7 +66,7 @@ fn main(
 
     // ---- name bound ----------------------------------------------------
     // Bounds UTF-8 *bytes*, not Unicode *code points*. The browser UI's
-    // "1 to 120 characters" promise (static/app.js validateExpenseName) is
+    // "1 to 120 characters" promise (static/app.js validateTransactionName) is
     // a code-point bound; a 120-character name using multi-byte UTF-8 can
     // exceed 120 bytes. This circuit uses the stricter byte-size bound and
     // separately proves well-formed UTF-8 below; it does not attempt to
@@ -131,10 +132,9 @@ fn main(
     assert(amount_cents <= MAX_AMOUNT_CENTS);
 
     // ---- category membership ----------------------------------------------
-    // has_category separates "no category selected" (validateExpenseCategory's
-    // `undefined`) from "Uncategorized" chosen explicitly. Both are legitimate
-    // canonical states but are different witnesses, so both are constrained
-    // explicitly rather than silently collapsed into one before proving.
+    // has_category preserves the versioned circuit's optional-category
+    // representation. The live v2 form always selects an allowlisted category;
+    // a false flag remains a canonical circuit value for API compatibility.
     if has_category {
         assert(category_id < CATEGORY_COUNT);
     } else {
@@ -397,7 +397,7 @@ fn changing_record_id_after_commitment_is_computed_is_rejected() {
 
 // ---- malicious-client simulation: bypass the browser entirely, hand-craft a witness ----
 // This is the primary reason this circuit exists: the browser's
-// validateExpenseName/validateExpenseAmount/validateExpenseCategory (see
+// validateTransactionName/validateTransactionAmount/validateTransactionCategory (see
 // static/app.js) are never consulted here at all. These tests build
 // `main`'s arguments directly, exactly as a hand-rolled malicious prover
 // would, bypassing every layer of JS validation entirely.

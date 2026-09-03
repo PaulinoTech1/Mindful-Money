@@ -32,7 +32,7 @@
     <div class="sidebarBottom">
       <button class="sideButton syncButton" id="syncBtn" hidden>Refresh demo accounts</button>
       <button class="sideButton syncButton" id="syncSimplefinBtn" hidden>Refresh SimpleFin accounts</button>
-      <button class="sideButton" id="addExpenseBtn" hidden>Add manual expense</button>
+      <button class="sideButton" id="addExpenseBtn" hidden>Add transaction</button>
       <button class="sideButton" id="viewToggle" hidden>See what the server sees</button>
       <button class="clearButton" id="resetBtn" hidden>Clear stored data</button>
     </div>
@@ -202,7 +202,9 @@
       <select id="editCategory">
         <option>Housing</option><option>Groceries</option><option>Dining</option><option>Transport</option>
         <option>Utilities</option><option>Subscriptions</option><option>Shopping</option>
-        <option>Health &amp; insurance</option><option>Investing</option><option>Income</option><option>Uncategorized</option>
+        <option>Health &amp; insurance</option><option>Investing</option><option>Income</option>
+        <option>Salary</option><option>Freelance</option><option>Investment income</option><option>Refund</option><option>Gift</option>
+        <option>Other</option><option>Uncategorized</option>
       </select>
       <label for="editNotes">Private notes</label>
       <textarea id="editNotes" maxlength="1000" rows="3" placeholder="Stored only inside this transaction's ciphertext"></textarea>
@@ -226,9 +228,17 @@
 
   <dialog class="transactionEditor" id="addExpenseDialog">
     <form id="addExpenseForm">
-      <div class="editorHeader"><div><div class="eyebrow">Encrypted locally</div><h2>Add manual expense</h2></div><button class="editorClose" id="addExpenseCancelX" type="button" aria-label="Close">×</button></div>
+      <div class="editorHeader"><div><div class="eyebrow">Encrypted locally</div><h2>Add transaction</h2></div><button class="editorClose" id="addExpenseCancelX" type="button" aria-label="Close">×</button></div>
 
-      <label for="addExpenseName">Expense name</label>
+      <fieldset class="transactionType">
+        <legend>Transaction type</legend>
+        <div class="transactionTypeOptions">
+          <label><input type="radio" name="addExpenseType" value="expense" checked>Expense</label>
+          <label><input type="radio" name="addExpenseType" value="income">Income</label>
+        </div>
+      </fieldset>
+
+      <label for="addExpenseName">Transaction name</label>
       <input id="addExpenseName" maxlength="120" required aria-describedby="addExpenseNameHint" autocomplete="off">
       <p class="editorHint" id="addExpenseNameHint">Text, 1 to 120 characters.</p>
 
@@ -236,14 +246,17 @@
       <input id="addExpenseAmount" inputmode="decimal" autocomplete="off" required placeholder="12.34" aria-describedby="addExpenseAmountHint">
       <p class="editorHint" id="addExpenseAmountHint">Enter a monetary amount such as 12.34. Maximum two decimal places.</p>
 
+      <label for="addExpenseAccount">Destination account</label>
+      <select id="addExpenseAccount" aria-describedby="addExpenseAccountHint" required></select>
+      <p class="editorHint" id="addExpenseAccountHint">Choose the account this transaction belongs to.</p>
+
       <label for="addExpenseCategory">Category</label>
-      <select id="addExpenseCategory" aria-describedby="addExpenseCategoryHint">
-        <option value="">Leave blank</option>
+      <select id="addExpenseCategory" aria-describedby="addExpenseCategoryHint" required>
         <option>Housing</option><option>Groceries</option><option>Dining</option><option>Transport</option>
         <option>Utilities</option><option>Subscriptions</option><option>Shopping</option>
-        <option>Health &amp; insurance</option><option>Investing</option><option>Income</option><option>Uncategorized</option>
+        <option>Health &amp; insurance</option><option>Investing</option><option>Other</option>
       </select>
-      <p class="editorHint" id="addExpenseCategoryHint">Optional. Select a category or leave blank.</p>
+      <p class="editorHint" id="addExpenseCategoryHint">Choose one expense category. Use Other when none of the named options fit.</p>
 
       <p class="editorError" id="addExpenseError" role="alert"></p>
       <div class="editorActions"><button class="sideAction" id="addExpenseCancel" type="button">Cancel</button><button class="primary" type="submit">Encrypt and save</button></div>

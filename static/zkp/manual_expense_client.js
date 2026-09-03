@@ -1,8 +1,8 @@
-/* Manual-expense ZK-proof client.
+/* Manual-transaction ZK-proof client.
  *
  * STATUS: compiled, bundled, and exercised with a real bb.js proof that
  * the native bb 5.1.0 CLI also verified. It is intentionally NOT wired
- * into static/app.js's live "Add manual expense" flow yet; see
+ * into static/app.js's live "Add transaction" flow yet; see
  * ../../zkp/README.md for the alpha feature-gating and bundle-size note.
  *
  * The API calls and data formats below are pinned to Noir
@@ -28,21 +28,26 @@ import acvmWasmUrl from '@noir-lang/acvm_js/web/acvm_js_bg.wasm?url';
 import noircWasmUrl from '@noir-lang/noirc_abi/web/noirc_abi_wasm_bg.wasm?url';
 import circuit from '../../zkp/manual_expense/target/manual_expense.json';
 
-export const CIRCUIT_VERSION = 'manual-expense-v1';
-export const SCHEMA_VERSION = 1;
+export const CIRCUIT_VERSION = 'manual-transaction-v2';
+export const SCHEMA_VERSION = 2;
 const MAX_NAME_BYTES = 120;
-// Order matters: index == the circuit's category_id. Must stay in exact
-// sync with MANUAL_CATEGORIES in static/app.js, CATEGORY_IDS in
-// zkp_verifier.py, and CATEGORY_COUNT's implicit ordering in main.nr.
-const CATEGORY_IDS = [
-  'Housing', 'Groceries', 'Dining', 'Transport', 'Utilities', 'Subscriptions',
-  'Shopping', 'Health & insurance', 'Investing', 'Income', 'Uncategorized',
-];
-// Same 29-byte ASCII label as DOMAIN_SEPARATOR in main.nr. Recomputed
+// Order matters: flattened index == the circuit's category_id. Each type
+// gets its own Other id so the commitment also binds income vs expense.
+// Keep this in sync with static/app.js, zkp_verifier.py, and main.nr.
+const CATEGORY_IDS_BY_TYPE = Object.freeze({
+  expense: Object.freeze([
+    'Housing', 'Groceries', 'Dining', 'Transport', 'Utilities', 'Subscriptions',
+    'Shopping', 'Health & insurance', 'Investing', 'Other',
+  ]),
+  income: Object.freeze([
+    'Salary', 'Freelance', 'Investment income', 'Refund', 'Gift', 'Other',
+  ]),
+});
+// Same ASCII label as DOMAIN_SEPARATOR in main.nr. Recomputed
 // here independently (not copy-pasted as a hex literal) so a future edit
 // to the label can't silently desync the two without also changing this
 // literal string.
-const DOMAIN_SEPARATOR_LABEL = 'PAULINOTECH_MANUAL_EXPENSE_V1';
+const DOMAIN_SEPARATOR_LABEL = 'PAULINOTECH_MANUAL_TX_V2';
 
 let wasmReady = null;
 function ensureWasmReady() {
@@ -68,7 +73,7 @@ const DOMAIN_SEPARATOR = fieldFromLabel(DOMAIN_SEPARATOR_LABEL);
 
 // ---- canonicalization -----------------------------------------------
 // Mirrors main.nr's witness shape exactly. Does NOT re-implement
-// validateExpenseName/Amount/Category from static/app.js -- callers must
+// validateTransactionName/Amount/Category from static/app.js -- callers must
 // run those first. This only turns already-validated values into the
 // circuit's fixed-size representation, and fails loudly (not silently)
 // if a value somehow doesn't fit, rather than truncating or padding past
@@ -78,7 +83,7 @@ function nameToFixedBuffer(name) {
   const bytes = Array.from(new TextEncoder().encode(name.normalize('NFC')));
   if (bytes.length < 1 || bytes.length > MAX_NAME_BYTES) {
     // The UI's "1 to 120 characters" is a code-point bound
-    // (validateExpenseName); this is a byte bound. Most names never hit
+    // (validateTransactionName); this is a byte bound. Most names never hit
     // this gap, but multi-byte UTF-8 can -- see ../../zkp/README.md.
     throw new Error('Expense name does not fit the proof’s 120-byte bound.');
   }
@@ -87,7 +92,7 @@ function nameToFixedBuffer(name) {
 }
 
 // Takes the ORIGINAL validated decimal string (e.g. "12.34"), not the
-// Number validateExpenseAmount() also returns -- deriving cents from a
+// Number validateTransactionAmount() also returns -- deriving cents from a
 // JS Number would reintroduce exactly the binary-float risk this design
 // exists to avoid.
 function amountStringToCents(rawAmountString) {
@@ -100,10 +105,12 @@ function amountStringToCents(rawAmountString) {
   return cents;
 }
 
-function categoryToWitness(categoryNameOrUndefined) {
+function categoryToWitness(categoryNameOrUndefined, transactionType) {
   if (categoryNameOrUndefined === undefined) return { category_id: 0, has_category: false };
-  const id = CATEGORY_IDS.indexOf(categoryNameOrUndefined);
-  if (id < 0) throw new Error('Unknown category.');
+  if (!Object.hasOwn(CATEGORY_IDS_BY_TYPE, transactionType)) throw new Error('Unknown transaction type.');
+  const localId = CATEGORY_IDS_BY_TYPE[transactionType].indexOf(categoryNameOrUndefined);
+  if (localId < 0) throw new Error(`Unknown ${transactionType} category.`);
+  const id = transactionType === 'income' ? CATEGORY_IDS_BY_TYPE.expense.length + localId : localId;
   return { category_id: id, has_category: true };
 }
 
@@ -191,9 +198,8 @@ export async function requestChallenge(apiFetch) {
 }
 
 /**
- * Full prove step for one manual expense. `validated` = the output of
- * static/app.js's validateExpenseName/validateExpenseAmount/
- * validateExpenseCategory, PLUS the original raw amount string (needed
+ * Full prove step for one manual transaction. `validated` = the output of
+ * static/app.js's transaction validators, PLUS the original raw amount string (needed
  * for exact-decimal cents conversion -- see amountStringToCents).
  * `challengeResponse` = requestChallenge()'s result.
  *
@@ -205,12 +211,12 @@ export async function requestChallenge(apiFetch) {
  * ../../zkp/README.md, "AES-GCM record" / this app's sealed-box
  * equivalent) so a legitimate client can recompute the commitment later.
  */
-export async function proveManualExpense(challengeResponse, validated) {
+export async function proveManualTransaction(challengeResponse, validated) {
   await ensureWasmReady();
 
   const { name_bytes, name_length } = nameToFixedBuffer(validated.name);
   const cents = amountStringToCents(validated.rawAmount);
-  const { category_id, has_category } = categoryToWitness(validated.category);
+  const { category_id, has_category } = categoryToWitness(validated.category, validated.transactionType);
   const blinding = randomBlindingField();
   const challenge = hexToField(challengeResponse.challenge);
   const recordIdHash = hexToField(challengeResponse.record_id);
@@ -259,7 +265,7 @@ export async function proveManualExpense(challengeResponse, validated) {
     publicInputs: proofPublicInputs,
     // Encrypt this context with the record. It lets the browser
     // recompute the commitment after decryption without revealing the
-    // private expense fields or the blinding factor to Flask.
+    // private transaction fields or the blinding factor to Flask.
     publicContext: {
       challenge: challengeResponse.challenge,
       record_id: challengeResponse.record_id,
@@ -268,9 +274,12 @@ export async function proveManualExpense(challengeResponse, validated) {
   };
 }
 
+// Backward-compatible export name for callers that imported the v1 module.
+export const proveManualExpense = proveManualTransaction;
+
 /**
  * Client retrieval verification (see ../../zkp/README.md). Call this
- * after decrypting a manual-expense record and BEFORE rendering it.
+ * after decrypting a manual-transaction record and BEFORE rendering it.
  * Recomputes the commitment from the decrypted plaintext (which must
  * include `commitment_blinding`, per proveManualExpense's contract) and
  * compares it against the record's stored `commitment`. On any mismatch,
@@ -282,11 +291,11 @@ export async function proveManualExpense(challengeResponse, validated) {
  */
 export async function verifyStoredRecord(decryptedRecord, storedCommitmentHex, publicContext) {
   const name = nameToFixedBuffer(decryptedRecord.merchant);
-  const category = categoryToWitness(decryptedRecord.category);
+  const category = categoryToWitness(decryptedRecord.category, decryptedRecord.transaction_type);
   const recomputed = await computeCommitment({
     nameBytes: name.name_bytes,
     nameLength: name.name_length,
-    amountCents: amountStringToCents(decryptedRecord.amount.toFixed(2)),
+    amountCents: amountStringToCents(Math.abs(decryptedRecord.amount).toFixed(2)),
     categoryId: category.category_id,
     hasCategory: category.has_category,
     blinding: hexToField(decryptedRecord.commitment_blinding),
