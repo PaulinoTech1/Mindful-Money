@@ -11,19 +11,14 @@ Postgres test database (imports ServerCase from test_demo.py):
   - every public-input / context mismatch Flask is supposed to catch
     BEFORE ever calling the cryptographic verifier
   - the real fail-closed behavior of zkp_verifier.verify_proof() when the
-    verification key / bb executable are absent (which is genuinely true
-    in this repository -- see zkp/README.md) -- this is not simulated,
-    it is the actual CircuitArtifactsUnavailable path executing for real
+    bb executable is not installed on the application host
+  - exact native-CLI proof/public-input file serialization and invocation
   - CSRF / origin / rate-limit protection on the new endpoints
 
-What these tests do NOT and cannot cover here (see zkp/README.md,
-"Status"): a real proof being generated, verified, and accepted. No
-`nargo`/`bb` toolchain is available in this dev sandbox (native Windows;
-Barretenberg has no Windows build), so there is no compiled circuit and no
-verification key. Every test below that would need a *valid* proof to
-proceed instead asserts the correct fail-closed 503/400 behavior when the
-verifier is unavailable -- which is itself the required behavior, not a
-placeholder for it.
+The endpoint suite does not install `bb`, so requests reaching the crypto
+boundary assert the required fail-closed response. A separate real smoke
+test (`static/zkp/smoke_prove.mjs`) generates a bb.js proof, and that proof
+was verified with the native 5.1.0 CLI; see zkp/README.md.
 """
 
 from __future__ import annotations
@@ -34,6 +29,20 @@ from test_demo import ServerCase
 
 import models
 import zkp_verifier
+
+
+VALID_COMMITMENT = "0" * 63 + "c"
+VALID_FAKE_PROOF = ("00" * 31 + "01") * 2
+ZERO_PUBLIC_INPUTS = [zkp_verifier.canonical_field_hex(0)] * zkp_verifier.PUBLIC_INPUT_COUNT
+
+
+def _proof_public_inputs(values, commitment=VALID_COMMITMENT):
+    return list(zkp_verifier.expected_public_inputs(
+        challenge=values["challenge"],
+        record_id=values["record_id"],
+        schema_version=values["schema_version"],
+        commitment=commitment,
+    ))
 
 
 class TestZkpChallengeIssuance(ServerCase):
@@ -109,9 +118,9 @@ class TestZkpChallengeLifecycle(ServerCase):
             "challenge_id": challenge_id,
             "blind_index": "a" * 64,
             "sealed": "b" * 200,
-            "commitment": "c" * 64,
-            "proof": "ab" * 64,
-            "public_inputs": {"challenge": "", "record_id": "", "schema_version": zkp_verifier.SCHEMA_VERSION},
+            "commitment": VALID_COMMITMENT,
+            "proof": VALID_FAKE_PROOF,
+            "public_inputs": ["0x" + "0" * 64] * zkp_verifier.PUBLIC_INPUT_COUNT,
         }
         payload.update(body)
         return self.unsafe("post", "/api/records/manual", json=payload)
@@ -127,60 +136,43 @@ class TestZkpChallengeLifecycle(ServerCase):
                 id=2, user_handle=b"tenant-two", passkey_required=False,
             ))
         values = _force_issue_challenge(self, identity_id=2)
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        })
+        resp = self.submit(values["challenge_id"], public_inputs=_proof_public_inputs(values))
         self.assertEqual(resp.status_code, 400)
 
     def test_expired_challenge_rejected(self):
         values = _force_issue_challenge(self, expires_at=time.time() - 1)
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        })
+        resp = self.submit(values["challenge_id"], public_inputs=_proof_public_inputs(values))
         self.assertEqual(resp.status_code, 400)
 
     def test_already_consumed_challenge_rejected(self):
         values = _force_issue_challenge(self, consumed_at=time.time())
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        })
+        resp = self.submit(values["challenge_id"], public_inputs=_proof_public_inputs(values))
         self.assertEqual(resp.status_code, 400)
 
     def test_public_input_challenge_mismatch_rejected(self):
         values = _force_issue_challenge(self)
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": ("00" * 31),  # wrong -- does not match the issued challenge
-            "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        })
+        inputs = _proof_public_inputs(values)
+        inputs[0] = "0x" + "0" * 64
+        resp = self.submit(values["challenge_id"], public_inputs=inputs)
         self.assertEqual(resp.status_code, 400)
 
     def test_public_input_record_id_mismatch_rejected(self):
         values = _force_issue_challenge(self)
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": values["challenge"].hex(),
-            "record_id": ("11" * 16),  # wrong
-            "schema_version": values["schema_version"],
-        })
+        inputs = _proof_public_inputs(values)
+        inputs[1] = "0x" + "0" * 32 + "11" * 16
+        resp = self.submit(values["challenge_id"], public_inputs=inputs)
         self.assertEqual(resp.status_code, 400)
 
     def test_wrong_schema_version_rejected(self):
         values = _force_issue_challenge(self)
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": zkp_verifier.SCHEMA_VERSION + 1,
-        })
+        inputs = _proof_public_inputs(values)
+        inputs[2] = zkp_verifier.canonical_field_hex(zkp_verifier.SCHEMA_VERSION + 1)
+        resp = self.submit(values["challenge_id"], public_inputs=inputs)
         self.assertEqual(resp.status_code, 400)
 
     def test_unknown_circuit_version_rejected(self):
         values = _force_issue_challenge(self, circuit_version="manual-expense-v0-deprecated")
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        })
+        resp = self.submit(values["challenge_id"], public_inputs=_proof_public_inputs(values))
         self.assertEqual(resp.status_code, 400)
 
     def test_malformed_proof_hex_rejected(self):
@@ -188,10 +180,7 @@ class TestZkpChallengeLifecycle(ServerCase):
         resp = self.submit(
             values["challenge_id"],
             proof="not hex at all",
-            public_inputs={
-                "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-                "schema_version": values["schema_version"],
-            },
+            public_inputs=_proof_public_inputs(values),
         )
         self.assertEqual(resp.status_code, 400)
 
@@ -203,15 +192,34 @@ class TestZkpChallengeLifecycle(ServerCase):
         200. This exercises the real zkp_verifier.verify_proof() code
         path end to end, not a mock."""
         values = _force_issue_challenge(self)
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        })
+        resp = self.submit(values["challenge_id"], public_inputs=_proof_public_inputs(values))
         self.assertEqual(resp.status_code, 503)
         with self._engine.connect() as conn:
             from sqlalchemy import text
-            count = conn.execute(text("SELECT count(*) FROM records WHERE commitment = 'c' || repeat('c', 63)")).scalar_one()
+            count = conn.execute(
+                text("SELECT count(*) FROM records WHERE commitment = :commitment"),
+                {"commitment": VALID_COMMITMENT},
+            ).scalar_one()
         self.assertEqual(count, 0, "no record must be stored when the verifier is unavailable")
+
+    def test_valid_verifier_result_stores_ciphertext_and_returns_commitment_metadata(self):
+        from unittest.mock import patch
+
+        values = _force_issue_challenge(self)
+        public_inputs = _proof_public_inputs(values)
+        with patch.object(
+            zkp_verifier, "verify_proof",
+            return_value=zkp_verifier.VerificationResult(valid=True, duration_seconds=0.001),
+        ) as verify:
+            resp = self.submit(values["challenge_id"], public_inputs=public_inputs)
+        self.assertEqual(resp.status_code, 200)
+        verify.assert_called_once_with(bytes.fromhex(VALID_FAKE_PROOF), tuple(public_inputs))
+
+        stored = self.client.get("/api/records").get_json()["records"]
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["commitment"], VALID_COMMITMENT)
+        self.assertEqual(stored[0]["circuit_version"], zkp_verifier.CIRCUIT_VERSION)
+        self.assertNotIn("proof", stored[0])
 
     def test_challenge_is_single_use_even_when_verification_later_fails(self):
         """The atomic claim in _claim_zkp_challenge means a challenge is
@@ -221,10 +229,7 @@ class TestZkpChallengeLifecycle(ServerCase):
         SELECT-then-UPDATE race window an attacker could exploit to reuse
         one challenge for two records."""
         values = _force_issue_challenge(self)
-        inputs = {
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        }
+        inputs = _proof_public_inputs(values)
         first = self.submit(values["challenge_id"], public_inputs=inputs)
         second = self.submit(values["challenge_id"], public_inputs=inputs)
         self.assertEqual(first.status_code, 503)  # fails closed on verification, but the challenge is now spent
@@ -243,10 +248,7 @@ class TestZkpChallengeLifecycle(ServerCase):
         other_hash = server_app._sid_hash(other_client.get_cookie(server_app.COOKIE_NAME).value)
 
         values = _force_issue_challenge(self, session_id_hash=other_hash)
-        resp = self.submit(values["challenge_id"], public_inputs={
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        })
+        resp = self.submit(values["challenge_id"], public_inputs=_proof_public_inputs(values))
         self.assertEqual(resp.status_code, 400)
 
     def test_request_without_csrf_or_origin_is_rejected(self):
@@ -257,10 +259,7 @@ class TestZkpChallengeLifecycle(ServerCase):
         from app import RATE_LIMITS
         limit, _seconds = RATE_LIMITS["zkp_verify"]
         values = _force_issue_challenge(self)
-        inputs = {
-            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-            "schema_version": values["schema_version"],
-        }
+        inputs = _proof_public_inputs(values)
         statuses = [self.submit(values["challenge_id"], public_inputs=inputs).status_code for _ in range(limit + 2)]
         self.assertIn(429, statuses, f"expected a 429 within {limit + 2} attempts, got {statuses}")
 
@@ -271,15 +270,83 @@ class TestZkpVerifierModule(ServerCase):
 
     def test_verify_proof_fails_closed_without_artifacts(self):
         with self.assertRaises(zkp_verifier.CircuitArtifactsUnavailable):
-            zkp_verifier.verify_proof(b"anything")
+            zkp_verifier.verify_proof(bytes.fromhex(VALID_FAKE_PROOF), ZERO_PUBLIC_INPUTS)
 
     def test_verify_proof_rejects_empty_proof_before_touching_artifacts(self):
         with self.assertRaises(zkp_verifier.ZkpVerificationError):
-            zkp_verifier.verify_proof(b"")
+            zkp_verifier.verify_proof(b"", ZERO_PUBLIC_INPUTS)
 
     def test_verify_proof_rejects_oversized_proof(self):
         with self.assertRaises(zkp_verifier.ZkpVerificationError):
-            zkp_verifier.verify_proof(b"x" * (zkp_verifier.MAX_PROOF_BYTES + 1))
+            zkp_verifier.verify_proof(
+                b"x" * (zkp_verifier.MAX_PROOF_BYTES + 1), ZERO_PUBLIC_INPUTS,
+            )
+
+    def test_rejects_noncanonical_and_wrong_count_public_inputs(self):
+        proof = bytes.fromhex(VALID_FAKE_PROOF)
+        with self.assertRaises(zkp_verifier.ZkpVerificationError):
+            zkp_verifier.verify_proof(proof, ZERO_PUBLIC_INPUTS[:-1])
+        noncanonical = list(ZERO_PUBLIC_INPUTS)
+        noncanonical[0] = "0x1"
+        with self.assertRaises(zkp_verifier.ZkpVerificationError):
+            zkp_verifier.verify_proof(proof, noncanonical)
+        outside_field = list(ZERO_PUBLIC_INPUTS)
+        outside_field[0] = f"0x{zkp_verifier.BN254_SCALAR_MODULUS:064x}"
+        with self.assertRaises(zkp_verifier.ZkpVerificationError):
+            zkp_verifier.verify_proof(proof, outside_field)
+
+    def test_expected_public_input_order_includes_commitment(self):
+        fields = zkp_verifier.expected_public_inputs(
+            challenge=b"\x01", record_id=b"\x02", schema_version=1,
+            commitment=VALID_COMMITMENT,
+        )
+        self.assertEqual(fields[0], zkp_verifier.canonical_field_hex(1))
+        self.assertEqual(fields[1], zkp_verifier.canonical_field_hex(2))
+        self.assertEqual(fields[2], zkp_verifier.canonical_field_hex(1))
+        self.assertEqual(fields[3], zkp_verifier.canonical_field_hex(VALID_COMMITMENT))
+
+    def test_committed_artifact_abi_matches_server_public_input_order(self):
+        import json
+        from pathlib import Path
+
+        artifact = json.loads(Path("zkp/manual_expense/target/manual_expense.json").read_text("utf-8"))
+        public_parameters = [
+            parameter["name"] for parameter in artifact["abi"]["parameters"]
+            if parameter["visibility"] == "public"
+        ]
+        self.assertEqual(public_parameters, ["challenge", "record_id_hash", "schema_version"])
+        self.assertEqual(artifact["abi"]["return_type"]["visibility"], "public")
+        self.assertEqual(artifact["abi"]["return_type"]["abi_type"]["kind"], "field")
+
+    def test_native_cli_receives_separate_big_endian_public_input_file(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import tempfile
+
+        proof = bytes.fromhex(VALID_FAKE_PROOF)
+        fields = tuple(ZERO_PUBLIC_INPUTS)
+        expected_pi_bytes = b"".join(bytes.fromhex(value[2:]) for value in fields)
+
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            vk = Path(artifact_dir) / "vk"
+            bb = Path(artifact_dir) / "bb"
+            vk.write_bytes(b"server-owned-vk")
+            bb.write_bytes(b"executable-placeholder")
+
+            def fake_run(command, **kwargs):
+                self.assertEqual(Path(command[command.index("-p") + 1]).read_bytes(), proof)
+                self.assertEqual(Path(command[command.index("-i") + 1]).read_bytes(), expected_pi_bytes)
+                self.assertEqual(command[command.index("-k") + 1], str(vk))
+                self.assertEqual(command[command.index("-s") + 1], "ultra_honk")
+                self.assertTrue(kwargs["capture_output"])
+                return SimpleNamespace(returncode=0)
+
+            with patch.object(zkp_verifier, "VK_PATH", vk), \
+                 patch.object(zkp_verifier, "BB_EXECUTABLE", str(bb)), \
+                 patch.object(zkp_verifier.subprocess, "run", side_effect=fake_run):
+                result = zkp_verifier.verify_proof(proof, fields)
+        self.assertTrue(result.valid)
 
     def test_category_id_round_trip_matches_static_app_js_taxonomy(self):
         # Keep this list in exact sync with MANUAL_CATEGORIES in
@@ -321,11 +388,8 @@ class TestProofCiphertextBindingLimitation(ServerCase):
         resp = self.submit(
             values["challenge_id"],
             sealed="f" * 200,
-            commitment="c" * 64,
-            public_inputs={
-                "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
-                "schema_version": values["schema_version"],
-            },
+            commitment=VALID_COMMITMENT,
+            public_inputs=_proof_public_inputs(values),
         )
         # Rejected here only because the verifier is unavailable in this
         # sandbox (fail-closed) -- NOT because Flask detected the mismatch.
@@ -339,9 +403,9 @@ class TestProofCiphertextBindingLimitation(ServerCase):
             "challenge_id": challenge_id,
             "blind_index": "a" * 64,
             "sealed": "b" * 200,
-            "commitment": "c" * 64,
-            "proof": "ab" * 64,
-            "public_inputs": {},
+            "commitment": VALID_COMMITMENT,
+            "proof": VALID_FAKE_PROOF,
+            "public_inputs": ZERO_PUBLIC_INPUTS,
         }
         payload.update(body)
         return self.unsafe("post", "/api/records/manual", json=payload)

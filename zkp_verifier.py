@@ -23,33 +23,26 @@ does `assert(true)`, produce its own matching key and proof, and defeat the
 entire system -- see the project's delivery report, "Verification trust
 anchor".
 
-Requires the official `bb` CLI (see zkp/README.md for install instructions
--- Barretenberg has no native Windows build; this module targets a
-Linux/macOS/WSL deployment host). Neither `bb` nor a compiled verification
-key exist in this repository's own dev sandbox, so verify_proof() below
-raises CircuitArtifactsUnavailable immediately here -- see zkp/README.md
-"Status" for exactly what has and has not been executed.
+Requires the official `bb` 5.1.0 CLI (see zkp/README.md). The circuit and
+verification key are committed, but `bb` is not installed on the default
+application host in this checkout, so runtime verification still fails
+closed until `ZKP_BB_EXECUTABLE` names the deployed binary.
 
-CLI usage is pinned to the documented basic flow from
-https://barretenberg.aztec.network/docs/getting_started/ :
-    bb verify -p <proof file> -k <vk file>
-That page notes Barretenberg proof files conventionally have the public
-inputs prepended to the proof bytes by `bb prove`/`write_vk --write_vk`.
-Whether bb.js's browser-generated proof blob (from
-`backend.generateProof(witness)`, which returns a `{proof, publicInputs}`
-structure per the noir_js tutorial) is byte-for-byte the same file format
-native `bb verify` expects is an INTEGRATION DETAIL NOT YET VALIDATED in
-this repository -- there is a real, documented history of friction between
-bb.js's in-browser proof format and the native bb CLI's file format across
-Barretenberg versions. Treat `_proof_file_bytes()` below as the one place
-that assumption lives, and verify it for real against the pinned toolchain
-version before relying on this in production.
+Barretenberg 5.1 represents an UltraHonk proof and its public inputs as
+separate arrays of 32-byte big-endian BN254 field elements. The browser
+returns that exact split as `{ proof, publicInputs }`; the native CLI reads
+the same split from `-p` and `-i`:
+
+    bb verify -s ultra_honk -p <proof> -i <public_inputs> -k <vk>
+
+This module validates canonical field encodings, writes both files, and
+never relies on a client-supplied verification key.
 """
 
 from __future__ import annotations
 
-import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -69,9 +62,14 @@ CATEGORY_IDS = (
 )
 
 BB_EXECUTABLE = os.environ.get("ZKP_BB_EXECUTABLE") or shutil.which("bb") or "bb"
-VK_PATH = Path(os.environ.get("ZKP_MANUAL_EXPENSE_VK_PATH", "zkp/manual_expense/target/vk"))
+_DEFAULT_VK_PATH = Path(__file__).resolve().parent / "zkp" / "manual_expense" / "target" / "vk"
+VK_PATH = Path(os.environ["ZKP_MANUAL_EXPENSE_VK_PATH"]) if os.environ.get("ZKP_MANUAL_EXPENSE_VK_PATH") else _DEFAULT_VK_PATH
 VERIFY_TIMEOUT_SECONDS = float(os.environ.get("ZKP_VERIFY_TIMEOUT_SECONDS", "10"))
 MAX_PROOF_BYTES = int(os.environ.get("ZKP_MAX_PROOF_BYTES", str(256 * 1024)))
+PUBLIC_INPUT_COUNT = 4
+FIELD_BYTES = 32
+BN254_SCALAR_MODULUS = int("30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001", 16)
+_CANONICAL_FIELD_HEX = re.compile(r"0x[0-9a-f]{64}")
 
 
 class ZkpVerificationError(RuntimeError):
@@ -106,22 +104,82 @@ def _require_artifacts() -> None:
         raise CircuitArtifactsUnavailable("bb executable not found")
 
 
-def verify_proof(proof_bytes: bytes) -> VerificationResult:
-    """Verify a manual-expense proof against the pinned verification key.
+def canonical_field_hex(value: int | bytes | str) -> str:
+    """Return one canonical `0x`-prefixed 32-byte BN254 field encoding.
 
-    Only answers "is this proof cryptographically valid under this
-    verification key" -- it says nothing about whether the proof's public
-    inputs are the ones Flask expects (challenge, record_id_hash,
-    schema_version). That check happens in app.py, against the
-    `public_inputs` the client submits alongside the proof, BEFORE this
-    function is ever called -- see POST /api/records/manual. A proof that
-    is cryptographically valid for the wrong public inputs is rejected
-    there, not here.
+    Bytes are interpreted as a big-endian unsigned integer. Strings may
+    contain hexadecimal with or without `0x`; they are parsed, range
+    checked, and padded. This helper is for server-owned values only;
+    request public inputs are required to already be canonical.
     """
+    if isinstance(value, bytes):
+        integer = int.from_bytes(value, "big")
+    elif isinstance(value, int) and not isinstance(value, bool):
+        integer = value
+    elif isinstance(value, str):
+        raw = value[2:] if value.startswith("0x") else value
+        if not raw or not re.fullmatch(r"[0-9a-f]+", raw):
+            raise ZkpVerificationError("invalid public input encoding")
+        integer = int(raw, 16)
+    else:
+        raise ZkpVerificationError("invalid public input type")
+    if not 0 <= integer < BN254_SCALAR_MODULUS:
+        raise ZkpVerificationError("public input is outside the BN254 scalar field")
+    return f"0x{integer:064x}"
+
+
+def expected_public_inputs(*, challenge: bytes, record_id: bytes, schema_version: int, commitment: str) -> tuple[str, ...]:
+    """Public-input order from the compiled Noir ABI.
+
+    Public parameters are emitted in declaration order, followed by the
+    public return value: challenge, record_id_hash, schema_version,
+    commitment. The server builds this tuple from its challenge row and
+    the separately validated commitment rather than trusting client
+    labels.
+    """
+    return (
+        canonical_field_hex(challenge),
+        canonical_field_hex(record_id),
+        canonical_field_hex(schema_version),
+        canonical_field_hex(commitment),
+    )
+
+
+def validate_public_inputs(public_inputs: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    if not isinstance(public_inputs, (list, tuple)) or len(public_inputs) != PUBLIC_INPUT_COUNT:
+        raise ZkpVerificationError("incorrect public input count")
+    result = tuple(public_inputs)
+    for value in result:
+        if not isinstance(value, str) or _CANONICAL_FIELD_HEX.fullmatch(value) is None:
+            raise ZkpVerificationError("public input is not canonical field hex")
+        if int(value[2:], 16) >= BN254_SCALAR_MODULUS:
+            raise ZkpVerificationError("public input is outside the BN254 scalar field")
+    return result
+
+
+def _validate_proof_bytes(proof_bytes: bytes) -> bytes:
     if not isinstance(proof_bytes, (bytes, bytearray)) or not proof_bytes:
         raise ZkpVerificationError("proof is missing or empty")
     if len(proof_bytes) > MAX_PROOF_BYTES:
         raise ZkpVerificationError("proof exceeds the maximum accepted size")
+    if len(proof_bytes) % FIELD_BYTES:
+        raise ZkpVerificationError("proof is not a sequence of field elements")
+    normalized = bytes(proof_bytes)
+    for offset in range(0, len(normalized), FIELD_BYTES):
+        if int.from_bytes(normalized[offset:offset + FIELD_BYTES], "big") >= BN254_SCALAR_MODULUS:
+            raise ZkpVerificationError("proof contains a non-canonical field element")
+    return normalized
+
+
+def verify_proof(proof_bytes: bytes, public_inputs: list[str] | tuple[str, ...]) -> VerificationResult:
+    """Verify a manual-expense proof against the pinned verification key.
+
+    The caller must first compare `public_inputs` to
+    expected_public_inputs(). This function still validates their binary
+    shape and passes the same values to the cryptographic verifier.
+    """
+    proof = _validate_proof_bytes(proof_bytes)
+    fields = validate_public_inputs(public_inputs)
     _require_artifacts()
 
     started = time.monotonic()
@@ -129,10 +187,16 @@ def verify_proof(proof_bytes: bytes) -> VerificationResult:
         # Server-generated filename, inside a server-generated temp
         # directory -- never derived from client input.
         proof_path = Path(tmpdir) / "proof"
-        proof_path.write_bytes(proof_bytes)
+        public_inputs_path = Path(tmpdir) / "public_inputs"
+        proof_path.write_bytes(proof)
+        public_inputs_path.write_bytes(b"".join(bytes.fromhex(value[2:]) for value in fields))
         try:
             result = subprocess.run(
-                [BB_EXECUTABLE, "verify", "-p", str(proof_path), "-k", str(VK_PATH)],
+                [
+                    BB_EXECUTABLE, "verify", "-s", "ultra_honk",
+                    "-p", str(proof_path), "-i", str(public_inputs_path),
+                    "-k", str(VK_PATH),
+                ],
                 capture_output=True,
                 timeout=VERIFY_TIMEOUT_SECONDS,
                 check=False,

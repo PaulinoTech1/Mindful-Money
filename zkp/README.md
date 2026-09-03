@@ -1,138 +1,194 @@
-# Manual expense zero-knowledge proof (`manual-expense-v1`)
+# Manual-expense zero-knowledge validation
 
-Reduces (does not eliminate -- see "What this does not prove" below) the
-residual risk that a modified client can submit ciphertext with
-semantically invalid manual-expense content that the server, by design,
-cannot decrypt to check.
+`manual-expense-v1` proves that a hidden manual-expense record satisfies
+the application's schema and range rules. The server verifies the proof
+before storing the opaque ciphertext and never receives the plaintext,
+encryption key, passphrase, or private witness.
 
-## Status: implemented, **not compiled or executed in this repository**
+## Verified status
 
-Every file here (`src/main.nr`, the tests in it, `zkp_verifier.py`,
-`static/zkp/manual_expense_client.js`) was written against real, current,
-cited API documentation and version pins -- not from memory. None of it has
-been compiled, proved, or verified in this session, because the toolchain
-this circuit needs (`nargo`, `bb`) has no native Windows build, and this
-repository's dev environment is native Windows (not WSL). See the project's
-delivery report for the exact evidence.
+This implementation was built and exercised with the exact pinned stack:
 
-Concretely, right now:
+| Component | Version |
+|---|---:|
+| Noir / Nargo / noir.js | `1.0.0-beta.26` |
+| Barretenberg / `@aztec/bb.js` | `5.1.0` |
+| Poseidon package source | `v0.2.6` plus the documented beta.26 compatibility patch |
 
-- `nargo test` (the circuit tests at the bottom of `src/main.nr`) has not
-  been run. They are reviewed, not verified.
-- No `target/manual_expense.json` circuit artifact exists, so
-  `static/zkp/manual_expense_client.js` has nothing to load and cannot
-  actually generate a proof yet.
-- No verification key exists, so `zkp_verifier.py`'s `bb verify` call has
-  nothing to verify against and will raise a clear
-  `CircuitArtifactsUnavailable` error rather than silently accepting or
-  rejecting proofs.
-- The existing (non-ZK) manual-expense entry flow added previously (the
-  "Add manual expense" dialog, `submitManualExpense` in `static/app.js`,
-  plain `POST /api/records`) is **unchanged and still fully functional**.
-  This ZK path is additive: `POST /api/records/manual` (see `app.py`) and
-  its challenge endpoint exist, are unit-tested at the Flask-orchestration
-  level (`test_zkp_server.py`, using a stub verifier -- see that file's
-  docstring), and are ready to be wired to a real proof once a circuit
-  artifact exists. The UI does not call it yet.
+The following checks passed on 2026-09-03:
 
-## Toolchain versions
+- all 28 Noir circuit tests, including direct malicious-witness and UTF-8 tests
+- `nargo compile`, producing the committed ACIR artifact
+- browser-package production bundling with Vite
+- a real 14,656-byte UltraHonk proof generated and self-verified by
+  `@aztec/bb.js` 5.1.0
+- native `bb` 5.1.0 verification of that bb.js proof using the committed VK
+- 28 Flask/server verifier tests
+- `npm audit --omit=dev`: zero production dependency advisories
 
-| Tool | Version | Source |
-|---|---|---|
-| `nargo` / Noir compiler | `>=1.0.0-beta.20` | See rationale below |
-| `bb` / Barretenberg | `3.0.0-nightly.20251104` | Confirmed compatible with nargo 1.0.0-beta.20 |
-| `@noir-lang/noir_js` | `1.0.0-beta.20` | pinned in `static/zkp/package.json` |
-| `@aztec/bb.js` | `3.0.0-nightly.20251104` | pinned in `static/zkp/package.json` |
-| `poseidon` (Noir stdlib package) | `v0.1.1` | git dependency in `Nargo.toml` |
+The full npm audit reports six low-severity advisories under the official
+Vite Node-polyfill development plugin's unused crypto-browserify tree. They
+are not present in the production dependency audit; no forced downgrade or
+security-control weakening was applied to hide them.
 
-**Why beta.20, not beta.15**: the official example app
-(`noir-lang/tiny-noirjs-app`, fetched directly from GitHub while writing
-this) pins `@noir-lang/noir_js@1.0.0-beta.15` with
-`@aztec/bb.js@3.0.0-nightly.20251104`. However, a filed upstream issue
-(`AztecProtocol/aztec-packages#18270`) reports that `bbup` -- the tool that
-resolves a compatible Barretenberg version for an installed `nargo` --
-resolves nargo `1.0.0-beta.15` to a **null** Barretenberg version, i.e. no
-mapping exists for that exact pairing via the standard install path. The
-same search turned up an explicit confirmation that nargo
-`1.0.0-beta.20` pairs correctly with Barretenberg
-`3.0.0-nightly.20251104`. Pinning to beta.20 avoids a known-broken install
-path; if you have evidence beta.15 now works via `bbup -nv 1.0.0-beta.15`,
-that's a one-line change to this file, `Nargo.toml`, and
-`static/zkp/package.json`.
+The production bundle is intentionally not committed. It is about 10 MB
+uncompressed because it includes the proving WASM; load it only when a
+user enters the proof-gated workflow.
 
-Note: `@noir-lang/acvm_js` and `@noir-lang/noirc_abi` (siblings `noir_js` imports at runtime, per the official example app) are pinned to `1.0.0-beta.20` in `static/zkp/package.json` by inference -- Noir's monorepo releases these together, but this session did not independently confirm `1.0.0-beta.20` is actually published for those two specific packages. Run `npm view @noir-lang/acvm_js versions` / `npm view @noir-lang/noirc_abi versions` before `npm install` and adjust if beta.20 isn't there.
+Barretenberg's browser worker needs `SharedArrayBuffer`. Flask now sends
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` on the app and same-origin
+assets so that capability is available without weakening CSP.
 
-**This entire stack is beta/nightly**, not a stable release line. That is
-an accurate description of where Noir/Barretenberg tooling currently is
-for a browser-proving UltraHonk workflow, not a corner cut in this
-implementation. Re-pin to stable tags as soon as they exist and this
-circuit has been re-verified against them -- do not assume beta.20's
-behavior carries forward unchanged.
+## Files
 
-## Build commands (to run on Linux, macOS, or WSL -- NOT native Windows)
+- `manual_expense/src/main.nr`: private-input constraints and public
+  Poseidon2 commitment output
+- `manual_expense/target/manual_expense.json`: compiled ACIR + ABI
+- `manual_expense/target/vk`: server verification key
+- `vendor/poseidon-v0.2.6-beta26`: narrowly scoped v0.2.6 compatibility
+  package
+- `../static/zkp/manual_expense_client.js`: browser witness/prover code
+- `../static/zkp/smoke_prove.mjs`: real bb.js-to-native-bb interop smoke proof
+- `../zkp_verifier.py`: fail-closed native CLI verifier
+- `../app.py`: authenticated, CSRF-protected challenge and storage endpoints
 
-```bash
-# 1. Install nargo (the Noir compiler)
-curl -L https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash
-noirup --version 1.0.0-beta.20
+Committed artifact SHA-256 values:
 
-# 2. Install bb (Barretenberg), matched to the installed nargo version
-curl -L https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/next/barretenberg/bbup/install | bash
-bbup   # auto-resolves to 3.0.0-nightly.20251104 for nargo 1.0.0-beta.20
-
-# 3. Compile the circuit (from zkp/manual_expense/)
-cd zkp/manual_expense
-nargo compile
-# -> produces target/manual_expense.json (ACIR bytecode + ABI)
-
-# 4. Run circuit tests
-nargo test --show-output
-
-# 5. Generate the verification key (from the compiled artifact)
-bb write_vk --scheme ultra_honk -b target/manual_expense.json -o target/vk
-sha256sum target/manual_expense.json target/vk   # record and pin both hashes
-
-# 6. Install and build the browser client bundle
-cd ../../static/zkp
-npm install
-npm run build   # produces the bundle static/app.js's manual-expense flow will load
+```text
+manual_expense.json  f8577b04b5ced4823c79beb822572f7f2a377de0c6acefc84771c1437e1023e9
+vk                   aa119aab46bb92a9be27db89819221c703141ff4412e0be509e86d2fbc34730e
+vk_hash              bbb2fe47eed1e3acc28d636bd884ee40ade721e68b1456ed7eb094c72846a7f5
 ```
 
-## Deploying the verification key (server side)
+Regenerate the ACIR and VK together after any circuit, dependency, or
+compiler change. Never accept a VK supplied by a request.
 
-`zkp_verifier.py` reads the verification key from
-`ZKP_MANUAL_EXPENSE_VK_PATH` (default `zkp/manual_expense/target/vk`) and
-refuses to start verifying proofs if that file is absent -- see
-`CircuitArtifactsUnavailable` in that module. **The server must never
-accept a verification key from a request.** Only the file at this
-server-controlled, read-only path is trusted; see `zkp_verifier.py` and the
-final report's "Verification trust anchor" section for why.
+## Statement proved
 
-## What this circuit does and does not prove
+Private witness:
 
-Proves (see `src/main.nr` for the exact constraints and the adversarial
-tests at the bottom of that file):
+- `name_bytes: [u8; 120]`
+- `name_length: u32`
+- `amount_cents: u64`
+- `category_id: u64`
+- `has_category: bool`
+- `commitment_blinding: Field`
 
-- the hidden amount, in integer cents, is `> 0` and `<= MAX_AMOUNT_CENTS`
-- the hidden name occupies `1..=120` UTF-8 **bytes** inside a fixed
-  120-byte buffer, with every byte past the declared length forced to zero
-- the hidden category is either "no category" or one of the 11 allowlisted
-  category IDs
-- the public `commitment` is the Poseidon2 hash of all of the above, plus
-  the server-issued `challenge`, `record_id_hash`, and `schema_version`,
-  under an explicit domain separator -- so the proof cannot be replayed
-  against a different challenge/record/schema by simply relabeling public
-  inputs
+Public statement, in the exact order emitted by the compiled ABI:
 
-Does **not** prove:
+1. server-issued `challenge`
+2. server-issued `record_id_hash`
+3. `schema_version == 1`
+4. public return value `commitment`
 
-- that the name is `<= 120` Unicode **code points** (that's a code-point
-  bound enforced by `validateExpenseName` in `static/app.js`; the circuit
-  only sees UTF-8 bytes and cannot cheaply parse Unicode boundaries -- see
-  the comment in `main.nr`)
-- that the AES/sealed-box ciphertext submitted alongside the proof
-  actually contains this same private record. This is the single most
-  important limitation of this design -- see the final report's "Residual
-  risks" and `test_zkp_server.py`'s `test_proof_ciphertext_mismatch_*`
-  test, which is required to stay in the suite specifically to document
-  this gap, not to hide it.
+The circuit enforces a non-empty, well-formed UTF-8, canonical zero-padded
+name; rejects ASCII controls, invalid/overlong sequences, surrogates, and
+outer ASCII spaces; bounds the amount to 1..99,999,999,999 cents; checks
+category membership; and fixes the schema version. It returns:
+
+```text
+Poseidon2(domain_separator, challenge, record_id_hash, schema_version,
+          blinding, amount_cents, category_id, has_category, name_length,
+          name_bytes[0..120])
+```
+
+Noir's `u8`, `u32`, `u64`, and `bool` witness decoding provides native
+type/range constraints. The explicit assertions enforce the tighter
+application rules. A hostile witness fails during Noir execution and no
+proof can be generated for it.
+
+The browser normalizes names to NFC and limits them to 120 Unicode code
+points before proving. The circuit proves valid UTF-8 and a stricter
+120-byte storage bound, but does not prove NFC normalization or count code
+points; those Unicode properties would require substantially more circuit
+logic.
+
+## Browser request flow
+
+1. Call `requestChallenge(api)`.
+2. Call `proveManualExpense(challenge, validatedRecord)`.
+3. Add the returned `blinding` and `publicContext` to the plaintext record.
+4. Encrypt that plaintext using the existing browser-only encryption code.
+5. Submit this shape to `POST /api/records/manual`:
+
+```js
+{
+  challenge_id: challenge.challenge_id,
+  blind_index,
+  sealed,
+  commitment: proofResult.commitment,
+  proof: proofResult.proof,
+  public_inputs: proofResult.publicInputs,
+}
+```
+
+The client takes the commitment from Noir's public return value. It also
+requires bb.js to emit exactly the expected four public inputs and performs
+a local proof self-check before submission.
+
+## Server verification
+
+Flask atomically consumes the challenge, reconstructs all four public
+inputs from server-owned context plus the submitted commitment, and rejects
+missing, extra, reordered, non-canonical, or out-of-field values. The
+verifier writes 32-byte big-endian field arrays and invokes:
+
+```bash
+bb verify -s ultra_honk -p proof -i public_inputs -k /server/controlled/vk
+```
+
+Only exit status zero is acceptance. Missing artifacts, timeout, malformed
+proofs, and execution errors all fail closed.
+
+Set these production variables:
+
+```text
+ZKP_BB_EXECUTABLE=/opt/barretenberg-5.1.0/bb
+ZKP_MANUAL_EXPENSE_VK_PATH=/srv/app/zkp/manual_expense/target/vk
+ZKP_VERIFY_TIMEOUT_SECONDS=10
+```
+
+## Reproducible build
+
+On Linux/macOS with exact `nargo` and `bb` binaries installed:
+
+```bash
+bash scripts/build_zkp.sh
+```
+
+The script refuses any Nargo version other than beta.26 or any bb version
+other than 5.1.0, then runs the circuit suite, compiles, regenerates the VK,
+locks npm dependencies, builds the browser bundle, and runs the real proof
+smoke test. Nargo cannot express a prerelease such as beta.26 in
+`compiler_version`; the script's version check is therefore the effective
+compiler pin.
+
+### Poseidon v0.2.6 compatibility
+
+Unmodified `noir-lang/poseidon` v0.2.6 does not compile with Noir beta.26:
+it calls the former two-argument `poseidon2_permutation(state, 4)` API and
+uses an empty-slice form rejected by the newer compiler. The local package
+retains v0.2.6's static Poseidon2 hash algorithm and applies only the new
+one-argument permutation signature. The untouched pinned upstream source
+is present at `zkp/upstream/poseidon` for comparison.
+
+## Critical limitation: ciphertext is not proved
+
+This proof establishes knowledge of a valid plaintext whose Poseidon2 hash
+is the public commitment. It does **not** establish that the separately
+submitted `sealed` ciphertext encrypts that same plaintext. A modified
+client can prove valid record A and submit ciphertext B.
+
+The legitimate client mitigates stored corruption by encrypting the
+blinding/context and calling `verifyStoredRecord()` after decryption before
+rendering. That is client-side detection, not server-side prevention.
+Server-enforced binding requires the circuit to prove the encryption
+relation itself (or use a ZK-friendly authenticated-encryption design);
+AES-GCM/sealed-box ciphertext cannot be bound merely by adding its hash as
+a public input.
+
+The current live `static/app.js` manual-entry path is still the original
+non-ZK path. The ZK module and endpoints are complete and tested, but UI
+wiring should remain feature-gated until the proving bundle's roughly
+3.4 MB gzip download and browser memory/latency are acceptable for alpha.

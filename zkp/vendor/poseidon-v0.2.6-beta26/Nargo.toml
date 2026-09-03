@@ -1,0 +1,6 @@
+[package]
+name = "poseidon"
+type = "lib"
+authors = [""]
+
+[dependencies]

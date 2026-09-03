@@ -273,6 +273,10 @@ def security_headers(response):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    # Required with COOP for SharedArrayBuffer-backed Barretenberg WASM
+    # workers. All application assets are same-origin and also receive
+    # Cross-Origin-Resource-Policy below.
+    response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
     response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=()"
     if request.path.startswith("/api/") or request.path == "/" or response.status_code >= 400:
@@ -747,11 +751,15 @@ def create_manual_expense_zkp():
         return api_error("Invalid record", 400)
     if not isinstance(commitment, str) or not _LOWER_HEX_64.fullmatch(commitment):
         return api_error("Invalid record", 400)
+    try:
+        commitment_field = zkp_verifier.canonical_field_hex(commitment)
+    except zkp_verifier.ZkpVerificationError:
+        return api_error("Invalid record", 400)
     if not isinstance(proof_hex, str) or not _LOWER_HEX.fullmatch(proof_hex) or len(proof_hex) % 2:
         return api_error("Unable to validate the encrypted record.", 400)
-    if not isinstance(public_inputs, dict) or set(public_inputs) != {"challenge", "record_id", "schema_version"}:
-        return api_error("Unable to validate the encrypted record.", 400)
-    if public_inputs["schema_version"] != zkp_verifier.SCHEMA_VERSION:
+    try:
+        public_inputs = zkp_verifier.validate_public_inputs(public_inputs)
+    except zkp_verifier.ZkpVerificationError:
         return api_error("Unable to validate the encrypted record.", 400)
 
     claimed = _claim_zkp_challenge(challenge_id, owner_id)
@@ -759,15 +767,18 @@ def create_manual_expense_zkp():
         LOG.warning('event="zkp_challenge_rejected" client="%s"', _client_log_id())
         return api_error("Unable to validate the encrypted record.", 400)
 
-    # Independently re-check every public input against what THIS server
-    # issued for THIS challenge -- never trust the client's copy of them,
-    # even though the proof also constrains them. Any mismatch here means
-    # the proof (if valid at all) was computed for a different context.
-    if (
-        public_inputs["challenge"] != bytes(claimed["challenge"]).hex()
-        or public_inputs["record_id"] != bytes(claimed["record_id"]).hex()
-        or claimed["circuit_version"] != zkp_verifier.CIRCUIT_VERSION
-    ):
+    # Independently reconstruct the complete public statement from
+    # server-owned challenge data plus the separately validated
+    # commitment. Public parameters appear in Noir declaration order and
+    # the public return value follows them. Never let the client relabel,
+    # omit, reorder, or append fields.
+    expected_public_inputs = zkp_verifier.expected_public_inputs(
+        challenge=bytes(claimed["challenge"]),
+        record_id=bytes(claimed["record_id"]),
+        schema_version=claimed["schema_version"],
+        commitment=commitment_field,
+    )
+    if public_inputs != expected_public_inputs or claimed["circuit_version"] != zkp_verifier.CIRCUIT_VERSION:
         LOG.warning('event="zkp_context_mismatch" client="%s"', _client_log_id())
         return api_error("Unable to validate the encrypted record.", 400)
 
@@ -777,7 +788,7 @@ def create_manual_expense_zkp():
         return api_error("Unable to validate the encrypted record.", 400)
 
     try:
-        result = zkp_verifier.verify_proof(proof_bytes)
+        result = zkp_verifier.verify_proof(proof_bytes, public_inputs)
     except zkp_verifier.CircuitArtifactsUnavailable:
         LOG.warning('event="zkp_verifier_unavailable" client="%s"', _client_log_id())
         return api_error("Unable to validate the encrypted record.", 503)
@@ -816,10 +827,20 @@ def get_records():
     denied = require_access()
     if denied: return denied
     table = models.Record.__table__
-    rows = db().execute(select(table.c.id, table.c.blind_index, table.c.sealed).where(
+    rows = db().execute(select(
+        table.c.id, table.c.blind_index, table.c.sealed,
+        table.c.commitment, table.c.circuit_version,
+    ).where(
         table.c.identity_id == current_identity_id()
     ).order_by(table.c.id)).mappings().all()
-    return jsonify({"records": [dict(r) for r in rows]})
+    records = []
+    for row in rows:
+        record = {"id": row["id"], "blind_index": row["blind_index"], "sealed": row["sealed"]}
+        if row["commitment"] is not None:
+            record["commitment"] = row["commitment"]
+            record["circuit_version"] = row["circuit_version"]
+        records.append(record)
+    return jsonify({"records": records})
 
 @app.get("/api/server-view")
 def server_view():

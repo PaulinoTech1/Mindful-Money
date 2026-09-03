@@ -2,11 +2,11 @@
 name = "manual_expense"
 type = "bin"
 authors = [""]
-# Pinned to the nargo/Noir release this circuit was written and reviewed
-# against -- see ../README.md for exactly which compiler build this maps
-# to and why (a known nargo 1.0.0-beta.15 x bbup incompatibility is why
-# this is NOT pinned to beta.15; see README "Toolchain versions").
-compiler_version = ">=1.0.0-beta.20"
+# Nargo rejects prerelease versions in `compiler_version` (it accepts
+# full releases only), so beta.26 cannot be expressed in this manifest.
+# The toolchain is instead pinned and checked by scripts/build_zkp.sh.
 
 [dependencies]
-poseidon = { tag = "v0.1.1", git = "https://github.com/noir-lang/poseidon" }
+# Derived from upstream tag v0.2.6 with the beta.26 compatibility patch
+# documented in the vendored package README.
+poseidon = { path = "../vendor/poseidon-v0.2.6-beta26" }

@@ -1,44 +1,26 @@
 /* Manual-expense ZK-proof client.
  *
- * STATUS: written, NOT wired into static/app.js's live "Add manual
- * expense" flow, and NOT executed anywhere in this repository -- see
- * ../../zkp/README.md, "Status". It needs a compiled circuit artifact
- * (../../zkp/manual_expense/target/manual_expense.json, produced by
- * `nargo compile` on Linux/macOS/WSL) that does not exist yet, because
- * Barretenberg has no native Windows build and this repo's dev sandbox is
- * native Windows. The existing (non-ZK) manual-expense flow in
- * static/app.js is unaffected and still works.
+ * STATUS: compiled, bundled, and exercised with a real bb.js proof that
+ * the native bb 5.1.0 CLI also verified. It is intentionally NOT wired
+ * into static/app.js's live "Add manual expense" flow yet; see
+ * ../../zkp/README.md for the alpha feature-gating and bundle-size note.
  *
- * API confidence, so a future reader knows what to re-verify first:
- *   - Noir/UltraHonkBackend import shape, `new Noir(circuit)`,
- *     `new UltraHonkBackend(circuit.bytecode)`, `noir.execute(inputs)`,
- *     `backend.generateProof(witness)`, `backend.verifyProof(proof)`:
- *     CONFIRMED verbatim from the official example app
- *     https://github.com/noir-lang/tiny-noirjs-app (fetched directly
- *     while writing this file), pinned to @noir-lang/noir_js 1.0.0-beta.20
- *     / @aztec/bb.js 3.0.0-nightly.20251104 -- see package.json and
- *     ../../zkp/README.md for the version-pin rationale.
- *   - `Barretenberg.new()` and `.poseidon2Hash(fields)`: found via
- *     secondary sources (search results referencing barretenberg/ts and a
- *     zk-mixer tutorial using `bb.poseidon2Hash([nullifier, secret])`),
- *     NOT confirmed against primary @aztec/bb.js TypeScript definitions
- *     in this session. Re-verify the exact factory/method name against
- *     the pinned bb.js version's type definitions before relying on this
- *     in production; that is the one genuinely unconfirmed API surface in
- *     this file.
+ * The API calls and data formats below are pinned to Noir
+ * 1.0.0-beta.26 and @aztec/bb.js 5.1.0. In this version the backend
+ * constructor requires the shared Barretenberg instance, and
+ * generateProof() returns proof bytes and public inputs separately.
  *
  * Trust boundary: everything below runs in the browser. Flask (see
  * app.py's /api/zkp/challenge and /api/records/manual) never receives
  * anything from here except challenge_id, blind_index, sealed (opaque
  * ciphertext), commitment (a public Poseidon2 output -- not a secret),
- * proof bytes, and public_inputs (challenge/record_id/schema_version,
- * server-issued values echoed back for Flask's own independent check --
- * see app.py). name, amount_cents, category_id, and commitment_blinding
+ * proof bytes, and the four public proof inputs. Flask reconstructs those
+ * inputs from server-owned challenge/record/schema context plus the
+ * commitment. name, amount_cents, category_id, and commitment_blinding
  * never leave this file. Do not log any of `inputs` below.
  */
 
-import { UltraHonkBackend } from '@aztec/bb.js';
-import { Barretenberg } from '@aztec/bb.js';
+import { Barretenberg, UltraHonkBackend } from '@aztec/bb.js';
 import { Noir } from '@noir-lang/noir_js';
 import initNoirC from '@noir-lang/noirc_abi';
 import initACVM from '@noir-lang/acvm_js';
@@ -72,8 +54,6 @@ function ensureWasmReady() {
 
 let barretenbergInstance = null;
 async function getBarretenberg() {
-  // See the file-level comment: this factory call is the one API surface
-  // in this file not confirmed against a primary source this session.
   if (!barretenbergInstance) barretenbergInstance = await Barretenberg.new();
   return barretenbergInstance;
 }
@@ -146,8 +126,26 @@ function bytesToHex(bytes) {
   return hex;
 }
 
+// BN254 scalar field modulus used by Noir and UltraHonk. Reject rather
+// than reduce non-canonical values: two encodings must never name the
+// same public input at the API boundary.
+const FIELD_MODULUS = BigInt('0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001');
+
+function normalizeFieldHex(value) {
+  const integer = BigInt(value);
+  if (integer < 0n || integer >= FIELD_MODULUS) {
+    throw new Error('Value is not a canonical BN254 field element.');
+  }
+  return `0x${integer.toString(16).padStart(64, '0')}`;
+}
+
+function fieldToBytes(value) {
+  const hex = normalizeFieldHex(value).slice(2);
+  return Uint8Array.from(hex.match(/../g).map((byte) => Number.parseInt(byte, 16)));
+}
+
 /**
- * Compute the same Poseidon2 commitment main.nr's `main` asserts,
+ * Compute the same Poseidon2 commitment main.nr's `main` returns,
  * independent of running the circuit. Used both before proving (to
  * supply the `commitment` public input the circuit checks) and by
  * verifyStoredRecord() below (to re-check a decrypted record's stored
@@ -158,7 +156,10 @@ function bytesToHex(bytes) {
  * mismatch here would make every proof fail closed (safe) rather than
  * silently verify the wrong thing, but keep the two in sync deliberately.
  */
-async function computeCommitment({ nameBytes, nameLength, amountCents, categoryId, blinding, challenge, recordIdHash }) {
+async function computeCommitment({
+  nameBytes, nameLength, amountCents, categoryId, hasCategory,
+  blinding, challenge, recordIdHash,
+}) {
   const bb = await getBarretenberg();
   const preimage = [
     DOMAIN_SEPARATOR,
@@ -168,14 +169,15 @@ async function computeCommitment({ nameBytes, nameLength, amountCents, categoryI
     blinding,
     `0x${amountCents.toString(16)}`,
     `0x${categoryId.toString(16)}`,
+    hasCategory ? '0x1' : '0x0',
     `0x${nameLength.toString(16)}`,
     ...nameBytes.map((b) => `0x${b.toString(16)}`),
   ];
-  // See the file-level comment: exact bb.js return shape (Fr vs string)
-  // not confirmed against primary docs this session -- normalize
-  // defensively either way.
-  const result = await bb.poseidon2Hash(preimage);
-  return typeof result === 'string' ? result : `0x${result.toString(16)}`;
+  // Barretenberg 5.1's generated RPC API accepts `{ inputs: Uint8Array[] }`
+  // and returns `{ hash: Uint8Array }`. Both use 32-byte big-endian field
+  // encodings, the same encoding emitted in ProofData.publicInputs.
+  const result = await bb.poseidon2Hash({ inputs: preimage.map(fieldToBytes) });
+  return normalizeFieldHex(`0x${bytesToHex(result.hash)}`);
 }
 
 /** Thin wrapper over POST /api/zkp/challenge -- see app.py. `apiFetch`
@@ -195,7 +197,8 @@ export async function requestChallenge(apiFetch) {
  * for exact-decimal cents conversion -- see amountStringToCents).
  * `challengeResponse` = requestChallenge()'s result.
  *
- * Returns { commitment, blinding, proof, publicInputs } ready to submit
+ * Returns { commitment, blinding, proof, publicInputs, publicContext }
+ * ready to submit
  * to POST /api/records/manual alongside blind_index/sealed (produced by
  * static/app.js's existing blindIndex()/seal(), unchanged) -- `blinding`
  * must be included in the sealed plaintext record (see
@@ -212,11 +215,6 @@ export async function proveManualExpense(challengeResponse, validated) {
   const challenge = hexToField(challengeResponse.challenge);
   const recordIdHash = hexToField(challengeResponse.record_id);
 
-  const commitment = await computeCommitment({
-    nameBytes: name_bytes, nameLength: name_length, amountCents: cents,
-    categoryId: category_id, blinding, challenge, recordIdHash,
-  });
-
   const inputs = {
     name_bytes, name_length,
     amount_cents: cents.toString(),
@@ -225,13 +223,27 @@ export async function proveManualExpense(challengeResponse, validated) {
     commitment_blinding: blinding,
     challenge, record_id_hash: recordIdHash,
     schema_version: SCHEMA_VERSION.toString(),
-    commitment,
   };
 
   const noir = new Noir(circuit);
-  const backend = new UltraHonkBackend(circuit.bytecode);
-  const { witness } = await noir.execute(inputs);
+  const bb = await getBarretenberg();
+  const backend = new UltraHonkBackend(circuit.bytecode, bb);
+  const { witness, returnValue } = await noir.execute(inputs);
+  const commitmentField = normalizeFieldHex(returnValue);
   const proof = await backend.generateProof(witness);
+  const expectedPublicInputs = [
+    normalizeFieldHex(challenge),
+    normalizeFieldHex(recordIdHash),
+    normalizeFieldHex(SCHEMA_VERSION),
+    commitmentField,
+  ];
+  const proofPublicInputs = proof.publicInputs.map(normalizeFieldHex);
+  if (
+    proofPublicInputs.length !== expectedPublicInputs.length
+    || proofPublicInputs.some((value, index) => value !== expectedPublicInputs[index])
+  ) {
+    throw new Error('Proof public inputs do not match the requested record context.');
+  }
   const verifiedLocally = await backend.verifyProof(proof);
   if (!verifiedLocally) {
     // Should be unreachable if the constraints above are satisfiable --
@@ -241,10 +253,14 @@ export async function proveManualExpense(challengeResponse, validated) {
   }
 
   return {
-    commitment,
+    commitment: commitmentField.slice(2),
     blinding,
     proof: bytesToHex(proof.proof),
-    publicInputs: {
+    publicInputs: proofPublicInputs,
+    // Encrypt this context with the record. It lets the browser
+    // recompute the commitment after decryption without revealing the
+    // private expense fields or the blinding factor to Flask.
+    publicContext: {
       challenge: challengeResponse.challenge,
       record_id: challengeResponse.record_id,
       schema_version: SCHEMA_VERSION,
@@ -265,11 +281,14 @@ export async function proveManualExpense(challengeResponse, validated) {
  * ingestion time, but a legitimate client detects it here on read.
  */
 export async function verifyStoredRecord(decryptedRecord, storedCommitmentHex, publicContext) {
+  const name = nameToFixedBuffer(decryptedRecord.merchant);
+  const category = categoryToWitness(decryptedRecord.category);
   const recomputed = await computeCommitment({
-    nameBytes: nameToFixedBuffer(decryptedRecord.merchant).name_bytes,
-    nameLength: nameToFixedBuffer(decryptedRecord.merchant).name_length,
+    nameBytes: name.name_bytes,
+    nameLength: name.name_length,
     amountCents: amountStringToCents(decryptedRecord.amount.toFixed(2)),
-    categoryId: categoryToWitness(decryptedRecord.category).category_id,
+    categoryId: category.category_id,
+    hasCategory: category.has_category,
     blinding: hexToField(decryptedRecord.commitment_blinding),
     challenge: hexToField(publicContext.challenge),
     recordIdHash: hexToField(publicContext.record_id),
