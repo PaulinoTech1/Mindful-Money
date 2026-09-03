@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "purpose": "Source inspection only; compatibility is not yet established",
+  "repositories": [
+    {
+      "name": "noir",
+      "url": "https://github.com/noir-lang/noir.git",
+      "release": "v1.0.0-beta.26",
+      "commit": "40d6574f851d926f93e0c3a271bac3e6e82ac905"
+    },
+    {
+      "name": "aztec-packages",
+      "url": "https://github.com/AztecProtocol/aztec-packages.git",
+      "release": "v5.1.0",
+      "commit": "3ffc13a503b7bf321c3578399074938c75f2ac7e",
+      "relevant_path": "barretenberg"
+    },
+    {
+      "name": "poseidon",
+      "url": "https://github.com/noir-lang/poseidon.git",
+      "release": "v0.2.6",
+      "commit": "00f879180a56720169cff92a56778d40678d8e26"
+    }
+  ]
+}
