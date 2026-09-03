@@ -4,8 +4,9 @@ Table shapes mirror the SQLite schema this replaces (see git history of
 app.py's old _migrate()) with deliberate type upgrades where a naive port
 would introduce a new bug -- see comments below, not a style preference.
 
-Single-vault design is unchanged: vault_identity has exactly one row (id=1,
-enforced below), never a users table. No multi-user, no admin roles.
+``vault_identity`` is the server-side tenant boundary. Financial records and
+credentials belong to exactly one identity; browser-side ciphertext remains
+opaque to the server.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ import datetime as dt
 from sqlalchemy import (
     BigInteger,
     Boolean,
-    CheckConstraint,
     Date,
     Double,
     Enum,
@@ -24,6 +24,7 @@ from sqlalchemy import (
     LargeBinary,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
@@ -45,14 +46,14 @@ class VaultIdentity(Base):
     created_at: Mapped[dt.datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at: Mapped[dt.datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 
-    __table_args__ = (CheckConstraint("id = 1", name="ck_vault_identity_singleton"),)
-
-
 class Record(Base):
     __tablename__ = "records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    blind_index: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    identity_id: Mapped[int] = mapped_column(
+        ForeignKey("vault_identity.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    blind_index: Mapped[str] = mapped_column(String(64), nullable=False)
     # Hex text, not BYTEA: arrives from and returns to the client as a hex
     # JSON string unchanged: no library expects raw bytes here.
     sealed: Mapped[str] = mapped_column(Text, nullable=False)
@@ -69,6 +70,12 @@ class Record(Base):
     commitment: Mapped[str | None] = mapped_column(String(64))
     circuit_version: Mapped[str | None] = mapped_column(String(40))
 
+    # The same transaction identifier may legitimately produce the same
+    # blind index in two separate vaults. Deduplication is tenant-local.
+    __table_args__ = (
+        UniqueConstraint("identity_id", "blind_index", name="uq_records_identity_blind_index"),
+    )
+
 
 class ZkpChallenge(Base):
     """One-time, single-use challenges binding a manual-expense ZK proof to
@@ -78,6 +85,9 @@ class ZkpChallenge(Base):
     __tablename__ = "zkp_challenges"
 
     challenge_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    identity_id: Mapped[int] = mapped_column(
+        ForeignKey("vault_identity.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     session_id_hash: Mapped[str] = mapped_column(
         ForeignKey("server_sessions.session_id_hash"), nullable=False, index=True
     )
@@ -137,6 +147,9 @@ class ServerSession(Base):
     # vault_identity's singleton row is guaranteed to exist.
     identity_id: Mapped[int | None] = mapped_column(Integer)
     authenticated_at: Mapped[float | None] = mapped_column(Double)
+    # Compatibility/UI state only: the browser asserts this after local
+    # decryption. It is not proof of passphrase or encryption-key possession
+    # and must never authorize destructive server-side actions.
     vault_unlocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     active_ceremony_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[float] = mapped_column(Double, nullable=False)

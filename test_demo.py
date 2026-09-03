@@ -85,7 +85,7 @@ TEST_DATABASE_URL = os.environ.get(
 )
 _ALL_TABLES = (
     "records", "vault_identity", "passkey_credentials", "server_sessions",
-    "webauthn_challenges", "rate_limits", "audit_events",
+    "webauthn_challenges", "zkp_challenges", "rate_limits", "audit_events",
 )
 
 
@@ -300,10 +300,12 @@ class TestServerAPI(ServerCase):
         for name in ALL_MERCHANTS:
             self.assertNotIn(name, blob)
 
-    def test_reset_clears(self):
+    def test_reset_without_a_passkey_is_rejected(self):
         self.full_flow()
-        self.unsafe("delete", "/api/records")
-        self.assertEqual(self.client.get("/api/records").get_json()["records"], [])
+        before = self.client.get("/api/records").get_json()["records"]
+        response = self.unsafe("delete", "/api/records")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.client.get("/api/records").get_json()["records"], before)
 
     def test_server_imports_no_crypto(self):
         """app.py should have no keys and no crypto library."""
@@ -338,9 +340,10 @@ class TestOptionalPasskeys(ServerCase):
 
     def test_protected_record_and_metadata_apis_require_authentication(self):
         self.set_required()
-        for method, path in (("get", "/api/records"), ("post", "/api/records"), ("post", "/api/relay"), ("get", "/api/server-view"), ("delete", "/api/records")):
+        for method, path in (("get", "/api/records"), ("post", "/api/records"), ("post", "/api/relay"), ("get", "/api/server-view")):
             response = getattr(self.client, method)(path, json={} if method == "post" else None, headers=self.headers() if method in {"post", "delete"} else None)
             self.assertEqual(response.status_code, 401, path)
+        self.assertEqual(self.client.delete("/api/records", headers=self.headers()).status_code, 409)
 
     def test_enrollment_requires_unlocked_vault(self):
         response = self.client.post("/api/passkeys/register/options", headers=self.headers())
@@ -376,6 +379,8 @@ class TestOptionalPasskeys(ServerCase):
             response = self.client.post("/api/passkeys/register/verify", json=payload, headers=self.headers())
         self.assertEqual(response.status_code, 200)
         self.assertTrue(self.client.get("/api/passkeys/status").get_json()["passkey_required"])
+        with self.client.session_transaction() as sess:
+            self.assertIsNone(sess.get("authenticated_at"), "registration is not a WebAuthn authentication assertion")
 
     def test_unknown_credential_and_authentication_challenge_single_use(self):
         with server_app.app.app_context():
@@ -553,7 +558,12 @@ class TestSecurityIncrement(ServerCase):
         self.assertIn("const apiFetch", runtime)
         self.assertIn('id="resetPassphraseBtn"', html)
         self.assertIn("async function resetPassphrase()", runtime)
-        self.assertIn("await api('/api/records', { method: 'DELETE' })", runtime)
+        self.assertIn("async function deleteAllRecordsWithStepUp(note)", runtime)
+        self.assertIn("await authenticateWithPasskey(note)", runtime)
+        self.assertEqual(runtime.count("await api('/api/records', { method: 'DELETE' })"), 2)
+        self.assertIn("error.status = response.status", runtime)
+        self.assertRegex(runtime, r"async function reset\(\) \{\s+if \(!confirm\([^\n]+\)\) return;\s+try \{\s+await deleteAllRecordsWithStepUp")
+        self.assertRegex(runtime, r"async function resetPassphrase\(\) \{\s+if \(!confirm\([^\n]+\)\) return;")
         self.assertIn("crypto.getRandomValues", runtime)
         self.assertIn("CHAT_ATTITUDE", runtime)
         self.assertIn('id="passEntropy"', html)
@@ -889,6 +899,7 @@ class TestAuditLog(ServerCase):
             server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
             server_app.db().commit()
         with self.client.session_transaction() as sess:
+            sess["identity_id"] = 1
             sess["vault_unlocked"] = True
             sess["authenticated_at"] = __import__("time").time()  # step-up freshness needs a recent passkey auth
         self.client.delete("/api/passkeys/Y3JlZA", headers=self.headers())
@@ -946,6 +957,7 @@ class TestAuditLog(ServerCase):
             server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
             server_app.db().commit()
         with self.client.session_transaction() as sess:
+            sess["identity_id"] = 1
             sess["vault_unlocked"] = True
             sess["authenticated_at"] = time.time()
         self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers())
@@ -997,6 +1009,7 @@ class TestStepUpAuthentication(ServerCase):
         with self.client.session_transaction() as sess:
             sess["vault_unlocked"] = True
             if authenticated_at is not None:
+                sess["identity_id"] = 1
                 sess["authenticated_at"] = authenticated_at
 
     def test_first_enrollment_needs_no_step_up(self):
@@ -1036,6 +1049,292 @@ class TestStepUpAuthentication(ServerCase):
         self.assertEqual(response.status_code, 200)
 
 
+class TestDestructiveRecordAuthorization(ServerCase):
+    """Full-vault deletion never trusts the browser's vault-open hint."""
+
+    def headers(self):
+        return self.security_headers()
+
+    def seed_record(self, marker="a"):
+        record = {"blind_index": marker * 64, "sealed": "b" * 96}
+        self.assertEqual(self.unsafe("post", "/api/records", json={"records": [record]}).status_code, 200)
+
+    def seed_passkey(self):
+        self.client.get("/api/passkeys/status")
+        with server_app.app.app_context():
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(
+                identity_id=1, credential_id=b"delete-cred",
+                credential_public_key=b"\x01", label="Deletion key",
+            ))
+            server_app.db().commit()
+
+    def authorize(self, authenticated_at, unlocked=False):
+        with self.client.session_transaction() as sess:
+            sess["identity_id"] = 1
+            sess["authenticated_at"] = authenticated_at
+            sess["vault_unlocked"] = unlocked
+
+    def record_count(self):
+        with self.raw_conn() as conn:
+            return conn.execute(text("SELECT count(*) FROM records")).scalar_one()
+
+    def test_no_registered_passkey_rejects_delete_and_preserves_records(self):
+        self.seed_record()
+        response = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["error"], "A passkey is required for this destructive action")
+        self.assertEqual(self.record_count(), 1)
+
+    def test_registered_passkey_with_unauthenticated_session_is_rejected(self):
+        self.seed_record(); self.seed_passkey()
+        response = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.record_count(), 1)
+
+    def test_stale_webauthn_session_is_rejected(self):
+        self.seed_record(); self.seed_passkey()
+        self.authorize(time.time() - server_app.VAULT_STEPUP_WINDOW_SECONDS - 1)
+        response = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.get_json()["error"], "Recent passkey authentication required")
+        self.assertEqual(self.record_count(), 1)
+
+    def test_recent_webauthn_session_deletes_and_security_logs(self):
+        self.seed_record(); self.seed_passkey(); self.authorize(time.time())
+        with self.assertLogs(server_app.LOG, level="INFO") as captured:
+            response = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.record_count(), 0)
+        log = "\n".join(captured.output)
+        self.assertIn('event="vault_records_deleted"', log)
+        self.assertRegex(log, r'client="[0-9a-f]{12}"')
+
+    def test_vault_unlocked_alone_cannot_authorize_delete(self):
+        self.seed_record(); self.seed_passkey()
+        with self.client.session_transaction() as sess:
+            sess["vault_unlocked"] = True
+        response = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.record_count(), 1)
+
+    def test_vault_unlocked_endpoint_cannot_authorize_delete_or_refresh_authentication(self):
+        self.seed_record(); self.seed_passkey()
+        unlocked = self.client.post("/api/vault/unlocked", headers=self.headers())
+        self.assertEqual(unlocked.status_code, 200)
+        with self.client.session_transaction() as sess:
+            self.assertTrue(sess["vault_unlocked"])
+            self.assertIsNone(sess.get("authenticated_at"))
+        self.assertEqual(self.client.post("/api/passkeys/register/options", headers=self.headers()).status_code, 401)
+        response = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.record_count(), 1)
+
+    def test_forged_ui_state_with_stale_authentication_is_rejected(self):
+        self.seed_record(); self.seed_passkey()
+        stale = time.time() - server_app.VAULT_STEPUP_WINDOW_SECONDS - 1
+        self.authorize(stale, unlocked=True)
+        response = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(self.record_count(), 1)
+        with self.client.session_transaction() as sess:
+            self.assertEqual(sess["authenticated_at"], stale)
+
+    def test_missing_csrf_is_rejected_before_deletion(self):
+        self.seed_record(); self.seed_passkey(); self.authorize(time.time())
+        response = self.client.delete("/api/records", headers={"Origin": server_app.ORIGIN})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.record_count(), 1)
+
+    def test_missing_and_hostile_origins_are_rejected_before_deletion(self):
+        self.seed_record(); self.seed_passkey(); self.authorize(time.time())
+        token = self.client.get("/api/session").get_json()["csrf_token"]
+        missing = self.client.delete("/api/records", headers={"X-CSRF-Token": token})
+        hostile = self.client.delete("/api/records", headers={
+            "Origin": "http://localhost.evil:5000", "X-CSRF-Token": token,
+        })
+        self.assertEqual((missing.status_code, hostile.status_code), (403, 403))
+        self.assertEqual(self.record_count(), 1)
+
+    def test_freshness_boundary_accepts_inside_and_rejects_outside(self):
+        self.seed_record(); self.seed_passkey()
+        now = time.time()
+        self.authorize(now - server_app.VAULT_STEPUP_WINDOW_SECONDS + 0.001)
+        with patch.object(server_app.time, "time", return_value=now):
+            inside = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(inside.status_code, 200)
+
+        self.seed_record("c")
+        self.authorize(now - server_app.VAULT_STEPUP_WINDOW_SECONDS - 0.001)
+        with patch.object(server_app.time, "time", return_value=now):
+            outside = self.client.delete("/api/records", headers=self.headers())
+        self.assertEqual(outside.status_code, 401)
+        self.assertEqual(self.record_count(), 1)
+
+    def test_unlock_hint_rejects_passphrase_and_key_payloads(self):
+        passphrase = "must-never-be-stored-passphrase"
+        encryption_key = "must-never-be-stored-key"
+        response = self.unsafe("post", "/api/vault/unlocked", json={
+            "passphrase": passphrase, "encryption_key": encryption_key,
+        })
+        self.assertEqual(response.status_code, 400)
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get("vault_unlocked", False))
+            self.assertIsNone(sess.get("authenticated_at"))
+        database = self.db_bytes()
+        self.assertNotIn(passphrase.encode(), database)
+        self.assertNotIn(encryption_key.encode(), database)
+
+    def test_verified_login_is_the_path_that_sets_fresh_authentication(self):
+        self.seed_passkey()
+        with self.client.session_transaction() as sess:
+            sess["vault_unlocked"] = True
+        self.client.post("/api/passkeys/login/options", headers=self.headers())
+        payload = _fake_authentication_credential_json(sign_count=1, credential_id="ZGVsZXRlLWNyZWQ")
+        verified = SimpleNamespace(new_sign_count=1, credential_device_type="single_device", credential_backed_up=False)
+        before = time.time()
+        with patch.object(server_app, "verify_authentication_response", return_value=verified):
+            response = self.client.post(
+                "/api/passkeys/login/verify", json={"credential": payload}, headers=self.headers()
+            )
+        self.assertEqual(response.status_code, 200)
+        with self.client.session_transaction() as sess:
+            self.assertEqual(sess["identity_id"], 1)
+            self.assertGreaterEqual(sess["authenticated_at"], before)
+            self.assertTrue(sess["vault_unlocked"], "session rotation may preserve only this UI hint")
+
+
+class TestTenantIsolation(ServerCase):
+    """The authenticated server session, never request data, selects a vault."""
+
+    def setUp(self):
+        super().setUp()
+        # Provision two independent backend identities. Public account
+        # onboarding is intentionally outside this tenant-isolation change.
+        self.client.get("/api/session")
+        with server_app.app.app_context():
+            conn = server_app.db()
+            identities = models.VaultIdentity.__table__
+            credentials = models.PasskeyCredential.__table__
+            conn.execute(identities.insert().values(
+                id=2, user_handle=b"tenant-two-user-handle", passkey_required=True,
+            ))
+            conn.execute(credentials.insert(), [
+                {"identity_id": 1, "credential_id": b"tenant-1", "credential_public_key": b"\x01", "label": "Tenant 1 key"},
+                {"identity_id": 2, "credential_id": b"tenant-2", "credential_public_key": b"\x02", "label": "Tenant 2 key"},
+            ])
+            conn.execute(identities.update().where(identities.c.id == 1).values(passkey_required=True))
+            conn.commit()
+        self.alice = self.client
+        self.bob = server_app.app.test_client()
+        self._authorize(self.alice, 1)
+        self._authorize(self.bob, 2)
+
+    def _authorize(self, client, identity_id, *, vault_unlocked=False):
+        client.get("/api/session")
+        with client.session_transaction() as sess:
+            sess["identity_id"] = identity_id
+            sess["authenticated_at"] = time.time()
+            sess["vault_unlocked"] = vault_unlocked
+
+    def _headers(self, client):
+        token = client.get("/api/session").get_json()["csrf_token"]
+        return {"Origin": server_app.ORIGIN, "X-CSRF-Token": token}
+
+    def _store(self, client, sealed, blind="a" * 64):
+        return client.post("/api/records", headers=self._headers(client), json={
+            "records": [{"blind_index": blind, "sealed": sealed}],
+        })
+
+    def test_same_blind_index_is_isolated_and_each_user_reads_only_their_record(self):
+        self.assertEqual(self._store(self.alice, "b" * 96).status_code, 200)
+        self.assertEqual(self._store(self.bob, "c" * 96).status_code, 200)
+
+        alice_records = self.alice.get("/api/records").get_json()["records"]
+        bob_records = self.bob.get("/api/records").get_json()["records"]
+        self.assertEqual([record["sealed"] for record in alice_records], ["b" * 96])
+        self.assertEqual([record["sealed"] for record in bob_records], ["c" * 96])
+        self.assertTrue(all("identity_id" not in record for record in alice_records + bob_records))
+        with self.raw_conn() as conn:
+            rows = conn.execute(text(
+                "SELECT identity_id, blind_index FROM records ORDER BY identity_id"
+            )).fetchall()
+        self.assertEqual(rows, [(1, "a" * 64), (2, "a" * 64)])
+
+    def test_metadata_and_samples_are_tenant_scoped(self):
+        self._store(self.alice, "b" * 96)
+        self._store(self.bob, "c" * 98, "d" * 64)
+        alice = self.alice.get("/api/server-view").get_json()
+        bob = self.bob.get("/api/server-view").get_json()
+        self.assertEqual((alice["record_count"], bob["record_count"]), (1, 1))
+        self.assertEqual(alice["sample"][0]["sealed"], "b" * 96)
+        self.assertEqual(bob["sample"][0]["sealed"], "c" * 98)
+        self.assertEqual(alice["size_histogram"], [{"bytes": 48, "n": 1}])
+        self.assertEqual(bob["size_histogram"], [{"bytes": 49, "n": 1}])
+
+    def test_delete_removes_only_authenticated_users_records(self):
+        self._store(self.alice, "b" * 96)
+        self._store(self.bob, "c" * 96)
+        deleted = self.alice.delete("/api/records", headers=self._headers(self.alice))
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.alice.get("/api/records").get_json()["records"], [])
+        self.assertEqual(len(self.bob.get("/api/records").get_json()["records"]), 1)
+
+    def test_quota_is_counted_per_tenant(self):
+        with patch.object(server_app, "MAX_TOTAL_RECORDS", 1):
+            self.assertEqual(self._store(self.alice, "b" * 96).status_code, 200)
+            self.assertEqual(self._store(self.bob, "c" * 96).status_code, 200)
+            self.assertEqual(self._store(self.alice, "d" * 96, "e" * 64).status_code, 409)
+
+    def test_request_body_cannot_select_another_identity(self):
+        response = self.alice.post("/api/records", headers=self._headers(self.alice), json={
+            "identity_id": 2,
+            "records": [{"blind_index": "a" * 64, "sealed": "b" * 96}],
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.bob.get("/api/records").get_json()["records"], [])
+
+    def test_passkey_inventory_and_mutation_are_tenant_scoped(self):
+        self._authorize(self.alice, 1, vault_unlocked=True)
+        self._authorize(self.bob, 2, vault_unlocked=True)
+        alice_keys = self.alice.get("/api/passkeys").get_json()["passkeys"]
+        bob_keys = self.bob.get("/api/passkeys").get_json()["passkeys"]
+        self.assertEqual([key["label"] for key in alice_keys], ["Tenant 1 key"])
+        self.assertEqual([key["label"] for key in bob_keys], ["Tenant 2 key"])
+        other_id = server_app.bytes_to_base64url(b"tenant-2")
+        response = self.alice.patch(
+            f"/api/passkeys/{other_id}", headers=self._headers(self.alice), json={"label": "stolen"}
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_signed_out_passkey_login_resolves_credential_owner(self):
+        self._store(self.bob, "c" * 96)
+        signed_out = server_app.app.test_client()
+        token = signed_out.get("/api/session").get_json()["csrf_token"]
+        headers = {"Origin": server_app.ORIGIN, "X-CSRF-Token": token}
+        self.assertEqual(signed_out.post("/api/passkeys/login/options", headers=headers).status_code, 200)
+        credential_id = server_app.bytes_to_base64url(b"tenant-2")
+        payload = _fake_authentication_credential_json(sign_count=1, credential_id=credential_id)
+        verified = SimpleNamespace(new_sign_count=1, credential_device_type="single_device", credential_backed_up=False)
+        with patch.object(server_app, "verify_authentication_response", return_value=verified):
+            response = signed_out.post(
+                "/api/passkeys/login/verify", headers=headers, json={"credential": payload}
+            )
+        self.assertEqual(response.status_code, 200)
+        with signed_out.session_transaction() as sess:
+            self.assertEqual(sess["identity_id"], 2)
+        self.assertEqual([r["sealed"] for r in signed_out.get("/api/records").get_json()["records"]], ["c" * 96])
+
+    def test_legacy_simplefin_credential_is_not_shared_with_other_tenants(self):
+        with patch.dict(os.environ, {"SIMPLEFIN_ACCESS_URL": "https://example.invalid/feed"}):
+            self.assertFalse(self.bob.get("/api/relay/sources").get_json()["simplefin_available"])
+            response = self.bob.post(
+                "/api/relay", headers=self._headers(self.bob), json={"source": "simplefin"}
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["error"], "SimpleFin is not configured for this account")
+
+
 # ---------------------------------------------------------------- runner
 
 REPORT = [
@@ -1048,6 +1347,8 @@ REPORT = [
     ("Privacy guarantee", TestPrivacyGuarantee),
     ("Audit log", TestAuditLog),
     ("Step-up authentication", TestStepUpAuthentication),
+    ("Destructive record authorization", TestDestructiveRecordAuthorization),
+    ("Tenant isolation", TestTenantIsolation),
 ]
 
 

@@ -44,8 +44,9 @@ After protection is enabled, future access has two distinct steps:
 A passkey cannot recover a forgotten passphrase. Add a backup passkey from the
 Security section before the primary device is lost. The final passkey cannot be
 removed while enforcement is enabled. Disabling protection requires a current
-passkey-authenticated session, confirmation from the locally unlocked vault,
-and restores passphrase-only access.
+passkey-authenticated session, a browser-reported vault-open workflow
+confirmation, and restores passphrase-only access. That browser report is a UX
+gate, not cryptographic proof that the passphrase or encryption key is present.
 
 **Lock vault** clears derived keys, decrypted transactions, charts, dashboard,
 server view, and assistant content as far as JavaScript permits, but preserves
@@ -62,6 +63,24 @@ applies once a passkey already exists: first-time enrollment has no prior
 passkey ceremony to be "recent" relative to, and stays gated by vault-unlock
 alone, exactly as before.
 
+Full server-side record deletion is stricter: `DELETE /api/records` always
+requires at least one registered passkey, an authenticated session, and a
+successful WebAuthn authentication assertion within
+`VAULT_STEPUP_WINDOW_SECONDS` (default 300 seconds). This applies even in the
+otherwise passphrase-only development policy. The web UI keeps the user's
+explicit deletion confirmation, performs a passkey assertion when freshness is
+missing, accepts the rotated CSRF token, and retries that confirmed deletion
+once. A passkey must be enrolled explicitly before the full server-side vault
+can be erased through either the UI or API.
+
+`POST /api/vault/unlocked` is only a browser-to-server UI synchronization hint.
+The Flask server never receives or verifies the passphrase, derived encryption
+keys, recovery keys, plaintext records, or a passphrase verifier. Consequently,
+`vault_unlocked=true` is not proof of vault-key possession, does not refresh
+`authenticated_at`, and cannot authorize destructive deletion. In application
+code, `authenticated_at` becomes fresh only after a successful server-side
+`verify_authentication_response(...)` WebAuthn assertion.
+
 ### Audit log
 
 `audit_events` is an append-only table recording `PASSKEY_REGISTERED`,
@@ -73,6 +92,28 @@ bucketing (not a raw IP), and — where relevant — a credential ID and a small
 JSON detail blob. Never a challenge, session token, CSRF token, or public
 key: the audit trail documents that something happened, not the
 cryptographic material involved.
+
+Successful full-record deletion emits the structured application security log
+event `event="vault_records_deleted"` with the same privacy-preserving client
+reference. It is intentionally not added to the database audit enum, avoiding
+an unnecessary schema migration for this hardening change.
+
+### Backend tenant isolation
+
+`vault_identity.id` is the server-side tenant boundary. Every encrypted record
+has a non-null foreign key to its identity, and `(identity_id, blind_index)` is
+unique. All record uploads, downloads, quota calculations, server metadata,
+ZKP challenge consumption, and deletions add the authenticated session's
+identity to their database predicate. The API does not accept an identity ID
+from request JSON, and record responses do not disclose one. A passkey
+credential is globally unique and a successful sign-in resolves that
+credential to its owning identity before rotating the session.
+
+Migration `9c1e4a7b2d10` assigns all pre-migration records to identity 1 without
+rewriting their blind indexes or ciphertext. Identity 1 remains the local
+demo's compatibility tenant. New identities must be deliberately provisioned;
+public signup, invitations, recovery, and account deletion are not implemented
+yet. Production must continue to use `VAULT_AUTH_POLICY=required`.
 
 A counter regression (an authenticator reporting a `signCount` that isn't
 greater than what's on file, one signal of possible credential cloning) is
@@ -110,6 +151,10 @@ response is session data. Sessions have an eight-hour absolute lifetime and a
 successful registration, login, and policy transitions rotate both the
 identifier and CSRF token. Cookies are HttpOnly, SameSite=Strict, Path `/`, and
 Secure in production. Expired and revoked rows are cleaned opportunistically.
+The retained `vault_unlocked` session column is compatibility-only,
+browser-reported UI state; it is not an authentication factor. Session rotation
+after WebAuthn authentication preserves that hint for workflow continuity but
+does not make it more authoritative.
 
 WebAuthn challenges live in `webauthn_challenges`, are bound to the initiating
 server session and ceremony kind, expire after five minutes, and are consumed
@@ -139,8 +184,8 @@ origin inference.
 The whole batch is validated before an atomic upsert. Unknown fields,
 duplicates, malformed blind indexes, and ciphertext outside 96–16384 hex
 characters are rejected without partial writes. Defaults are an 8 MiB request
-and JSON limit, 1,000 records per batch, and 100,000 total stored records. Byte
-counts are computed from decoded hex on the server.
+and JSON limit, 1,000 records per batch, and 100,000 stored records per tenant.
+Byte counts are computed from decoded hex on the server.
 
 Configuration overrides are `VAULT_SESSION_TTL`, `VAULT_SESSION_IDLE_TTL`,
 `VAULT_CHALLENGE_TTL`, `VAULT_MAX_REQUEST_BYTES`,
@@ -151,8 +196,8 @@ listener; optional policy rejects a non-loopback host.
 
 Schema changes are Alembic migrations (`alembic upgrade head`), not something
 the app does at runtime. The one thing the app still does on first request is
-idempotently seed this prototype's single `vault_identity` row if it's
-missing — a cheap `INSERT ... ON CONFLICT DO NOTHING`, not a schema change.
+idempotently seed legacy identity 1 if it is missing — a cheap
+`INSERT ... ON CONFLICT DO NOTHING`, not a schema change.
 `passkey_credentials` holds credential IDs and public keys as raw bytes (not
 base64url text — nothing about them needs text-safe encoding once SQLite's
 TEXT-only columns are no longer the storage layer), counters, transports,
@@ -391,15 +436,22 @@ The access URL is a bearer credential for a real (or demo) linked bridge; keep
 it out of version control (`.env` is already gitignored) and treat it the way
 you would any other aggregator token.
 
+The environment-based SimpleFin credential is legacy identity 1's connection
+only. Other identities receive "not configured" and cannot use or discover
+that feed. A multi-user alpha still needs a per-identity connection table,
+KMS-wrapped access URLs, and an explicit claim/revoke lifecycle before real
+bank connections can be offered to those users.
+
 ## Demo shortcuts to remove
 
 1. **Fixed salts** in `app.js` (`DEMO_SALT_ENC`, `DEMO_SALT_IDX`) so a reload
    re-derives the same key without a signup flow. Real builds generate random
    salts per user and store them next to the public key.
 2. **Optional authentication.** Until passkey protection is explicitly enabled,
-   any browser reaching this single-vault server can fetch its ciphertext and
-metadata. Optional mode preserves compatibility; it does not protect users
-who have not enabled it, and is deliberately restricted to loopback development.
+   any browser reaching the local demo can fetch compatibility tenant 1's
+   ciphertext and metadata. Optional mode preserves backwards compatibility;
+   it does not protect users who have not enabled it, and is deliberately
+   restricted to loopback development.
 3. **No recovery.** Forget the passphrase, lose the data. That's the honest
    consequence of the design; a real build adds a 24-word recovery phrase
    wrapping a second copy of the private key.
@@ -407,14 +459,15 @@ who have not enabled it, and is deliberately restricted to loopback development.
    process environment / `.env`. A real build seals it under a KMS key instead.
 5. **Flask dev server.** Obviously.
 
-Additional threat-model limits remain: this is a single-vault prototype with
-no account recovery or multi-user isolation; a compromised origin can replace
-the JavaScript and steal the passphrase or plaintext; XSS runs with the user's
-session; ciphertext count, timing, and length remain visible to the server once
-authenticated (and always in passphrase-only mode); Flask's signed cookie does
-and cloned/non-counter authenticators can limit sign-counter detection. Passkey
-backup security depends on the platform provider. Use HTTPS, a hardened CSP,
-trusted static deployment, rate limits,
+Additional threat-model limits remain: database queries are tenant-isolated,
+but there is no public account onboarding, invitation flow, account recovery,
+per-user encryption salt provisioning, or per-user bank-connection lifecycle;
+a compromised origin can replace the JavaScript and steal the passphrase or
+plaintext; XSS runs with the user's session; ciphertext count, timing, and
+length remain visible to the server once authenticated (and for compatibility
+tenant 1 in passphrase-only mode); cloned/non-counter authenticators can limit
+sign-counter detection. Passkey backup security depends on the platform
+provider. Use HTTPS, a hardened CSP, trusted static deployment, rate limits,
 and operational monitoring before production use.
 
 ## Next

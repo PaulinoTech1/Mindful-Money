@@ -2,8 +2,8 @@
 
 Mirrors the old app.py pattern (_connect() / db() / _close()) almost
 exactly: a lazily-created, request-scoped connection stored on Flask's
-`g`, disposed in app teardown. The one thing this replaces beyond a
-straight driver swap is documented on _ensure_identity() below.
+`g`, disposed in app teardown. The legacy identity bootstrap is documented
+on _seed_identity() below.
 """
 
 from __future__ import annotations
@@ -63,16 +63,15 @@ def rebind(url: str) -> None:
 
 
 def _seed_identity(session: Session) -> None:
-    """Idempotently create the single vault_identity row if it's missing.
+    """Idempotently create the legacy/default vault identity if it is missing.
 
     The old SQLite _migrate() ran a full CREATE TABLE script (schema DDL,
     now Alembic's job) on every request, which also had the side effect
     of self-healing this singleton row if it was ever missing. That
     self-healing behavior is relied on implicitly (e.g. tests that GET
     /api/passkeys/status purely to guarantee the row exists before
-    mutating it directly), so it's preserved here as a cheap per-request
-    idempotent upsert on first DB access, rather than dropped along with
-    the DDL.
+    mutating it directly). Identity 1 remains the compatibility tenant;
+    additional identities are provisioned explicitly rather than silently.
     """
     stmt = (
         pg_insert(models.VaultIdentity.__table__)

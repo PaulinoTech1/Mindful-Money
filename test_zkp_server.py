@@ -75,6 +75,7 @@ def _force_issue_challenge(case, **overrides):
     now = time.time()
     values = dict(
         challenge_id=secrets.token_urlsafe(16),
+        identity_id=1,
         session_id_hash=_current_session_id_hash(case),
         challenge=secrets.token_bytes(31),
         record_id=secrets.token_bytes(16),
@@ -117,6 +118,19 @@ class TestZkpChallengeLifecycle(ServerCase):
 
     def test_unknown_challenge_id_rejected(self):
         resp = self.submit("does-not-exist")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_challenge_from_another_identity_is_rejected(self):
+        with self._engine.begin() as conn:
+            from sqlalchemy import insert
+            conn.execute(insert(models.VaultIdentity.__table__).values(
+                id=2, user_handle=b"tenant-two", passkey_required=False,
+            ))
+        values = _force_issue_challenge(self, identity_id=2)
+        resp = self.submit(values["challenge_id"], public_inputs={
+            "challenge": values["challenge"].hex(), "record_id": values["record_id"].hex(),
+            "schema_version": values["schema_version"],
+        })
         self.assertEqual(resp.status_code, 400)
 
     def test_expired_challenge_rejected(self):

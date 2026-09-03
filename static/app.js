@@ -24,7 +24,11 @@ const apiFetch = async (url, options = {}) => {
   const response = await fetch(url, opts);
   const contentType = response.headers.get('content-type') || '';
   const data = contentType.includes('application/json') ? await response.json().catch(() => ({})) : {};
-  if (!response.ok) throw new Error(data.error || (response.status === 401 ? 'Your passkey session expired.' : 'Request failed.'));
+  if (!response.ok) {
+    const error = new Error(data.error || (response.status === 401 ? 'Your passkey session expired.' : 'Request failed.'));
+    error.status = response.status;
+    throw error;
+  }
   if (typeof data.csrf_token === 'string') CSRF = data.csrf_token;
   return data;
 };
@@ -1281,8 +1285,12 @@ function toggleView() {
 
 async function reset() {
   if (!confirm('Clear every encrypted transaction from this vault? This cannot be undone.')) return;
-  await api('/api/records', { method: 'DELETE' });
-  location.reload();
+  try {
+    await deleteAllRecordsWithStepUp($('securityNote'));
+    location.reload();
+  } catch (error) {
+    alert(webauthnMessage(error));
+  }
 }
 
 async function resetPassphrase() {
@@ -1290,7 +1298,7 @@ async function resetPassphrase() {
   const note = $('gateNote');
   $('resetPassphraseBtn').disabled = true;
   try {
-    await api('/api/records', { method: 'DELETE' });
+    await deleteAllRecordsWithStepUp(note);
     KEYS = null; TXNS = [];
     $('pass').value = '';
     updatePassphraseEntropy();
@@ -1312,6 +1320,32 @@ function webauthnMessage(error) {
   return error?.message || 'The passkey operation failed.';
 }
 
+async function authenticateWithPasskey(note) {
+  if (!window.PublicKeyCredential) throw new Error('This browser does not support WebAuthn passkeys.');
+  if (note) note.textContent = 'Waiting for your authenticator...';
+  const options = await api('/api/passkeys/login/options', { method: 'POST' });
+  const credential = await navigator.credentials.get({ publicKey: publicKeyOptions(options) });
+  const result = await api('/api/passkeys/login/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credential: credentialJSON(credential) }) });
+  CSRF = result.csrf_token;
+  PASSKEY_AUTHENTICATED = true;
+  return result;
+}
+
+async function deleteAllRecordsWithStepUp(note) {
+  try {
+    return await api('/api/records', { method: 'DELETE' });
+  } catch (error) {
+    if (error.status === 409) {
+      throw new Error('Enroll a passkey before deleting every server-side vault record.');
+    }
+    if (error.status !== 401) throw error;
+    // This retry remains scoped to the destructive action the user already
+    // confirmed. Session rotation updates CSRF but does not touch KEYS.
+    await authenticateWithPasskey(note);
+    return await api('/api/records', { method: 'DELETE' });
+  }
+}
+
 async function registerPasskey() {
   const note = $('securityNote');
   try {
@@ -1320,7 +1354,13 @@ async function registerPasskey() {
     const options = await api('/api/passkeys/register/options', { method: 'POST' });
     const credential = await navigator.credentials.create({ publicKey: publicKeyOptions(options) });
     const result = await api('/api/passkeys/register/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credential: credentialJSON(credential), label: $('passkeyLabel').value || 'Passkey' }) });
-    if (result.verified) { PASSKEY_REQUIRED = true; PASSKEY_AUTHENTICATED = true; await refreshSecurity(); note.textContent = 'Passkey protection is enabled. Future access requires your passkey and then your passphrase.'; }
+    if (result.verified) {
+      PASSKEY_REQUIRED = true;
+      note.textContent = 'Passkey enrolled. Authenticate with it to begin the protected session.';
+      await authenticateWithPasskey(note);
+      await refreshSecurity();
+      note.textContent = 'Passkey protection is enabled. Future access requires your passkey and then your passphrase.';
+    }
   } catch (error) { note.textContent = webauthnMessage(error); }
 }
 
@@ -1328,10 +1368,7 @@ async function loginPasskey() {
   const note = $('passkeyGateNote');
   try {
     note.textContent = 'Waiting for your authenticator…';
-    const options = await api('/api/passkeys/login/options', { method: 'POST' });
-    const credential = await navigator.credentials.get({ publicKey: publicKeyOptions(options) });
-    const result = await api('/api/passkeys/login/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credential: credentialJSON(credential) }) });
-    CSRF = result.csrf_token; PASSKEY_AUTHENTICATED = true;
+    await authenticateWithPasskey(note);
     $('passkeyGate').hidden = true; $('gate').hidden = false; $('gate').querySelector('h1').textContent = 'Unlock vault with passphrase';
     $('gateNote').textContent = 'Passkey accepted. Your passphrase now decrypts the vault locally.';
   } catch (error) { note.textContent = webauthnMessage(error); }

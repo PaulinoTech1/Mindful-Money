@@ -123,9 +123,12 @@ def main() -> int:
             errors: list[str] = []
             requests: list[str] = []
             request_bodies: list[str] = []
+            record_delete_statuses: list[int] = []
             page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
             page.on("pageerror", lambda e: errors.append(f"PAGEERROR: {e}"))
             page.on("request", lambda r: (requests.append(r.url), request_bodies.append(r.post_data or "")))
+            page.on("response", lambda r: record_delete_statuses.append(r.status)
+                    if r.request.method == "DELETE" and r.url.endswith("/api/records") else None)
 
             # --- unlock -------------------------------------------------
             print("  Unlock")
@@ -369,12 +372,6 @@ def main() -> int:
             page.click("#lockVaultBtn")
             check(page.is_visible("#gate") and not page.is_visible("#passkeyGate"), "lock clears vault but preserves passkey session")
             page.fill("#pass", PASSPHRASE); page.click("#unlockBtn"); page.wait_for_selector("#dash:not([hidden])", timeout=30000)
-            page.on("dialog", lambda dialog: dialog.accept())
-            page.click("#disablePasskeyBtn")
-            page.wait_for_function("() => document.querySelector('#passkeyState').innerText === 'Not enabled'")
-            check(page.is_visible("#security"), "disabling restores passphrase-only mode")
-            check(all(PASSPHRASE not in body for body in request_bodies), "passphrase never appears in network request bodies")
-            cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": authenticator})
 
             # --- manual expense entry -------------------------------------
             print("\n  Manual expense entry")
@@ -429,11 +426,15 @@ def main() -> int:
             page.fill("#addExpenseAmount", "45.67")
             page.select_option("#addExpenseCategory", label="Dining")
             fired = []
-            page.once("dialog", lambda d: (fired.append(d.message), d.dismiss()))
+            def capture_xss_dialog(dialog):
+                fired.append(dialog.message)
+                dialog.dismiss()
+            page.once("dialog", capture_xss_dialog)
             page.click("#addExpenseForm button[type=submit]")
             page.wait_for_selector("#addExpenseDialog", state="hidden")
             check(int(page.inner_text("#statRecords")) == records_before + 1, "manual expense adds exactly one record")
             check(not fired, "no alert() fired from the injected expense name", str(fired))
+            page.remove_listener("dialog", capture_xss_dialog)
             ledger_text = page.inner_text("#ledgerBody")
             check(xss_name in ledger_text, "XSS-payload expense name renders as literal visible text")
             check(page.query_selector("#ledgerBody img") is None, "payload never became a live <img> element")
@@ -487,6 +488,44 @@ def main() -> int:
             )
             check(not overflow, "no horizontal overflow at 390px")
             page.screenshot(path=SHOTS / "4-mobile.png", full_page=True)
+
+            # --- destructive deletion step-up ---------------------------
+            print("\n  Destructive deletion step-up")
+            page.set_viewport_size({"width": 1280, "height": 900})
+
+            # Force only the server-side assertion timestamp stale. The
+            # browser keeps its locally derived keys so the inline step-up
+            # can prove session rotation does not clear or transmit them.
+            admin_engine = create_engine(test_db_url, future=True)
+            with admin_engine.begin() as conn:
+                conn.execute(text("UPDATE server_sessions SET authenticated_at=0 WHERE revoked_at IS NULL"))
+                before_delete = conn.execute(text("SELECT count(*) FROM records")).scalar_one()
+            key_before = page.evaluate("() => S.to_hex(KEYS.publicKey)")
+            csrf_before = page.evaluate("() => CSRF")
+            page.evaluate("() => deleteAllRecordsWithStepUp(document.getElementById('securityNote'))")
+            key_after = page.evaluate("() => S.to_hex(KEYS.publicKey)")
+            csrf_after = page.evaluate("() => CSRF")
+            with admin_engine.connect() as conn:
+                after_delete = conn.execute(text("SELECT count(*) FROM records")).scalar_one()
+                refreshed_at = conn.execute(text(
+                    "SELECT authenticated_at FROM server_sessions WHERE revoked_at IS NULL "
+                    "ORDER BY last_seen_at DESC LIMIT 1"
+                )).scalar_one()
+            admin_engine.dispose()
+            check(record_delete_statuses == [401, 200], "stale delete is rejected, authenticated, and retried exactly once", str(record_delete_statuses))
+            check(before_delete > 0 and after_delete == 0, "step-up-authorized retry deletes all server records")
+            check(csrf_after != csrf_before and refreshed_at > 0, "step-up rotation supplies a fresh CSRF token and authentication time")
+            check(key_after == key_before, "WebAuthn session rotation preserves the browser-only derived key")
+            expected_stepup_error = "Failed to load resource: the server responded with a status of 401 (UNAUTHORIZED)"
+            if record_delete_statuses == [401, 200] and expected_stepup_error in errors:
+                errors.remove(expected_stepup_error)
+
+            page.once("dialog", lambda dialog: dialog.accept())
+            page.click("#disablePasskeyBtn")
+            page.wait_for_function("() => document.querySelector('#passkeyState').innerText === 'Not enabled'")
+            check(page.is_visible("#security"), "disabling restores passphrase-only mode")
+            check(all(PASSPHRASE not in body for body in request_bodies), "passphrase never appears in network request bodies")
+            cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": authenticator})
 
             check(not errors, "no console errors", "; ".join(errors[:3]))
             browser.close()
