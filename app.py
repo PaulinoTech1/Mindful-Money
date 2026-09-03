@@ -63,7 +63,7 @@ _B64URL = re.compile(r"[A-Za-z0-9_-]{2,1024}\Z")
 def _configuration():
     production = os.environ.get("VAULT_ENV", os.environ.get("FLASK_ENV", "development")).lower() == "production"
     policy_raw = os.environ.get("VAULT_AUTH_POLICY")
-    policy = policy_raw or ("optional" if not production else "")
+    policy = policy_raw or ("required" if not production else "")
     if policy not in {"optional", "required"}:
         raise RuntimeError("VAULT_AUTH_POLICY must be optional or required")
     if production and policy != "required":

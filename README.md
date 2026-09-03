@@ -23,11 +23,12 @@ python app.py
 ## Authentication policy and passkey protection
 
 `VAULT_AUTH_POLICY` is explicit: `optional` or `required`. Development defaults
-to `optional` for the localhost prototype and optional mode may bind only to a
-loopback host. Production has no optional default and refuses to start unless
-`VAULT_AUTH_POLICY=required`. Required policy protects APIs independently of
-whether a credential happens to have been enrolled; an existing deployment
-must enroll its passkey before switching to required production policy.
+to `required`; set `VAULT_AUTH_POLICY=optional` only when bootstrapping a local
+installation that has not enrolled a passkey yet. Optional mode may bind only
+to a loopback host. Production has no optional default and refuses to start
+unless `VAULT_AUTH_POLICY=required`. Required policy protects APIs
+independently of whether a credential happens to have been enrolled; enroll a
+passkey before using the protected local installation.
 
 Passkeys are optional. A new or existing installation continues in the current
 passphrase-only mode until **Enable passkey protection** is chosen from inside
