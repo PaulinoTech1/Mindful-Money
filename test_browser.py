@@ -225,12 +225,12 @@ def main() -> int:
             check("Across" in chat_text, "assistant summarizes decrypted transactions locally")
             check("LOCAL ONLY" in page.inner_text("#assistant"), "assistant shows its local-only privacy boundary")
             check(requests == before_chat_requests, "chat question made no network request", str(requests[len(before_chat_requests):]))
-            page.fill("#chatInput", "How much did I spend at Fans Only last month?")
+            page.fill("#chatInput", "How much did I spend at Family Recreation Center last month?")
             page.click("#chatSend")
             page.wait_for_function(
                 "() => document.querySelectorAll('#chatMessages .chatBubble').length >= 5"
             )
-            check("$423.23" in page.inner_text("#chatMessages"), "assistant reports the exact Fans Only charge")
+            check("$89.99" in page.inner_text("#chatMessages"), "assistant reports the exact family recreation center charge")
             page.fill("#chatInput", "Graph my spending by category")
             page.click("#chatSend")
             page.wait_for_selector("#chatMessages .chatGraph canvas")
@@ -287,6 +287,8 @@ def main() -> int:
                       if m in sv_text]
             check(not leaked, "no merchant name appears in the server view", f"leaked: {leaked}")
             check(str(records) in sv_text, "server view reports the real row count")
+            check("No records in this vault have been accepted by the ZKP verifier yet." in sv_text, "server view reports ZKP verification status")
+            check("transaction name, amount, account, or category" in sv_text, "ZKP status explains plaintext remains hidden")
 
             raw = page.query_selector_all("#rawBody tr")
             check(len(raw) > 0, f"{len(raw)} raw ciphertext rows displayed")
@@ -448,7 +450,16 @@ def main() -> int:
                 dialog.dismiss()
             page.once("dialog", capture_xss_dialog)
             page.click("#addExpenseForm button[type=submit]")
-            page.wait_for_selector("#addExpenseDialog", state="hidden")
+            # Browser-side Barretenberg initialization and proof generation
+            # can take longer than the ordinary UI interaction budget on a
+            # cold WASM load, especially on laptops with many worker threads.
+            try:
+                page.wait_for_selector("#addExpenseDialog", state="hidden", timeout=120000)
+            except Exception:
+                print("    manual submit status:", page.inner_text("#addExpenseError"))
+                print("    manual submit requests:", requests[-12:])
+                print("    browser errors:", errors[-8:])
+                raise
             check(int(page.inner_text("#statRecords")) == records_before + 1, "manual expense adds exactly one record")
             check(not fired, "no alert() fired from the injected transaction name", str(fired))
             page.remove_listener("dialog", capture_xss_dialog)

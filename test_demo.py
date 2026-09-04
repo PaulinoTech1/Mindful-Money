@@ -14,10 +14,12 @@ pass, the browser path is sound.
 from __future__ import annotations
 
 import json
+import ast
 import os
 import re
 import sys
 import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 import unittest
@@ -153,6 +155,89 @@ class ServerCase(unittest.TestCase):
         return sim, txns
 
 
+class TestApiErrorCodeContract(ServerCase):
+    CODE_PATTERN = re.compile(r"MM_(?:SERVER|CLIENT)_[A-Z0-9]+(?:_[A-Z0-9]+){3,15}\Z")
+
+    def assert_coded_error(self, response, expected_code=None):
+        payload = response.get_json()
+        self.assertIsInstance(payload.get("error"), str)
+        self.assertRegex(payload.get("error_code", ""), self.CODE_PATTERN)
+        if expected_code is not None:
+            self.assertEqual(payload["error_code"], expected_code)
+
+    def test_every_api_error_call_has_a_literal_valid_code(self):
+        tree = ast.parse(Path(server_app.__file__).read_text("utf-8"))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "api_error"
+        ]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(len(call.args), 3, f"api_error at line {call.lineno} must provide a code")
+            self.assertIsInstance(call.args[2], ast.Constant, f"error code at line {call.lineno} must be literal")
+            self.assertRegex(call.args[2].value, self.CODE_PATTERN)
+            self.assertTrue(call.args[2].value.startswith("MM_SERVER_"), f"server error at line {call.lineno} has the wrong origin")
+
+    def test_every_declared_server_and_client_code_matches_the_scheme(self):
+        for relative_path in ("app.py", "static/app.js"):
+            source = (Path(server_app.__file__).parent / relative_path).read_text("utf-8")
+            codes = set(re.findall(r"MM_(?:SERVER|CLIENT)_[A-Z0-9_]+", source))
+            self.assertTrue(codes, relative_path)
+            for code in codes:
+                self.assertRegex(code, self.CODE_PATTERN, f"invalid code in {relative_path}")
+
+    def test_origin_rejection_returns_specific_coded_error(self):
+        response = self.client.post("/api/records", json={"records": []}, headers={"Origin": "https://hostile.invalid"})
+        self.assertEqual(response.status_code, 403)
+        self.assert_coded_error(response, "MM_SERVER_SECURITY_ORIGIN_VALIDATION_REQUEST_REJECTED")
+
+    def test_malformed_json_returns_specific_coded_error(self):
+        response = self.unsafe("post", "/api/records", data="{", content_type="application/json")
+        self.assertEqual(response.status_code, 400)
+        self.assert_coded_error(response, "MM_SERVER_HTTP_JSON_PARSE_SYNTAX_INVALID")
+
+    def test_unknown_api_route_returns_specific_coded_error(self):
+        response = self.client.get("/api/not-a-real-endpoint")
+        self.assertEqual(response.status_code, 404)
+        self.assert_coded_error(response, "MM_SERVER_HTTP_REQUEST_ROUTE_ENDPOINT_NOT_FOUND")
+
+    def test_zkp_worker_assets_are_served_from_the_narrow_asset_route(self):
+        asset_root = Path(server_app.STATIC) / "zkp" / "dist" / "assets"
+        filenames = ("main.worker-CemVKdPj.js", "thread.worker-B3dcc7dL.js")
+        if not all((asset_root / filename).is_file() for filename in filenames):
+            self.skipTest("ZKP browser bundle has not been built")
+        for filename in filenames:
+            response = self.client.get(f"/assets/{filename}")
+            self.assertEqual(response.status_code, 200, filename)
+            self.assertIn("postMessage", response.get_data(as_text=True), filename)
+
+    def test_zkp_crs_route_serves_only_the_allowed_public_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            (root_path / "g1_compressed.dat").write_bytes(b"g1")
+            (root_path / "g2.dat").write_bytes(b"g2")
+            (root_path / "grumpkin_g1_v2.dat").write_bytes(b"grumpkin")
+            with patch.object(server_app, "ZKP_CRS_ROOT", root_path):
+                self.assertEqual(self.client.get("/zkp-crs/g1_compressed.dat").data, b"g1")
+                self.assertEqual(self.client.get("/zkp-crs/g2.dat").data, b"g2")
+                self.assertEqual(self.client.get("/zkp-crs/grumpkin_g1_v2.dat").data, b"grumpkin")
+                self.assertEqual(self.client.get("/zkp-crs/secret.txt").status_code, 404)
+
+    def test_disallowed_api_method_returns_specific_coded_error(self):
+        response = self.client.get("/api/zkp/challenge")
+        self.assertEqual(response.status_code, 405)
+        self.assertIn("POST", response.headers["Allow"])
+        self.assert_coded_error(response, "MM_SERVER_HTTP_REQUEST_ROUTE_METHOD_NOT_ALLOWED")
+
+    def test_unexpected_api_failure_returns_safe_coded_error(self):
+        with patch.object(fakebank, "generate", side_effect=RuntimeError("private diagnostic")):
+            response = self.unsafe("post", "/api/relay")
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("private diagnostic", response.get_data(as_text=True))
+        self.assert_coded_error(response, "MM_SERVER_APPLICATION_REQUEST_EXECUTION_UNEXPECTED_FAILURE")
+
+
 # ---------------------------------------------------------------- fake bank
 
 
@@ -208,10 +293,10 @@ class TestFakeBank(unittest.TestCase):
         self.assertTrue(all(t["account_label"] == fakebank.ACCOUNTS[t["account"]]["label"] for t in txns))
         self.assertTrue(all(t["account_type"] == fakebank.ACCOUNTS[t["account"]]["type"] for t in txns))
 
-    def test_fans_only_is_a_monthly_423_23_subscription(self):
-        charges = [t for t in fakebank.generate() if t["merchant"] == "Fans Only"]
+    def test_family_recreation_center_is_a_monthly_89_99_membership(self):
+        charges = [t for t in fakebank.generate() if t["merchant"] == "Family Recreation Center"]
         self.assertGreaterEqual(len(charges), 6)
-        self.assertTrue(all(t["amount"] == 423.23 for t in charges))
+        self.assertTrue(all(t["amount"] == 89.99 for t in charges))
         self.assertEqual(len({t["date"][:7] for t in charges}), len(charges))
 
 

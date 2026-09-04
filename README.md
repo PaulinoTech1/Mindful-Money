@@ -210,8 +210,8 @@ that commits a successfully verified credential.
 Set any passphrase, click **Connect demo bank**. Six months of transactions get
 generated across a checking account, an IRA and a 401(k), encrypted in your
 browser, and stored as ciphertext. The demo banks are Scammers Inc, Wells
-Foreclosure and DC Unc. The checking feed includes a fixed $423.23 monthly
-Fans Only subscription charge.
+Foreclosure and DC Unc. The checking feed includes a fixed $89.99 monthly
+Family Recreation Center membership charge.
 
 No *external* network access required — PostgreSQL is a local (or
 operator-controlled) service, not a third party. Chart.js and libsodium are
@@ -410,6 +410,7 @@ context, projections, and results never leave the browser.
 | `models.py` | SQLAlchemy models for the PostgreSQL schema |
 | `db.py` | Request-scoped engine/session lifecycle |
 | `migrations/` | Alembic migrations (`alembic upgrade head`) |
+| `ERROR_CODES.md` | Stable verbose API/client error-code grammar and security rules |
 | `fakebank.py` | Stand-in for the bank feed. Swap in the Plaid adapter here |
 | `simplefin.py` | SimpleFin Protocol adapter — normalizes a real (or demo) linked bridge into the same transaction shape as `fakebank.generate()` |
 | `static/style.css` | Ledger aesthetic — Georgia's old-style figures, no webfonts |

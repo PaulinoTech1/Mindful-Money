@@ -16,17 +16,43 @@ let PASSKEY_AUTHENTICATED = false;
 let SIMPLEFIN_AVAILABLE = false;
 let EDITING_TRANSACTION_ID = null;
 let ANOMALIES = new Map();
+let ZKP_CLIENT_PROMISE = null;
+
+const ERROR_CODE_PATTERN = /^MM_(?:SERVER|CLIENT)_[A-Z0-9]+(?:_[A-Z0-9]+){3,15}$/;
+function attachErrorCode(error, code, fallbackMessage = 'Request failed.') {
+  const normalized = error instanceof Error ? error : new Error(fallbackMessage);
+  if (ERROR_CODE_PATTERN.test(normalized.code || '')) return normalized;
+  const coded = new Error(`${normalized.message || fallbackMessage} [${code}]`);
+  coded.code = code;
+  coded.cause = normalized;
+  return coded;
+}
+
+const clientError = (message, code) => attachErrorCode(new Error(message), code, message);
 
 const apiFetch = async (url, options = {}) => {
   const opts = { credentials: 'same-origin', ...options, headers: { ...(options.headers || {}) } };
   const method = (opts.method || 'GET').toUpperCase();
   if (!['GET', 'HEAD'].includes(method)) opts.headers['X-CSRF-Token'] = CSRF;
-  const response = await fetch(url, opts);
+  let response;
+  try {
+    response = await fetch(url, opts);
+  } catch (cause) {
+    throw attachErrorCode(
+      cause, 'MM_CLIENT_NETWORK_API_REQUEST_CONNECTION_OR_TRANSPORT_FAILED',
+      'Could not reach the application server.',
+    );
+  }
   const contentType = response.headers.get('content-type') || '';
   const data = contentType.includes('application/json') ? await response.json().catch(() => ({})) : {};
   if (!response.ok) {
-    const error = new Error(data.error || (response.status === 401 ? 'Your passkey session expired.' : 'Request failed.'));
+    const errorCode = ERROR_CODE_PATTERN.test(data.error_code || '')
+      ? data.error_code
+      : 'MM_CLIENT_HTTP_API_RESPONSE_STRUCTURED_ERROR_CODE_MISSING_OR_INVALID';
+    const message = data.error || (response.status === 401 ? 'Your passkey session expired.' : 'Request failed.');
+    const error = new Error(`${message} [${errorCode}]`);
     error.status = response.status;
+    error.code = errorCode;
     throw error;
   }
   if (typeof data.csrf_token === 'string') CSRF = data.csrf_token;
@@ -66,7 +92,7 @@ const RULES = [
   [/blue bottle|sweetgreen|lucali/i,                    'Dining'],
   [/mta|omny|uber|citi bike|enterprise|delta air/i,     'Transport'],
   [/con edison|verizon/i,                               'Utilities'],
-  [/spotify|netflix|fans only/i,                        'Subscriptions'],
+  [/spotify|netflix|family recreation center/i,         'Subscriptions'],
   [/amazon|apple store|rough trade|paragon|warby/i,     'Shopping'],
   [/duane reade|weill cornell|equinox|state farm/i,     'Health & insurance'],
   [/ira contribution|401\(k\)|employee deferral|employer match/i, 'Investing'],
@@ -98,7 +124,7 @@ const categorize = (merchant) => {
 };
 
 /* ---------- manual transaction entry ------------------------------------
-   The server (app.py's put_records) only ever sees ciphertext -- it can
+  The server (app.py's put_records and create_manual_expense_zkp) only ever sees ciphertext -- it can
    check that a record LOOKS like a sealed box (hex, length bounds) but
    has no way to validate a transaction's business content, because it never
    has the key to read it. That makes these validators the sole trust
@@ -124,14 +150,28 @@ const MANUAL_AMOUNT_MAX = 999999999.99;
 const MANUAL_AMOUNT_PATTERN = /^\d{1,9}(?:\.\d{1,2})?$/;
 
 function validateTransactionName(raw) {
-  if (typeof raw !== 'string') throw new Error('Transaction name is required.');
+  if (typeof raw !== 'string') {
+    throw clientError('Transaction name is required.', 'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_NAME_TYPE_INVALID');
+  }
   const trimmed = raw.normalize('NFC').trim();
-  if (!trimmed) throw new Error('Transaction name is required.');
+  if (!trimmed) {
+    throw clientError('Transaction name is required.', 'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_NAME_REQUIRED');
+  }
   for (const ch of trimmed) {
     const point = ch.codePointAt(0);
-    if (point < 0x20 || point === 0x7f) throw new Error('Transaction name contains an invalid character.');
+    if (point < 0x20 || point === 0x7f) {
+      throw clientError(
+        'Transaction name contains an invalid character.',
+        'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_NAME_CONTROL_CHARACTER_DISALLOWED',
+      );
+    }
   }
-  if ([...trimmed].length > 120) throw new Error('Transaction name must be 120 characters or fewer.');
+  if ([...trimmed].length > 120) {
+    throw clientError(
+      'Transaction name must be 120 characters or fewer.',
+      'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_NAME_MAXIMUM_LENGTH_EXCEEDED',
+    );
+  }
   return trimmed;
 }
 
@@ -141,21 +181,41 @@ function validateTransactionName(raw) {
 // "NaN", hex, etc. one at a time. Never routes through parseFloat/Number
 // before this check, so binary-float parsing of hostile input never happens.
 function validateTransactionAmount(raw) {
-  if (typeof raw !== 'string') throw new Error('Amount is required.');
+  if (typeof raw !== 'string') {
+    throw clientError('Amount is required.', 'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_AMOUNT_TYPE_INVALID');
+  }
   const trimmed = raw.trim();
-  if (!trimmed) throw new Error('Amount is required.');
+  if (!trimmed) {
+    throw clientError('Amount is required.', 'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_AMOUNT_REQUIRED');
+  }
   if (!MANUAL_AMOUNT_PATTERN.test(trimmed)) {
-    throw new Error('Enter a monetary amount such as 12.34. Maximum two decimal places.');
+    throw clientError(
+      'Enter a monetary amount such as 12.34. Maximum two decimal places.',
+      'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_AMOUNT_DECIMAL_FORMAT_INVALID',
+    );
   }
   const value = Number(trimmed);
-  if (!Number.isFinite(value) || value <= 0) throw new Error('Enter an amount greater than 0.');
-  if (value > MANUAL_AMOUNT_MAX) throw new Error(`Enter an amount between 0.01 and ${MANUAL_AMOUNT_MAX.toFixed(2)}.`);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw clientError(
+      'Enter an amount greater than 0.',
+      'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_AMOUNT_POSITIVE_VALUE_REQUIRED',
+    );
+  }
+  if (value > MANUAL_AMOUNT_MAX) {
+    throw clientError(
+      `Enter an amount between 0.01 and ${MANUAL_AMOUNT_MAX.toFixed(2)}.`,
+      'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_AMOUNT_MAXIMUM_VALUE_EXCEEDED',
+    );
+  }
   return value;
 }
 
 function validateTransactionType(raw) {
   if (typeof raw !== 'string' || !MANUAL_TRANSACTION_TYPES.has(raw)) {
-    throw new Error('Select either income or expense.');
+    throw clientError(
+      'Select either income or expense.',
+      'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_TYPE_ALLOWLIST_REJECTED',
+    );
   }
   return raw;
 }
@@ -164,7 +224,10 @@ function validateTransactionCategory(raw, transactionType) {
   const type = validateTransactionType(transactionType);
   if (typeof raw !== 'string' || !MANUAL_CATEGORIES.has(raw)
       || !MANUAL_CATEGORY_OPTIONS[type].includes(raw)) {
-    throw new Error(`Select a valid ${type} category.`);
+    throw clientError(
+      `Select a valid ${type} category.`,
+      'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_CATEGORY_ALLOWLIST_REJECTED',
+    );
   }
   return raw;
 }
@@ -201,7 +264,10 @@ function updateManualAccountOptions() {
 
 function validateManualAccount(raw) {
   if (typeof raw !== 'string' || !raw || !accountGroups().has(raw)) {
-    throw new Error('Select a destination account.');
+    throw clientError(
+      'Select a destination account.',
+      'MM_CLIENT_MANUAL_TRANSACTION_VALIDATE_DESTINATION_ACCOUNT_UNAVAILABLE',
+    );
   }
   return raw;
 }
@@ -261,6 +327,22 @@ async function submitManualTransaction(event) {
   const submitButton = $('addExpenseForm').querySelector('button[type="submit"]');
   submitButton.disabled = true;
   try {
+    // The proof binds the validated name, amount, category, and transaction type
+    // to a server-issued challenge before this encrypted record is accepted.
+    error.textContent = 'Preparing a private validation proof…';
+    const zkp = await getZkpClient();
+    const challenge = await zkp.requestChallenge(api);
+    error.textContent = 'Generating the browser-side zero-knowledge proof…';
+    let proof;
+    try {
+      proof = await zkp.proveManualTransaction(challenge, {
+        name, rawAmount: amountField.value.trim(), category, transactionType,
+      });
+    } catch (cause) {
+      throw attachErrorCode(cause, 'MM_CLIENT_ZKP_PROOF_GENERATE_WITNESS_OR_BARRETENBERG_EXECUTION_FAILED');
+    }
+
+    error.textContent = 'Submitting the encrypted record for verification…';
     // Explicit allowlist of user-facing fields (type, name, amount, category)
     // merged into a record built entirely from trusted, non-form values --
     // id, date, account*, and source are never taken from user input, so
@@ -275,14 +357,25 @@ async function submitManualTransaction(event) {
       date: new Date().toISOString().slice(0, 10),
       pending: false,
       account,
-      ...accountMeta(account, accountGroups().get(account)),
+      bank: accountMeta(account, accountGroups().get(account)).bank,
+      account_label: accountMeta(account, accountGroups().get(account)).label,
+      account_type: accountMeta(account, accountGroups().get(account)).type,
       source: 'manual',
       transaction_type: transactionType,
       category,
+      commitment_blinding: proof.blinding,
+      zkp_public_context: proof.publicContext,
     };
-    await api('/api/records', {
+    await api('/api/records/manual', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: [{ blind_index: blindIndex(manual.id), sealed: seal(manual) }] }),
+      body: JSON.stringify({
+        challenge_id: challenge.challenge_id,
+        blind_index: blindIndex(manual.id),
+        sealed: seal(manual),
+        commitment: proof.commitment,
+        proof: proof.proof,
+        public_inputs: proof.publicInputs,
+      }),
     });
     TXNS.push({
       ...manual,
@@ -299,6 +392,16 @@ async function submitManualTransaction(event) {
     TRANSACTION_SUBMIT_IN_FLIGHT = false;
     submitButton.disabled = false;
   }
+}
+
+async function getZkpClient() {
+  if (!ZKP_CLIENT_PROMISE) {
+    ZKP_CLIENT_PROMISE = import('/static/zkp/dist/manual_expense_prover_v2.js').catch((cause) => {
+      ZKP_CLIENT_PROMISE = null;
+      throw attachErrorCode(cause, 'MM_CLIENT_ZKP_PROVER_MODULE_LOAD_BUNDLE_OR_WASM_UNAVAILABLE');
+    });
+  }
+  return ZKP_CLIENT_PROMISE;
 }
 
 /* ---------- crypto ---------- */
@@ -414,6 +517,31 @@ async function load(duringUnlock = false) {
   // Decrypt everything locally. ~20MB for a decade of history, so the whole
   // corpus lives in memory and every aggregate is computed here.
   let decrypted = records.map((r) => open(r.sealed));
+  const zkpRecords = records.map((record, index) => ({ record, transaction: decrypted[index] }))
+    .filter(({ record }) => record.commitment && record.circuit_version);
+  if (zkpRecords.length) {
+    const zkp = await getZkpClient();
+    for (const { record, transaction } of zkpRecords) {
+      try {
+        if (!transaction.commitment_blinding || !transaction.zkp_public_context
+            || transaction.zkp_public_context.schema_version !== zkp.SCHEMA_VERSION
+            || transaction.zkp_public_context.record_id === undefined
+            || transaction.zkp_public_context.challenge === undefined
+            || record.circuit_version !== zkp.CIRCUIT_VERSION
+            || !await zkp.verifyStoredRecord(transaction, record.commitment, transaction.zkp_public_context)) {
+          throw clientError(
+            'A stored zero-knowledge proof record failed integrity verification.',
+            'MM_CLIENT_ZKP_STORED_RECORD_COMMITMENT_INTEGRITY_VERIFICATION_FAILED',
+          );
+        }
+      } catch (cause) {
+        throw attachErrorCode(
+          cause,
+          'MM_CLIENT_ZKP_STORED_RECORD_COMMITMENT_INTEGRITY_VERIFICATION_FAILED',
+        );
+      }
+    }
+  }
 
   // Records written by older versions do not contain encrypted institution
   // metadata. Fetch it again, merge and re-seal it here in the browser so the
@@ -1316,6 +1444,12 @@ async function renderServerView() {
 
   $('svFigure').textContent = `${d.record_count} rows \u00d7 ${d.columns.length} columns`;
   $('statReadable').textContent = '0';
+  const zkpCount = Number(d.zkp_verified_count || 0);
+  $('svZkpStatus').textContent = zkpCount
+    ? `${zkpCount} ${zkpCount === 1 ? 'record was' : 'records were'} accepted by the ZKP verifier before storage.`
+    : 'No records in this vault have been accepted by the ZKP verifier yet.';
+  const circuits = (d.zkp_circuits || []).map((c) => `${c.circuit_version} (${c.n})`);
+  $('svZkpCircuit').textContent = circuits.length ? `Circuit versions: ${circuits.join(', ')}` : 'Circuit version: none recorded';
 
   draw('chSizes', {
     type: 'bar',

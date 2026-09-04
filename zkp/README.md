@@ -42,6 +42,16 @@ Barretenberg's browser worker needs `SharedArrayBuffer`. Flask now sends
 `Cross-Origin-Embedder-Policy: require-corp` on the app and same-origin
 assets so that capability is available without weakening CSP.
 
+The browser prover also needs the public Barretenberg CRS. The client rewrites
+bb.js's external CRS URLs to the same-origin `/zkp-crs/` route, and Flask serves
+the pinned `g1_compressed.dat`, `g2.dat`, and `grumpkin_g1_v2.dat` files from
+`ZKP_CRS_ROOT`. The Vite build also emits same-origin compressed Barretenberg
+WASM assets; the client passes an explicit `wasmPath` so the packaged `data:`
+URL fallback is never used. This keeps proving usable when the Aztec CDN is
+blocked and avoids sending browser metadata to an external CRS host. CRS
+files and WASM modules are public parameters, not vault data; provision them
+during host setup and verify their hashes against the pinned release.
+
 ## Files
 
 - `manual_expense/src/main.nr`: private-input constraints and public
@@ -142,17 +152,23 @@ missing, extra, reordered, non-canonical, or out-of-field values. The
 verifier writes 32-byte big-endian field arrays and invokes:
 
 ```bash
-bb verify -s ultra_honk -p proof -i public_inputs -k /server/controlled/vk
+bb verify -s ultra_honk -c /opt/barretenberg-5.1.0/crs -p proof.json -i public_inputs.json -k /server/controlled/vk.json
 ```
 
-Only exit status zero is acceptance. Missing artifacts, timeout, malformed
-proofs, and execution errors all fail closed.
+The verifier writes Barretenberg's JSON field-array format before invoking the
+CLI. This is important on Windows, where the native binary reader can treat a
+binary Ctrl-Z byte as end-of-file. `ZKP_CRS_ROOT` must contain the native
+`bn254_g1.dat`, `bn254_g1_compressed.dat`, and `bn254_g2.dat` files (the
+browser aliases are served separately by Flask). Only exit status zero is
+acceptance. Missing artifacts, timeout, malformed proofs, and execution
+errors all fail closed.
 
 Set these production variables:
 
 ```text
 ZKP_BB_EXECUTABLE=/opt/barretenberg-5.1.0/bb
 ZKP_MANUAL_EXPENSE_VK_PATH=/srv/app/zkp/manual_expense/target/vk
+ZKP_CRS_ROOT=/opt/barretenberg-5.1.0/crs
 ZKP_VERIFY_TIMEOUT_SECONDS=10
 ```
 

@@ -18,7 +18,7 @@ from flask.sessions import SessionInterface, SessionMixin
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.middleware.proxy_fix import ProxyFix
 from webauthn import (
     generate_authentication_options, generate_registration_options, options_to_json,
@@ -42,6 +42,8 @@ import zkp_verifier
 STATIC = Path(__file__).parent / "static"
 CHALLENGE_TTL = int(os.environ.get("VAULT_CHALLENGE_TTL", "300"))
 ZKP_CHALLENGE_TTL = int(os.environ.get("VAULT_ZKP_CHALLENGE_TTL", "300"))
+_DEFAULT_ZKP_CRS_ROOT = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local")) / "MindfulMoney" / "barretenberg-5.1.0" / "crs"
+ZKP_CRS_ROOT = Path(os.environ.get("ZKP_CRS_ROOT", _DEFAULT_ZKP_CRS_ROOT))
 SESSION_TTL = int(os.environ.get("VAULT_SESSION_TTL", str(8 * 60 * 60)))
 SESSION_IDLE_TTL = int(os.environ.get("VAULT_SESSION_IDLE_TTL", "1800"))
 MAX_REQUEST_BYTES = int(os.environ.get("VAULT_MAX_REQUEST_BYTES", str(8 * 1024 * 1024)))
@@ -58,6 +60,7 @@ TRUST_PROXY = os.environ.get("VAULT_TRUST_PROXY", "0") == "1"
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _LOWER_HEX = re.compile(r"[0-9a-f]+\Z")
 _B64URL = re.compile(r"[A-Za-z0-9_-]{2,1024}\Z")
+_ERROR_CODE = re.compile(r"MM_SERVER_[A-Z0-9]+(?:_[A-Z0-9]+){3,15}\Z")
 
 
 def _configuration():
@@ -125,6 +128,7 @@ logging.basicConfig(level=os.environ.get("VAULT_LOG_LEVEL", "INFO"), format="%(m
 LOG = logging.getLogger("vault.security")
 LOG.info('event="startup" environment="%s" auth_policy="%s" csp_mode="%s" proxy_trust="%s"', "production" if PRODUCTION else "development", AUTH_POLICY, CSP_MODE, int(TRUST_PROXY))
 LOG.info('event="zkp_artifacts_available" available="%s"', int(zkp_verifier.artifacts_available()))
+LOG.info('event="zkp_crs_available" available="%s"', int(all((ZKP_CRS_ROOT / name).is_file() for name in ("g1_compressed.dat", "g2.dat", "grumpkin_g1_v2.dat"))))
 RATE_KEY = hmac.new(SECRET.encode(), b"vault-rate-limit-v1", hashlib.sha256).digest()
 RATE_LIMITS = {
     "general": (int(os.environ.get("VAULT_RATE_GENERAL", "120")), 60),
@@ -147,19 +151,60 @@ db = dbmod.db
 dbmod.init_app(app)
 
 
-def api_error(message, status):
-    return jsonify({"error": message}), status
+def api_error(message, status, code):
+    """Return a safe message plus a stable, origin-oriented diagnostic code.
+
+    Codes follow MM_<SIDE>_<DOMAIN>_<OPERATION>_<CONDITION>. Requiring every
+    call site to supply one prevents ambiguous status-only failures from
+    silently entering the API. Codes classify the likely layer, but must not
+    expose paths, credentials, tenant existence, proof bytes, or verifier
+    output.
+    """
+    if not isinstance(code, str) or _ERROR_CODE.fullmatch(code) is None:
+        raise RuntimeError("invalid application error code")
+    return jsonify({"error": message, "error_code": code}), status
 
 
 @app.errorhandler(RequestEntityTooLarge)
 def too_large(_error):
     LOG.warning('event="request_rejected" reason="body_too_large"')
-    return api_error("Request body is too large", 413)
+    return api_error("Request body is too large", 413, "MM_SERVER_HTTP_REQUEST_BODY_MAXIMUM_SIZE_EXCEEDED")
 
 
 @app.errorhandler(SQLAlchemyError)
 def database_error(_error):
-    return api_error("The request could not be completed", 503)
+    return api_error("The request could not be completed", 503, "MM_SERVER_DATABASE_REQUEST_EXECUTION_TEMPORARILY_UNAVAILABLE")
+
+
+@app.errorhandler(404)
+def not_found(error):
+    if request.path.startswith("/api/"):
+        return api_error("API endpoint not found", 404, "MM_SERVER_HTTP_REQUEST_ROUTE_ENDPOINT_NOT_FOUND")
+    return error
+
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    if not request.path.startswith("/api/"):
+        return error
+    response, status = api_error(
+        "HTTP method is not allowed for this API endpoint", 405,
+        "MM_SERVER_HTTP_REQUEST_ROUTE_METHOD_NOT_ALLOWED",
+    )
+    if error.valid_methods:
+        response.headers["Allow"] = ", ".join(error.valid_methods)
+    return response, status
+
+
+@app.errorhandler(Exception)
+def unexpected_error(error):
+    if isinstance(error, HTTPException):
+        return error
+    LOG.exception('event="request_failed" reason="unexpected_application_error"')
+    return api_error(
+        "The request could not be completed", 500,
+        "MM_SERVER_APPLICATION_REQUEST_EXECUTION_UNEXPECTED_FAILURE",
+    )
 
 
 @app.before_request
@@ -167,11 +212,11 @@ def protect_unsafe_requests():
     if request.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         if _parse_origin(request.headers.get("Origin", "")) not in ALLOWED_ORIGINS:
             LOG.warning('event="request_rejected" reason="origin" client="%s"', _client_log_id())
-            return api_error("Request authorization failed", 403)
+            return api_error("Request authorization failed", 403, "MM_SERVER_SECURITY_ORIGIN_VALIDATION_REQUEST_REJECTED")
         supplied, expected = request.headers.get("X-CSRF-Token", ""), session.get("csrf_token", "")
         if not isinstance(supplied, str) or not supplied or len(supplied) > 128 or not expected or not secrets.compare_digest(supplied, expected):
             LOG.warning('event="request_rejected" reason="csrf" client="%s"', _client_log_id())
-            return api_error("Request authorization failed", 403)
+            return api_error("Request authorization failed", 403, "MM_SERVER_SECURITY_CSRF_TOKEN_VALIDATION_REQUEST_REJECTED")
 
 
 def _client_log_id():
@@ -252,7 +297,7 @@ def apply_rate_limit():
     if count > limit:
         retry = max(1, expires-now)
         LOG.warning('event="rate_limited" group="%s" client="%s"', group, _client_log_id())
-        response = api_error("Request rate limit exceeded", 429)
+        response = api_error("Request rate limit exceeded", 429, "MM_SERVER_RATE_LIMIT_REQUEST_BUDGET_WINDOW_EXCEEDED")
         response[0].headers["Retry-After"] = str(retry)
         return response
 
@@ -323,7 +368,7 @@ def authenticated():
 
 
 def require_access():
-    return api_error("Passkey authentication required", 401) if auth_required() and not authenticated() else None
+    return api_error("Passkey authentication required", 401, "MM_SERVER_AUTHORIZATION_SESSION_ACCESS_PASSKEY_AUTHENTICATION_REQUIRED") if auth_required() and not authenticated() else None
 
 
 def require_client_vault_open():
@@ -336,7 +381,7 @@ def require_client_vault_open():
     denied = require_access()
     if denied:
         return denied
-    return None if session.get("vault_unlocked") else api_error("Unlock the vault with its passphrase first", 403)
+    return None if session.get("vault_unlocked") else api_error("Unlock the vault with its passphrase first", 403, "MM_SERVER_VAULT_MANAGEMENT_ACCESS_BROWSER_UNLOCK_REQUIRED")
 
 
 def require_recent_reauth():
@@ -353,10 +398,10 @@ def require_recent_reauth():
         return None
     when = session.get("authenticated_at")
     if not authenticated() or isinstance(when, bool) or not isinstance(when, (int, float)):
-        return api_error("Recent passkey authentication required", 401)
+        return api_error("Recent passkey authentication required", 401, "MM_SERVER_AUTHORIZATION_STEP_UP_PASSKEY_AUTHENTICATION_REQUIRED")
     age = time.time() - when
     if age < 0 or age > VAULT_STEPUP_WINDOW_SECONDS:
-        return api_error("Recent passkey authentication required", 401)
+        return api_error("Recent passkey authentication required", 401, "MM_SERVER_AUTHORIZATION_STEP_UP_PASSKEY_AUTHENTICATION_EXPIRED")
     return None
 
 
@@ -372,12 +417,12 @@ def require_destructive_management():
         select(func.count()).select_from(table).where(table.c.identity_id == current_identity_id())
     ).scalar_one() > 0
     if not has_passkey:
-        return api_error("A passkey is required for this destructive action", 409)
+        return api_error("A passkey is required for this destructive action", 409, "MM_SERVER_VAULT_DESTRUCTIVE_OPERATION_REGISTERED_PASSKEY_REQUIRED")
     denied = require_access()
     if denied:
         return denied
     if not authenticated():
-        return api_error("Passkey authentication required", 401)
+        return api_error("Passkey authentication required", 401, "MM_SERVER_VAULT_DESTRUCTIVE_OPERATION_PASSKEY_AUTHENTICATION_REQUIRED")
     return require_recent_reauth()
 
 
@@ -395,17 +440,17 @@ def _rotate_session(**values):
 
 def _json_object():
     if request.mimetype != "application/json":
-        return None, api_error("Content-Type must be application/json", 400)
+        return None, api_error("Content-Type must be application/json", 400, "MM_SERVER_HTTP_JSON_PARSE_APPLICATION_CONTENT_TYPE_REQUIRED")
     if request.content_length is not None and request.content_length > MAX_JSON_OBJECT_BYTES:
-        return None, api_error("JSON body is too large", 413)
+        return None, api_error("JSON body is too large", 413, "MM_SERVER_HTTP_JSON_PARSE_MAXIMUM_SIZE_EXCEEDED")
     try:
         value = request.get_json(silent=False)
     except RequestEntityTooLarge:
         raise
     except Exception:
-        return None, api_error("Malformed JSON", 400)
+        return None, api_error("Malformed JSON", 400, "MM_SERVER_HTTP_JSON_PARSE_SYNTAX_INVALID")
     if not isinstance(value, dict):
-        return None, api_error("JSON body must be an object", 400)
+        return None, api_error("JSON body must be an object", 400, "MM_SERVER_HTTP_JSON_PARSE_TOP_LEVEL_OBJECT_REQUIRED")
     return value, None
 
 
@@ -536,6 +581,21 @@ def index(): return send_from_directory(STATIC, "index.html")
 @app.get("/static/<path:name>")
 def static_file(name): return send_from_directory(STATIC, name)
 
+# Vite emits Barretenberg's module workers with root-relative `/assets/...`
+# URLs. Keep this route narrow: it exposes only the committed worker assets,
+# never the build directory or arbitrary filesystem paths.
+@app.get("/assets/<path:name>")
+def zkp_asset(name): return send_from_directory(STATIC / "zkp" / "dist" / "assets", name)
+
+# The bb.js browser backend normally fetches these public CRS files from an
+# external CDN. Serve the pinned local copy instead so proving does not stall
+# on a blocked CDN or disclose browser/network metadata to a third party.
+@app.get("/zkp-crs/<path:name>")
+def zkp_crs(name):
+    if name not in {"g1_compressed.dat", "g2.dat", "grumpkin_g1_v2.dat"}:
+        return app.response_class("Not found", status=404, mimetype="text/plain")
+    return send_from_directory(ZKP_CRS_ROOT, name, conditional=True, max_age=31536000)
+
 @app.get("/api/session")
 def session_status():
     return jsonify({"authenticated": authenticated(), "vault_unlocked": bool(session.get("vault_unlocked")),
@@ -547,7 +607,7 @@ def mark_unlocked():
     denied = require_access()
     if denied: return denied
     if request.data:
-        return api_error("This endpoint does not accept a request body", 400)
+        return api_error("This endpoint does not accept a request body", 400, "MM_SERVER_VAULT_UNLOCK_STATE_REQUEST_BODY_NOT_ALLOWED")
     # UI state only. This value is asserted by the browser and is NOT proof
     # that the client possesses the vault passphrase or encryption key.
     # Never use it as an authentication factor for destructive operations.
@@ -581,25 +641,26 @@ def relay():
     if request.mimetype == "application/json" and request.data:
         payload, error = _json_object()
         if error: return error
-        if set(payload) - {"source"}: return api_error("Unknown field in relay request", 400)
+        if set(payload) - {"source"}: return api_error("Unknown field in relay request", 400, "MM_SERVER_BANK_RELAY_REQUEST_UNKNOWN_FIELD_REJECTED")
         source = payload.get("source", "fakebank")
-        if source not in {"fakebank", "simplefin"}: return api_error("Unknown transaction source", 400)
+        if source not in {"fakebank", "simplefin"}: return api_error("Unknown transaction source", 400, "MM_SERVER_BANK_RELAY_SOURCE_ALLOWLIST_VALIDATION_FAILED")
     if source == "simplefin":
         if owner_id != DEFAULT_IDENTITY_ID:
-            return api_error("SimpleFin is not configured for this account", 503)
+            return api_error("SimpleFin is not configured for this account", 503, "MM_SERVER_BANK_SIMPLEFIN_ACCOUNT_CONFIGURATION_UNAVAILABLE")
         try:
             transactions = simplefin.generate()
         except simplefin.SimpleFinNotConfigured:
-            return api_error("SimpleFin is not configured on this server", 503)
+            return api_error("SimpleFin is not configured on this server", 503, "MM_SERVER_BANK_SIMPLEFIN_SERVER_CONFIGURATION_UNAVAILABLE")
         except simplefin.SimpleFinAccessRevoked:
             LOG.warning('event="simplefin_fetch_failed" reason="access_revoked" client="%s"', _client_log_id())
             return api_error(
                 "SimpleFin declined this connection. The stored access URL may have been "
                 "claimed elsewhere or revoked -- disable it and set up SimpleFin again.", 502,
+                "MM_SERVER_BANK_SIMPLEFIN_ACCESS_CREDENTIAL_REVOKED_OR_RECLAIMED",
             )
         except simplefin.SimpleFinError:
             LOG.warning('event="simplefin_fetch_failed" client="%s"', _client_log_id())
-            return api_error("Could not fetch accounts from SimpleFin", 502)
+            return api_error("Could not fetch accounts from SimpleFin", 502, "MM_SERVER_BANK_SIMPLEFIN_ACCOUNT_FETCH_UPSTREAM_REQUEST_FAILED")
     else:
         transactions = fakebank.generate(months=6)
     return jsonify({"transactions": transactions})
@@ -611,18 +672,18 @@ def put_records():
     owner_id = current_identity_id()
     payload, error = _json_object()
     if error: return error
-    if set(payload) != {"records"}: return api_error("Body must contain only records", 400)
+    if set(payload) != {"records"}: return api_error("Body must contain only records", 400, "MM_SERVER_VAULT_RECORD_BATCH_REQUEST_SCHEMA_INVALID")
     rows = payload["records"]
-    if not isinstance(rows, list): return api_error("records must be a list", 400)
-    if len(rows) > MAX_RECORDS_PER_BATCH: return api_error("Record batch is too large", 413)
+    if not isinstance(rows, list): return api_error("records must be a list", 400, "MM_SERVER_VAULT_RECORD_BATCH_COLLECTION_TYPE_INVALID")
+    if len(rows) > MAX_RECORDS_PER_BATCH: return api_error("Record batch is too large", 413, "MM_SERVER_VAULT_RECORD_BATCH_MAXIMUM_COUNT_EXCEEDED")
     validated, seen = [], set()
     for row in rows:
-        if not isinstance(row, dict) or set(row) != {"blind_index", "sealed"}: return api_error("Invalid record", 400)
+        if not isinstance(row, dict) or set(row) != {"blind_index", "sealed"}: return api_error("Invalid record", 400, "MM_SERVER_VAULT_RECORD_WRITE_ENVELOPE_SCHEMA_INVALID")
         blind, sealed = row["blind_index"], row["sealed"]
-        if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind): return api_error("Invalid record", 400)
-        if blind in seen: return api_error("Duplicate record in batch", 400)
+        if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind): return api_error("Invalid record", 400, "MM_SERVER_VAULT_RECORD_WRITE_BLIND_INDEX_ENCODING_INVALID")
+        if blind in seen: return api_error("Duplicate record in batch", 400, "MM_SERVER_VAULT_RECORD_BATCH_DUPLICATE_BLIND_INDEX_REJECTED")
         if not isinstance(sealed, str) or not _LOWER_HEX.fullmatch(sealed) or len(sealed)%2 or not MIN_SEALED_HEX_LENGTH <= len(sealed) <= MAX_SEALED_HEX_LENGTH:
-            return api_error("Invalid record", 400)
+            return api_error("Invalid record", 400, "MM_SERVER_VAULT_RECORD_WRITE_CIPHERTEXT_ENVELOPE_INVALID")
         seen.add(blind); validated.append((blind, sealed, len(bytes.fromhex(sealed))))
     table = models.Record.__table__
     conn = db()
@@ -633,7 +694,7 @@ def put_records():
         )).scalar_one()
     total = conn.execute(select(func.count()).select_from(table).where(table.c.identity_id == owner_id)).scalar_one()
     if total + len(validated) - existing > MAX_TOTAL_RECORDS:
-        conn.rollback(); return api_error("Vault record quota exceeded", 409)
+        conn.rollback(); return api_error("Vault record quota exceeded", 409, "MM_SERVER_VAULT_RECORD_STORAGE_TENANT_QUOTA_EXCEEDED")
     if validated:
         # pg_insert(...).values([]) on an empty list degrades to a single
         # DEFAULT VALUES row rather than a no-op, unlike the old
@@ -662,12 +723,15 @@ def zkp_challenge():
     if denied: return denied
     payload, error = _json_object()
     if error: return error
-    if set(payload) != {"purpose"}: return api_error("Unknown field in challenge request", 400)
+    if set(payload) != {"purpose"}: return api_error("Unknown field in challenge request", 400, "MM_SERVER_ZKP_CHALLENGE_CREATE_REQUEST_SCHEMA_INVALID")
     if payload["purpose"] != "manual_expense_create":
-        return api_error("Unsupported challenge purpose", 400)
+        return api_error("Unsupported challenge purpose", 400, "MM_SERVER_ZKP_CHALLENGE_CREATE_PURPOSE_NOT_SUPPORTED")
     if not zkp_verifier.artifacts_available():
         LOG.warning('event="zkp_challenge_unavailable" client="%s"', _client_log_id())
-        return api_error("Encrypted-record validation is temporarily unavailable", 503)
+        return api_error(
+            "Encrypted-record validation is temporarily unavailable", 503,
+            "MM_SERVER_ZKP_CHALLENGE_CREATE_BARRETENBERG_EXECUTABLE_OR_VERIFICATION_KEY_UNAVAILABLE",
+        )
 
     challenge_id = secrets.token_urlsafe(32)
     # 31 bytes, not 32: kept strictly below the BN254 scalar field modulus
@@ -736,36 +800,36 @@ def create_manual_expense_zkp():
     payload, error = _json_object()
     if error: return error
     expected = {"challenge_id", "blind_index", "sealed", "commitment", "proof", "public_inputs"}
-    if set(payload) != expected: return api_error("Invalid manual transaction submission", 400)
+    if set(payload) != expected: return api_error("Invalid manual transaction submission", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_REQUEST_ENVELOPE_SCHEMA_INVALID")
 
     challenge_id, blind, sealed, commitment, proof_hex, public_inputs = (
         payload["challenge_id"], payload["blind_index"], payload["sealed"],
         payload["commitment"], payload["proof"], payload["public_inputs"],
     )
     if not isinstance(challenge_id, str) or not challenge_id or len(challenge_id) > 128:
-        return api_error("Invalid manual transaction submission", 400)
+        return api_error("Invalid manual transaction submission", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_CHALLENGE_IDENTIFIER_INVALID")
     if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind):
-        return api_error("Invalid record", 400)
+        return api_error("Invalid record", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_BLIND_INDEX_ENCODING_INVALID")
     if not isinstance(sealed, str) or not _LOWER_HEX.fullmatch(sealed) or len(sealed) % 2 \
             or not MIN_SEALED_HEX_LENGTH <= len(sealed) <= MAX_SEALED_HEX_LENGTH:
-        return api_error("Invalid record", 400)
+        return api_error("Invalid record", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_CIPHERTEXT_ENVELOPE_INVALID")
     if not isinstance(commitment, str) or not _LOWER_HEX_64.fullmatch(commitment):
-        return api_error("Invalid record", 400)
+        return api_error("Invalid record", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_COMMITMENT_ENCODING_INVALID")
     try:
         commitment_field = zkp_verifier.canonical_field_hex(commitment)
     except zkp_verifier.ZkpVerificationError:
-        return api_error("Invalid record", 400)
+        return api_error("Invalid record", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_COMMITMENT_FIELD_VALUE_INVALID")
     if not isinstance(proof_hex, str) or not _LOWER_HEX.fullmatch(proof_hex) or len(proof_hex) % 2:
-        return api_error("Unable to validate the encrypted record.", 400)
+        return api_error("Unable to validate the encrypted record.", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_PROOF_HEX_ENCODING_INVALID")
     try:
         public_inputs = zkp_verifier.validate_public_inputs(public_inputs)
     except zkp_verifier.ZkpVerificationError:
-        return api_error("Unable to validate the encrypted record.", 400)
+        return api_error("Unable to validate the encrypted record.", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_PUBLIC_INPUTS_ENCODING_INVALID")
 
     claimed = _claim_zkp_challenge(challenge_id, owner_id)
     if claimed is None:
         LOG.warning('event="zkp_challenge_rejected" client="%s"', _client_log_id())
-        return api_error("Unable to validate the encrypted record.", 400)
+        return api_error("Unable to validate the encrypted record.", 400, "MM_SERVER_ZKP_CHALLENGE_CONSUME_UNAVAILABLE_EXPIRED_USED_OR_NOT_OWNED")
 
     # Independently reconstruct the complete public statement from
     # server-owned challenge data plus the separately validated
@@ -780,28 +844,28 @@ def create_manual_expense_zkp():
     )
     if public_inputs != expected_public_inputs or claimed["circuit_version"] != zkp_verifier.CIRCUIT_VERSION:
         LOG.warning('event="zkp_context_mismatch" client="%s"', _client_log_id())
-        return api_error("Unable to validate the encrypted record.", 400)
+        return api_error("Unable to validate the encrypted record.", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_PUBLIC_CONTEXT_OR_CIRCUIT_VERSION_MISMATCH")
 
     try:
         proof_bytes = bytes.fromhex(proof_hex)
     except ValueError:
-        return api_error("Unable to validate the encrypted record.", 400)
+        return api_error("Unable to validate the encrypted record.", 400, "MM_SERVER_ZKP_MANUAL_TRANSACTION_PROOF_BINARY_DECODING_FAILED")
 
     try:
         result = zkp_verifier.verify_proof(proof_bytes, public_inputs)
     except zkp_verifier.CircuitArtifactsUnavailable:
         LOG.warning('event="zkp_verifier_unavailable" client="%s"', _client_log_id())
-        return api_error("Unable to validate the encrypted record.", 503)
+        return api_error("Unable to validate the encrypted record.", 503, "MM_SERVER_ZKP_BARRETENBERG_VERIFY_EXECUTABLE_OR_VERIFICATION_KEY_UNAVAILABLE")
     except zkp_verifier.ZkpVerificationError:
         LOG.warning('event="zkp_proof_malformed" client="%s"', _client_log_id())
-        return api_error("Unable to validate the encrypted record.", 400)
+        return api_error("Unable to validate the encrypted record.", 400, "MM_SERVER_ZKP_BARRETENBERG_VERIFY_PROOF_STRUCTURE_OR_EXECUTION_INVALID")
 
     if not result.valid:
         LOG.warning(
             'event="zkp_proof_invalid" client="%s" duration_ms="%d"',
             _client_log_id(), int(result.duration_seconds * 1000),
         )
-        return api_error("Unable to validate the encrypted record.", 400)
+        return api_error("Unable to validate the encrypted record.", 400, "MM_SERVER_ZKP_BARRETENBERG_VERIFY_CRYPTOGRAPHIC_PROOF_REJECTED")
 
     table = models.Record.__table__
     conn = db()
@@ -853,7 +917,9 @@ def server_view():
     sizes=conn.execute(select(table.c.bytes, func.count().label("n")).where(tenant).group_by(table.c.bytes).order_by(table.c.bytes)).mappings().all()
     days=conn.execute(select(table.c.stored_at.label("d"), func.count().label("n")).where(tenant).group_by(table.c.stored_at).order_by(table.c.stored_at)).mappings().all()
     sample=conn.execute(select(table.c.blind_index, table.c.sealed).where(tenant).order_by(table.c.id).limit(12)).mappings().all()
-    return jsonify({"record_count":total,"size_histogram":[dict(r) for r in sizes],"write_days":[{"d": r["d"].isoformat(), "n": r["n"]} for r in days],"sample":[dict(r) for r in sample],"columns":["id","blind_index","sealed","bytes","stored_at"]})
+    zkp_count = conn.execute(select(func.count()).select_from(table).where(tenant & table.c.commitment.is_not(None))).scalar_one()
+    circuits = conn.execute(select(table.c.circuit_version, func.count().label("n")).where(tenant & table.c.circuit_version.is_not(None)).group_by(table.c.circuit_version).order_by(table.c.circuit_version)).mappings().all()
+    return jsonify({"record_count":total,"size_histogram":[dict(r) for r in sizes],"write_days":[{"d": r["d"].isoformat(), "n": r["n"]} for r in days],"sample":[dict(r) for r in sample],"zkp_verified_count":zkp_count,"zkp_circuits":[dict(r) for r in circuits],"columns":["id","blind_index","sealed","bytes","stored_at"]})
 
 @app.delete("/api/records")
 def reset():
@@ -881,7 +947,7 @@ def register_options():
     table = models.PasskeyCredential.__table__
     ident=identity(owner_id); credentials=db().execute(select(table.c.credential_id).where(table.c.identity_id==owner_id)).mappings().all()
     if ident is None:
-        return api_error("Account is unavailable", 401)
+        return api_error("Account is unavailable", 401, "MM_SERVER_AUTHORIZATION_ACCOUNT_LOOKUP_CURRENT_IDENTITY_UNAVAILABLE")
     options=generate_registration_options(rp_id=RP_ID,rp_name=RP_NAME,user_id=bytes(ident["user_handle"]),user_name=f"vault-{owner_id}",challenge=_new_challenge("registration", owner_id),exclude_credentials=[PublicKeyCredentialDescriptor(id=bytes(r["credential_id"])) for r in credentials],authenticator_selection=AuthenticatorSelectionCriteria(resident_key=ResidentKeyRequirement.PREFERRED,user_verification=UserVerificationRequirement.REQUIRED),attestation=AttestationConveyancePreference.NONE)
     return app.response_class(options_to_json(options),mimetype="application/json")
 
@@ -891,12 +957,12 @@ def register_verify():
     if denied: return denied
     owner_id = current_identity_id()
     challenge_row=_take_challenge("registration", owner_id)
-    if challenge_row is None: return api_error("Passkey ceremony could not be verified",400)
+    if challenge_row is None: return api_error("Passkey ceremony could not be verified",400, "MM_SERVER_PASSKEY_REGISTRATION_CHALLENGE_UNAVAILABLE_EXPIRED_USED_OR_NOT_OWNED")
     challenge = challenge_row["challenge"]
     payload,error=_json_object()
     if error: return error
     credential=payload.get("credential"); label=payload.get("label","Passkey")
-    if not isinstance(credential,dict) or not isinstance(label,str) or not label.strip() or len(label.strip())>MAX_LABEL_LENGTH: return api_error("Passkey registration could not be verified",400)
+    if not isinstance(credential,dict) or not isinstance(label,str) or not label.strip() or len(label.strip())>MAX_LABEL_LENGTH: return api_error("Passkey registration could not be verified",400, "MM_SERVER_PASSKEY_REGISTRATION_CREDENTIAL_OR_LABEL_SCHEMA_INVALID")
     label=label.strip()
     conn=db()
     try:
@@ -912,11 +978,11 @@ def register_verify():
         _audit_event("PASSKEY_REGISTERED", credential_id=result.credential_id, detail={"label": label})
         conn.commit()
     except IntegrityError:
-        conn.rollback(); return api_error("Passkey registration conflict",409)
+        conn.rollback(); return api_error("Passkey registration conflict",409, "MM_SERVER_PASSKEY_REGISTRATION_CREDENTIAL_IDENTIFIER_ALREADY_REGISTERED")
     except (WebAuthnException,ValueError,KeyError,TypeError):
         conn.rollback()
         LOG.warning('event="authentication_failure" category="registration_verification" client="%s"', _client_log_id())
-        return api_error("Passkey registration could not be verified",400)
+        return api_error("Passkey registration could not be verified",400, "MM_SERVER_PASSKEY_REGISTRATION_WEBAUTHN_ATTESTATION_VERIFICATION_FAILED")
     # Registration verifies creation of a credential, not an authentication
     # assertion. Do not make authenticated_at fresh here; the client performs
     # a login assertion next when it needs an authenticated session.
@@ -935,30 +1001,30 @@ def login_options():
     if bound_identity_id is not None:
         query = query.where(table.c.identity_id == bound_identity_id)
     rows=db().execute(query).mappings().all()
-    if not rows: return api_error("Passkey sign-in is unavailable",409)
+    if not rows: return api_error("Passkey sign-in is unavailable",409, "MM_SERVER_PASSKEY_AUTHENTICATION_OPTIONS_NO_REGISTERED_CREDENTIAL_AVAILABLE")
     options=generate_authentication_options(rp_id=RP_ID,challenge=_new_challenge("authentication", bound_identity_id),allow_credentials=[PublicKeyCredentialDescriptor(id=bytes(r["credential_id"])) for r in rows],user_verification=UserVerificationRequirement.REQUIRED)
     return app.response_class(options_to_json(options),mimetype="application/json")
 
 @app.post("/api/passkeys/login/verify")
 def login_verify():
     challenge_row=_take_challenge("authentication")
-    if challenge_row is None: return api_error("Passkey ceremony could not be verified",400)
+    if challenge_row is None: return api_error("Passkey ceremony could not be verified",400, "MM_SERVER_PASSKEY_AUTHENTICATION_CHALLENGE_UNAVAILABLE_EXPIRED_USED_OR_NOT_OWNED")
     challenge = challenge_row["challenge"]
     payload,error=_json_object()
     if error: return error
     credential=payload.get("credential")
-    if not isinstance(credential,dict): return api_error("Passkey authentication could not be verified",400)
+    if not isinstance(credential,dict): return api_error("Passkey authentication could not be verified",400, "MM_SERVER_PASSKEY_AUTHENTICATION_CREDENTIAL_ENVELOPE_TYPE_INVALID")
     credential_id=credential.get("id","")
-    if not isinstance(credential_id,str) or not _B64URL.fullmatch(credential_id): return api_error("Passkey authentication could not be verified",400)
+    if not isinstance(credential_id,str) or not _B64URL.fullmatch(credential_id): return api_error("Passkey authentication could not be verified",400, "MM_SERVER_PASSKEY_AUTHENTICATION_CREDENTIAL_IDENTIFIER_ENCODING_INVALID")
     try:
         credential_id_bytes=base64url_to_bytes(credential_id)
     except Exception:
-        return api_error("Passkey authentication could not be verified",400)
+        return api_error("Passkey authentication could not be verified",400, "MM_SERVER_PASSKEY_AUTHENTICATION_CREDENTIAL_IDENTIFIER_DECODING_FAILED")
     table = models.PasskeyCredential.__table__
     row=db().execute(select(table).where(table.c.credential_id==credential_id_bytes)).mappings().first()
-    if row is None: return api_error("Passkey authentication could not be verified",400)
+    if row is None: return api_error("Passkey authentication could not be verified",400, "MM_SERVER_PASSKEY_AUTHENTICATION_CREDENTIAL_UNKNOWN_OR_NOT_AVAILABLE")
     if challenge_row["identity_id"] is not None and row["identity_id"] != challenge_row["identity_id"]:
-        return api_error("Passkey authentication could not be verified",400)
+        return api_error("Passkey authentication could not be verified",400, "MM_SERVER_PASSKEY_AUTHENTICATION_CREDENTIAL_TENANT_CONTEXT_MISMATCH")
     if _sign_count_regressed(credential, row["sign_count"]):
         _audit_event("SUSPICIOUS_COUNTER_EVENT", credential_id=row["credential_id"], detail={"stored_sign_count": row["sign_count"]}, identity_id=row["identity_id"])
         db().commit()
@@ -968,7 +1034,7 @@ def login_verify():
     except (WebAuthnException,ValueError,KeyError,TypeError):
         conn=db(); _audit_event("PASSKEY_AUTH_FAILURE", credential_id=row["credential_id"], identity_id=row["identity_id"]); conn.commit()
         LOG.warning('event="authentication_failure" category="assertion_verification" client="%s"', _client_log_id())
-        return api_error("Passkey authentication could not be verified",400)
+        return api_error("Passkey authentication could not be verified",400, "MM_SERVER_PASSKEY_AUTHENTICATION_WEBAUTHN_ASSERTION_VERIFICATION_FAILED")
     conn=db(); conn.execute(update(table).where(table.c.id==row["id"]).values(sign_count=result.new_sign_count,device_type=str(result.credential_device_type),backed_up=bool(result.credential_backed_up),last_used_at=func.now()))
     _audit_event("PASSKEY_AUTH_SUCCESS", credential_id=row["credential_id"], identity_id=row["identity_id"])
     conn.commit()
@@ -994,38 +1060,38 @@ def _valid_credential_id(value): return isinstance(value,str) and bool(_B64URL.f
 def rename_passkey(credential_id):
     denied=require_client_vault_open()
     if denied: return denied
-    if not _valid_credential_id(credential_id): return api_error("Unknown passkey",404)
+    if not _valid_credential_id(credential_id): return api_error("Unknown passkey",404, "MM_SERVER_PASSKEY_MANAGEMENT_CREDENTIAL_IDENTIFIER_ENCODING_INVALID")
     try:
         credential_id_bytes=base64url_to_bytes(credential_id)
     except Exception:
-        return api_error("Unknown passkey",404)
+        return api_error("Unknown passkey",404, "MM_SERVER_PASSKEY_MANAGEMENT_CREDENTIAL_IDENTIFIER_DECODING_FAILED")
     payload,error=_json_object()
     if error: return error
     label=payload.get("label")
-    if set(payload)!={"label"} or not isinstance(label,str) or not label.strip() or len(label.strip())>MAX_LABEL_LENGTH: return api_error("Invalid passkey label",400)
+    if set(payload)!={"label"} or not isinstance(label,str) or not label.strip() or len(label.strip())>MAX_LABEL_LENGTH: return api_error("Invalid passkey label",400, "MM_SERVER_PASSKEY_MANAGEMENT_RENAME_LABEL_SCHEMA_INVALID")
     table = models.PasskeyCredential.__table__
     conn=db(); cur=conn.execute(update(table).where((table.c.identity_id==current_identity_id())&(table.c.credential_id==credential_id_bytes)).values(label=label.strip())); conn.commit()
-    return jsonify({"renamed":True}) if cur.rowcount else api_error("Unknown passkey",404)
+    return jsonify({"renamed":True}) if cur.rowcount else api_error("Unknown passkey",404, "MM_SERVER_PASSKEY_MANAGEMENT_RENAME_CREDENTIAL_NOT_FOUND_FOR_TENANT")
 
 @app.delete("/api/passkeys/<credential_id>")
 def remove_passkey(credential_id):
     denied=require_client_vault_open() or require_recent_reauth()
     if denied: return denied
-    if not _valid_credential_id(credential_id): return api_error("Unknown passkey",404)
+    if not _valid_credential_id(credential_id): return api_error("Unknown passkey",404, "MM_SERVER_PASSKEY_MANAGEMENT_CREDENTIAL_IDENTIFIER_ENCODING_INVALID")
     try:
         credential_id_bytes=base64url_to_bytes(credential_id)
     except Exception:
-        return api_error("Unknown passkey",404)
+        return api_error("Unknown passkey",404, "MM_SERVER_PASSKEY_MANAGEMENT_CREDENTIAL_IDENTIFIER_DECODING_FAILED")
     table = models.PasskeyCredential.__table__
     conn=db()
     owner_id = current_identity_id()
     count=conn.execute(select(func.count()).select_from(table).where(table.c.identity_id==owner_id)).scalar_one()
-    if auth_required() and count<=1: return api_error("Disable protection before removing the final passkey",409)
+    if auth_required() and count<=1: return api_error("Disable protection before removing the final passkey",409, "MM_SERVER_PASSKEY_MANAGEMENT_REMOVE_FINAL_REQUIRED_CREDENTIAL_BLOCKED")
     cur=conn.execute(delete(table).where((table.c.identity_id==owner_id)&(table.c.credential_id==credential_id_bytes)))
     if cur.rowcount: _audit_event("PASSKEY_REMOVED", credential_id=credential_id_bytes)
     conn.commit()
     if cur.rowcount: LOG.info('event="passkey_removed" client="%s"', _client_log_id())
-    return jsonify({"removed":True}) if cur.rowcount else api_error("Unknown passkey",404)
+    return jsonify({"removed":True}) if cur.rowcount else api_error("Unknown passkey",404, "MM_SERVER_PASSKEY_MANAGEMENT_REMOVE_CREDENTIAL_NOT_FOUND_FOR_TENANT")
 
 @app.post("/api/passkeys/disable")
 def disable_passkeys():
@@ -1033,8 +1099,8 @@ def disable_passkeys():
     if denied: return denied
     payload,error=_json_object()
     if error: return error
-    if payload!={"confirm_unlocked":True}: return api_error("Unlocked-vault confirmation is required",400)
-    if AUTH_POLICY=="required": return api_error("Authentication is required by deployment policy",409)
+    if payload!={"confirm_unlocked":True}: return api_error("Unlocked-vault confirmation is required",400, "MM_SERVER_PASSKEY_MANAGEMENT_DISABLE_UNLOCK_CONFIRMATION_REQUIRED")
+    if AUTH_POLICY=="required": return api_error("Authentication is required by deployment policy",409, "MM_SERVER_PASSKEY_MANAGEMENT_DISABLE_DEPLOYMENT_POLICY_REQUIRES_AUTHENTICATION")
     owner_id = current_identity_id()
     table = models.VaultIdentity.__table__
     conn=db(); conn.execute(update(table).where(table.c.id==owner_id).values(passkey_required=False, updated_at=func.now()))

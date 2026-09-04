@@ -59,7 +59,40 @@ function ensureWasmReady() {
 
 let barretenbergInstance = null;
 async function getBarretenberg() {
-  if (!barretenbergInstance) barretenbergInstance = await Barretenberg.new();
+  // A manual transaction is a small circuit. Capping the browser backend
+  // avoids creating dozens of WASM workers on high-core laptops, where cold
+  // initialization can look like a hung form and exhaust browser memory.
+  const threads = typeof navigator === 'object' && Number.isInteger(navigator.hardwareConcurrency)
+    ? Math.min(4, Math.max(1, navigator.hardwareConcurrency))
+    : 4;
+  if (!barretenbergInstance) {
+    // bb.js 5.1's browser CRS loader uses two absolute CDN URLs internally.
+    // Keep the browser on the same origin and let Flask serve the public,
+    // pinned CRS files locally; no plaintext or key material is involved.
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : input?.url;
+      if (url?.endsWith('/g1_compressed.dat') || url?.endsWith('/g2.dat') || url?.endsWith('/grumpkin_g1_v2.dat')) {
+        const filename = url.endsWith('/g1_compressed.dat')
+          ? 'g1_compressed.dat'
+          : url.endsWith('/g2.dat') ? 'g2.dat' : 'grumpkin_g1_v2.dat';
+        return originalFetch(`/zkp-crs/${filename}`, init);
+      }
+      return originalFetch(input, init);
+    };
+    try {
+      // Pass an explicit same-origin compressed module. Without this option
+      // bb.js dynamically imports its packaged data: URL, which strict CSP
+      // correctly rejects as an external connection. The build copies both
+      // single-thread and shared-memory modules to /assets/.
+      barretenbergInstance = await Barretenberg.new({
+        threads,
+        wasmPath: '/assets/barretenberg.wasm.gz',
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
   return barretenbergInstance;
 }
 

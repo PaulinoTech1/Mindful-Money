@@ -181,6 +181,14 @@
         <article class="card"><h2>Records written per day</h2><div class="chart serverChart"><canvas id="chDays"></canvas></div></article>
       </div>
 
+      <article class="card zkpStatus" aria-labelledby="zkpStatusTitle">
+        <div class="eyebrow">Zero-knowledge proof status</div>
+        <h2 id="zkpStatusTitle">Proofs verified before storage</h2>
+        <p id="svZkpStatus">Loading verification status...</p>
+        <p class="editorHint" id="svZkpCircuit"></p>
+        <p class="editorHint">The server can verify the proof and store its public commitment, but cannot read the transaction name, amount, account, or category.</p>
+      </article>
+
       <p class="callout">Ciphertext length hints at the length of the merchant name. Padding every blob to fixed 256-byte buckets closes it — about ten lines of code.</p>
 
       <section class="ledger rawLedger">

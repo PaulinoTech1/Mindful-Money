@@ -59,6 +59,7 @@ class TestZkpChallengeIssuance(ServerCase):
     def test_rejects_unknown_purpose(self):
         resp = self.unsafe("post", "/api/zkp/challenge", json={"purpose": "delete_everything"})
         self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error_code"], "MM_SERVER_ZKP_CHALLENGE_CREATE_PURPOSE_NOT_SUPPORTED")
 
     def test_rejects_unexpected_fields(self):
         resp = self.unsafe("post", "/api/zkp/challenge", json={"purpose": "manual_expense_create", "extra": 1})
@@ -69,6 +70,10 @@ class TestZkpChallengeIssuance(ServerCase):
         self.assertFalse(zkp_verifier.artifacts_available())
         resp = self.unsafe("post", "/api/zkp/challenge", json={"purpose": "manual_expense_create"})
         self.assertEqual(resp.status_code, 503)
+        self.assertEqual(
+            resp.get_json()["error_code"],
+            "MM_SERVER_ZKP_CHALLENGE_CREATE_BARRETENBERG_EXECUTABLE_OR_VERIFICATION_KEY_UNAVAILABLE",
+        )
         self.assertNotIn("Traceback", resp.get_data(as_text=True))
 
 
@@ -128,6 +133,10 @@ class TestZkpChallengeLifecycle(ServerCase):
     def test_unknown_challenge_id_rejected(self):
         resp = self.submit("does-not-exist")
         self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            resp.get_json()["error_code"],
+            "MM_SERVER_ZKP_CHALLENGE_CONSUME_UNAVAILABLE_EXPIRED_USED_OR_NOT_OWNED",
+        )
 
     def test_challenge_from_another_identity_is_rejected(self):
         with self._engine.begin() as conn:
@@ -183,6 +192,7 @@ class TestZkpChallengeLifecycle(ServerCase):
             public_inputs=_proof_public_inputs(values),
         )
         self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error_code"], "MM_SERVER_ZKP_MANUAL_TRANSACTION_PROOF_HEX_ENCODING_INVALID")
 
     def test_well_formed_but_unverifiable_proof_fails_closed_503(self):
         """Every context check passes (challenge, record_id, schema_version,
@@ -194,6 +204,10 @@ class TestZkpChallengeLifecycle(ServerCase):
         values = _force_issue_challenge(self)
         resp = self.submit(values["challenge_id"], public_inputs=_proof_public_inputs(values))
         self.assertEqual(resp.status_code, 503)
+        self.assertEqual(
+            resp.get_json()["error_code"],
+            "MM_SERVER_ZKP_BARRETENBERG_VERIFY_EXECUTABLE_OR_VERIFICATION_KEY_UNAVAILABLE",
+        )
         with self._engine.connect() as conn:
             from sqlalchemy import text
             count = conn.execute(
@@ -322,6 +336,7 @@ class TestZkpVerifierModule(ServerCase):
         from pathlib import Path
         from types import SimpleNamespace
         from unittest.mock import patch
+        import json
         import tempfile
 
         proof = bytes.fromhex(VALID_FAKE_PROOF)
@@ -331,18 +346,27 @@ class TestZkpVerifierModule(ServerCase):
         with tempfile.TemporaryDirectory() as artifact_dir:
             vk = Path(artifact_dir) / "vk"
             bb = Path(artifact_dir) / "bb"
-            vk.write_bytes(b"server-owned-vk")
+            crs = Path(artifact_dir) / "crs"
+            crs.mkdir()
+            for name in zkp_verifier.CRS_FILENAMES:
+                (crs / name).write_bytes(b"public-crs")
+            vk.write_bytes(b"\x00" * 32)
             bb.write_bytes(b"executable-placeholder")
 
             def fake_run(command, **kwargs):
-                self.assertEqual(Path(command[command.index("-p") + 1]).read_bytes(), proof)
-                self.assertEqual(Path(command[command.index("-i") + 1]).read_bytes(), expected_pi_bytes)
-                self.assertEqual(command[command.index("-k") + 1], str(vk))
+                proof_json = json.loads(Path(command[command.index("-p") + 1]).read_text("ascii"))
+                inputs_json = json.loads(Path(command[command.index("-i") + 1]).read_text("ascii"))
+                vk_json = json.loads(Path(command[command.index("-k") + 1]).read_text("ascii"))
+                self.assertEqual(proof_json["proof"], ["0x" + proof[offset:offset + 32].hex() for offset in range(0, len(proof), 32)])
+                self.assertEqual(inputs_json["public_inputs"], list(fields))
+                self.assertEqual(vk_json["vk"], ["0x" + "0" * 64])
+                self.assertEqual(command[command.index("-c") + 1], str(crs))
                 self.assertEqual(command[command.index("-s") + 1], "ultra_honk")
                 self.assertTrue(kwargs["capture_output"])
                 return SimpleNamespace(returncode=0)
 
             with patch.object(zkp_verifier, "VK_PATH", vk), \
+                 patch.object(zkp_verifier, "CRS_ROOT", crs), \
                  patch.object(zkp_verifier, "BB_EXECUTABLE", str(bb)), \
                  patch.object(zkp_verifier.subprocess, "run", side_effect=fake_run):
                 result = zkp_verifier.verify_proof(proof, fields)

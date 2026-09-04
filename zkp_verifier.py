@@ -24,23 +24,26 @@ entire system -- see the project's delivery report, "Verification trust
 anchor".
 
 Requires the official `bb` 5.1.0 CLI (see zkp/README.md). The circuit and
-verification key are committed, but `bb` is not installed on the default
-application host in this checkout, so runtime verification still fails
-closed until `ZKP_BB_EXECUTABLE` names the deployed binary.
+verification key are committed, but `bb` and its server-side CRS are
+deployment artifacts, so runtime verification fails closed until both are
+provisioned.
 
 Barretenberg 5.1 represents an UltraHonk proof and its public inputs as
 separate arrays of 32-byte big-endian BN254 field elements. The browser
-returns that exact split as `{ proof, publicInputs }`; the native CLI reads
-the same split from `-p` and `-i`:
+returns that exact split as `{ proof, publicInputs }`. The native CLI accepts
+JSON wrappers for those arrays; this module uses JSON deliberately because
+the Windows CLI opens binary files in text mode (which can truncate at a
+Ctrl-Z byte):
 
-    bb verify -s ultra_honk -p <proof> -i <public_inputs> -k <vk>
+    bb verify -s ultra_honk -c <crs> -p <proof.json> -i <public_inputs.json> -k <vk.json>
 
-This module validates canonical field encodings, writes both files, and
-never relies on a client-supplied verification key.
+This module validates canonical field encodings, writes all three JSON files,
+and never relies on a client-supplied verification key.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -65,6 +68,11 @@ CATEGORY_IDS = (
 BB_EXECUTABLE = os.environ.get("ZKP_BB_EXECUTABLE") or shutil.which("bb") or "bb"
 _DEFAULT_VK_PATH = Path(__file__).resolve().parent / "zkp" / "manual_expense" / "target" / "vk"
 VK_PATH = Path(os.environ["ZKP_MANUAL_EXPENSE_VK_PATH"]) if os.environ.get("ZKP_MANUAL_EXPENSE_VK_PATH") else _DEFAULT_VK_PATH
+_DEFAULT_CRS_ROOT = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local")) / "MindfulMoney" / "barretenberg-5.1.0" / "crs"
+CRS_ROOT = Path(os.environ["ZKP_CRS_ROOT"]) if os.environ.get("ZKP_CRS_ROOT") else _DEFAULT_CRS_ROOT
+# Native bb names. Browser-facing aliases are served by Flask from the same
+# CRS directory (app.py's /zkp-crs route).
+CRS_FILENAMES = ("bn254_g1.dat", "bn254_g1_compressed.dat", "bn254_g2.dat")
 VERIFY_TIMEOUT_SECONDS = float(os.environ.get("ZKP_VERIFY_TIMEOUT_SECONDS", "10"))
 MAX_PROOF_BYTES = int(os.environ.get("ZKP_MAX_PROOF_BYTES", str(256 * 1024)))
 PUBLIC_INPUT_COUNT = 4
@@ -80,8 +88,8 @@ class ZkpVerificationError(RuntimeError):
 
 
 class CircuitArtifactsUnavailable(RuntimeError):
-    """The pinned verification key or the `bb` executable is not present
-    on this host. Callers MUST fail closed exactly as for an invalid
+    """The pinned verification key, native CRS, or `bb` executable is not
+    present on this host. Callers MUST fail closed exactly as for an invalid
     proof -- never treat "verifier unavailable" as "proof accepted"."""
 
 
@@ -95,14 +103,40 @@ def artifacts_available() -> bool:
     """Non-raising check for a startup/health-check log line -- see
     app.py's startup logging. Does not itself imply anything about proof
     validity."""
-    return VK_PATH.is_file() and (shutil.which(BB_EXECUTABLE) is not None or Path(BB_EXECUTABLE).is_file())
+    return (
+        VK_PATH.is_file()
+        and all((CRS_ROOT / name).is_file() for name in CRS_FILENAMES)
+        and (shutil.which(BB_EXECUTABLE) is not None or Path(BB_EXECUTABLE).is_file())
+    )
 
 
 def _require_artifacts() -> None:
     if not VK_PATH.is_file():
         raise CircuitArtifactsUnavailable(f"verification key not found at {VK_PATH}")
+    if any(not (CRS_ROOT / name).is_file() for name in CRS_FILENAMES):
+        raise CircuitArtifactsUnavailable("Barretenberg CRS is not provisioned")
     if shutil.which(BB_EXECUTABLE) is None and not Path(BB_EXECUTABLE).is_file():
         raise CircuitArtifactsUnavailable("bb executable not found")
+
+
+def _field_array_json(values: bytes) -> list[str]:
+    """Encode concatenated big-endian field elements for bb JSON input."""
+    if len(values) % FIELD_BYTES:
+        raise CircuitArtifactsUnavailable("verification key is not field-aligned")
+    return [
+        canonical_field_hex(values[offset:offset + FIELD_BYTES])
+        for offset in range(0, len(values), FIELD_BYTES)
+    ]
+
+
+def _write_json_field_file(path: Path, key: str, values: list[str]) -> None:
+    path.write_text(
+        json.dumps(
+            {key: values, "vk_hash": "", "bb_version": "5.1.0", "scheme": "ultra_honk"},
+            separators=(",", ":"),
+        ),
+        encoding="ascii",
+    )
 
 
 def canonical_field_hex(value: int | bytes | str) -> str:
@@ -185,18 +219,31 @@ def verify_proof(proof_bytes: bytes, public_inputs: list[str] | tuple[str, ...])
 
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="zkp_verify_") as tmpdir:
-        # Server-generated filename, inside a server-generated temp
-        # directory -- never derived from client input.
-        proof_path = Path(tmpdir) / "proof"
-        public_inputs_path = Path(tmpdir) / "public_inputs"
-        proof_path.write_bytes(proof)
-        public_inputs_path.write_bytes(b"".join(bytes.fromhex(value[2:]) for value in fields))
+        # Server-generated filenames, inside a server-generated temp
+        # directory -- never derived from client input. JSON is intentional:
+        # the Windows bb binary reader treats Ctrl-Z as EOF.
+        proof_path = Path(tmpdir) / "proof.json"
+        public_inputs_path = Path(tmpdir) / "public_inputs.json"
+        vk_path = Path(tmpdir) / "vk.json"
+        _write_json_field_file(proof_path, "proof", _field_array_json(proof))
+        _write_json_field_file(public_inputs_path, "public_inputs", list(fields))
+        vk_bytes = VK_PATH.read_bytes()
+        if vk_bytes.lstrip().startswith(b"{"):
+            try:
+                vk_json = json.loads(vk_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise CircuitArtifactsUnavailable("verification key JSON is invalid") from exc
+            if not isinstance(vk_json, dict) or not isinstance(vk_json.get("vk"), list):
+                raise CircuitArtifactsUnavailable("verification key JSON is invalid")
+            vk_path.write_text(json.dumps(vk_json, separators=(",", ":")), encoding="ascii")
+        else:
+            _write_json_field_file(vk_path, "vk", _field_array_json(vk_bytes))
         try:
             result = subprocess.run(
                 [
                     BB_EXECUTABLE, "verify", "-s", "ultra_honk",
-                    "-p", str(proof_path), "-i", str(public_inputs_path),
-                    "-k", str(VK_PATH),
+                    "-c", str(CRS_ROOT), "-p", str(proof_path),
+                    "-i", str(public_inputs_path), "-k", str(vk_path),
                 ],
                 capture_output=True,
                 timeout=VERIFY_TIMEOUT_SECONDS,

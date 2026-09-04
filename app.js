@@ -30,7 +30,7 @@ const RULES = [
   [/blue bottle|sweetgreen|lucali/i,                    'Dining'],
   [/mta|omny|uber|citi bike|enterprise|delta air/i,     'Transport'],
   [/con edison|verizon/i,                               'Utilities'],
-  [/spotify|netflix|fans only/i,                        'Subscriptions'],
+  [/spotify|netflix|family recreation center/i,         'Subscriptions'],
   [/amazon|apple store|rough trade|paragon|warby/i,     'Shopping'],
   [/duane reade|weill cornell|equinox|state farm/i,     'Health & insurance'],
   [/ira contribution|401\(k\)|employee deferral|employer match/i, 'Investing'],

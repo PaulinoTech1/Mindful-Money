@@ -46,7 +46,7 @@ OCCASIONAL = [
 
 MONTHLY_FIXED = [
     ("Stuyvesant Town Rent", 2150.00, 1),
-    ("Fans Only", 423.23, 1),
+    ("Family Recreation Center", 89.99, 1),
     ("Con Edison", 104.00, 8),
     ("Verizon Fios", 79.99, 12),
     ("Spotify", 11.99, 4),
@@ -91,8 +91,8 @@ def generate(months: int = 6) -> list[dict]:
         # Keep the legacy checking IDs stable when adding a new recurring
         # charge. The monthly charge gets its own deterministic ID, so a
         # refresh updates old rows instead of duplicating the feed.
-        if account == "demo_checking" and merchant == "Fans Only":
-            external_id = f"demo_fans_only_{date:%Y%m}"
+        if account == "demo_checking" and merchant == "Family Recreation Center":
+            external_id = f"demo_family_recreation_center_{date:%Y%m}"
         else:
             external_id = f"demo_{sequence:05d}" if account == "demo_checking" else f"{account}_{sequence:05d}"
         meta = ACCOUNTS[account]
@@ -110,7 +110,7 @@ def generate(months: int = 6) -> list[dict]:
                 "source": "fakebank",
             }
         )
-        if not (account == "demo_checking" and merchant == "Fans Only"):
+        if not (account == "demo_checking" and merchant == "Family Recreation Center"):
             account_counts[account] = sequence + 1
 
     day = start
@@ -132,7 +132,7 @@ def generate(months: int = 6) -> list[dict]:
         # Fixed monthly bills.
         for merchant, amount, dom in MONTHLY_FIXED:
             if day.day == dom:
-                jitter = 1.0 if merchant.startswith(("Spotify", "Netflix", "Fans Only")) else rng.uniform(0.9, 1.15)
+                jitter = 1.0 if merchant.startswith(("Spotify", "Netflix", "Family Recreation Center")) else rng.uniform(0.9, 1.15)
                 add(day, merchant, amount * jitter)
 
         # Weekly habits, weighted toward weekdays for coffee and transit.
