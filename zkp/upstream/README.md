@@ -1,9 +1,11 @@
 # ZKP upstream dependency workspace
 
-This directory collects the three upstream source repositories relevant to
-Mindful Money's experimental manual-expense proof in one place. They are Git
-submodules pinned to immutable release commits; their source histories and
-build artifacts are not copied into the main application repository.
+This directory records the three upstream source repositories relevant to
+Mindful Money's experimental manual-expense proof. On `main` only the
+immutable pins are kept (`pins.json`); the submodule checkouts themselves
+live on the `ZKP` branch, so application deployments (e.g. Vercel) never
+pull multi-gigabyte upstream monorepos. Their source histories and build
+artifacts are not copied into the main application repository.
 
 ## Pinned sources
 
@@ -20,9 +22,10 @@ change those production-facing pins until the circuit tests, browser proof,
 native verification, and proof/public-input serialization have passed together
 with one recorded toolchain set.
 
-## Initialize this workspace
+## Checking out the upstream sources
 
-After cloning Mindful-Money:
+The submodule workspace lives on the `ZKP` branch (`main` carries only
+`pins.json`, deliberately, so deploys never fetch the upstream monorepos):
 
 ```bash
 git switch ZKP
