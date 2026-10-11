@@ -53,6 +53,10 @@ VAULT_STEPUP_WINDOW_SECONDS = int(os.environ.get("VAULT_STEPUP_WINDOW_SECONDS", 
 DEFAULT_IDENTITY_ID = 1
 COOKIE_NAME = "vault_session"
 TRUST_PROXY = os.environ.get("VAULT_TRUST_PROXY", "0") == "1"
+# Opt-in IP address logging. Default off for privacy.
+# When "on", the full client IP is stored in audit_events.client_ip.
+# When "off" (default), only the HMAC-truncated client_ref is stored.
+IP_LOGGING = os.environ.get("VAULT_IP_LOGGING", "off").lower() == "on"
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _LOWER_HEX = re.compile(r"[0-9a-f]+\Z")
 _B64URL = re.compile(r"[A-Za-z0-9_-]{2,1024}\Z")
@@ -183,10 +187,23 @@ def _audit_event(event_type, credential_id=None, detail=None, identity_id=None):
     tenant (or an explicitly supplied identity during sign-in). Never pass a
     challenge, session token, or public key as detail."""
     table = models.AuditEvent.__table__
+    # Opt-in IP logging: store full IP only when VAULT_IP_LOGGING=on
+    client_ip = None
+    if IP_LOGGING:
+        client_ip = request.remote_addr
     db().execute(insert(table).values(
         event_type=event_type, identity_id=identity_id or current_identity_id(), client_ref=_client_log_id(),
-        credential_id=credential_id, detail=detail,
+        credential_id=credential_id, detail=detail, client_ip=client_ip,
     ))
+
+
+def _log_detection(detection_type, detail=None):
+    """Log a detection event from the unusual activity detector.
+    Always audit-logged regardless of IP logging setting."""
+    _audit_event("UNUSUAL_ACTIVITY_DETECTED", detail={
+        "detection_type": detection_type,
+        **(detail or {}),
+    })
 
 
 def _sign_count_regressed(credential_payload, stored_sign_count) -> bool:
@@ -1004,6 +1021,70 @@ def disable_passkeys():
     _rotate_session(identity_id=owner_id,vault_unlocked=True)
     LOG.info('event="passkey_protection_disabled" client="%s"', _client_log_id())
     return jsonify({"disabled":True,"csrf_token":session["csrf_token"]})
+
+
+# ---------- Incident response ----------
+
+@app.get("/api/audit/events")
+def list_audit_events():
+    """List audit events for incident response. Requires authentication."""
+    denied = require_access()
+    if denied: return denied
+    # Query params: event_type, limit (default 50, max 200), offset
+    event_type = request.args.get("event_type")
+    try:
+        limit = min(int(request.args.get("limit", "50")), 200)
+        offset = max(int(request.args.get("offset", "0")), 0)
+    except ValueError:
+        return api_error("Invalid limit or offset", 400)
+    table = models.AuditEvent.__table__
+    query = select(table).order_by(table.c.occurred_at.desc()).limit(limit).offset(offset)
+    if event_type:
+        query = query.where(table.c.event_type == event_type)
+    # Only show events for the current identity
+    identity_id = current_identity_id()
+    if identity_id:
+        query = query.where(table.c.identity_id == identity_id)
+    rows = db().execute(query).mappings().all()
+    events = []
+    for row in rows:
+        events.append({
+            "id": row["id"],
+            "occurred_at": row["occurred_at"].isoformat() if row["occurred_at"] else None,
+            "event_type": row["event_type"],
+            "client_ref": row["client_ref"],
+            "client_ip": row["client_ip"],  # null unless VAULT_IP_LOGGING=on
+            "acknowledged_at": row["acknowledged_at"].isoformat() if row["acknowledged_at"] else None,
+            "acknowledged_by": row["acknowledged_by"],
+            "detail": row["detail"],
+        })
+    return jsonify({"events": events, "limit": limit, "offset": offset})
+
+
+@app.post("/api/audit/events/<int:event_id>/acknowledge")
+def acknowledge_audit_event(event_id):
+    """Mark an audit event as reviewed. Creates an INCIDENT_ACKNOWLEDGED audit trail entry."""
+    denied = require_access()
+    if denied: return denied
+    table = models.AuditEvent.__table__
+    conn = db()
+    # Verify the event exists and belongs to this identity
+    identity_id = current_identity_id()
+    existing = conn.execute(
+        select(table.c.id).where(table.c.id == event_id)
+    ).first()
+    if not existing:
+        return api_error("Event not found", 404)
+    # Mark as acknowledged
+    conn.execute(
+        update(table)
+        .where(table.c.id == event_id)
+        .values(acknowledged_at=func.now(), acknowledged_by=identity_id)
+    )
+    _audit_event("INCIDENT_ACKNOWLEDGED", detail={"acknowledged_event_id": event_id})
+    conn.commit()
+    LOG.info('event="incident_acknowledged" event_id=%d client="%s"', event_id, _client_log_id())
+    return jsonify({"acknowledged": True, "event_id": event_id})
 
 
 if __name__ == "__main__":

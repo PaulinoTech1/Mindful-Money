@@ -215,6 +215,8 @@ class AuditEvent(Base):
             "PASSKEY_PROTECTION_DISABLED",
             "SESSION_REVOKED",
             "SUSPICIOUS_COUNTER_EVENT",
+            "UNUSUAL_ACTIVITY_DETECTED",
+            "INCIDENT_ACKNOWLEDGED",
             name="audit_event_type",
             native_enum=False,
             create_constraint=True,
@@ -229,6 +231,16 @@ class AuditEvent(Base):
     # IP address -- matches the app's existing privacy convention for the
     # identical purpose (rate-limit bucketing).
     client_ref: Mapped[str] = mapped_column(String(12), nullable=False)
+    # Opt-in full IP logging. Null unless VAULT_IP_LOGGING=on.
+    # See docs for privacy implications.
+    client_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     credential_id: Mapped[bytes | None] = mapped_column(LargeBinary)
     # Never contains secrets, challenges, session tokens, or private keys.
     detail: Mapped[dict | None] = mapped_column(JSONB)
+    # Incident response: mark events as reviewed
+    acknowledged_at: Mapped[dt.datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    acknowledged_by: Mapped[int | None] = mapped_column(
+        ForeignKey("vault_identity.id", ondelete="SET NULL")
+    )
