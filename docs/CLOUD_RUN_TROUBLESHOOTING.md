@@ -323,3 +323,41 @@ postgresql://user:password@ep-xxx-xxx.us-east-2.aws.neon.tech/dbname?sslmode=req
 ```
 Use the pooled connection string from the Neon dashboard (contains `-pooler`
 in the hostname).
+
+## Decision: Secrets via Secret Manager, never shell history
+
+**Context:** The Neon database URL and Flask secret key are sensitive
+credentials. They needed to get into GCP Secret Manager securely.
+
+**Options considered:**
+
+1. **Direct `echo` in shell** (rejected)
+   ```bash
+   echo -n "postgresql://..." | gcloud secrets create neon-db-url --data-file=-
+   ```
+   The URL appears in shell history (`~/.bash_history`). Anyone with
+   access to the Cloud Shell VM or its disk image could recover it.
+   Rejected.
+
+2. **`read -s` with hidden input** (acceptable fallback)
+   ```bash
+   read -s NEON_URL
+   echo -n "$NEON_URL" | gcloud secrets versions add neon-db-url --data-file=-
+   unset NEON_URL
+   ```
+   Input is hidden, doesn't appear in history. The variable is cleared
+   after use. Acceptable but requires careful execution.
+
+3. **GCP Console web UI** (chosen)
+   Navigate to Secret Manager in the browser, click the secret,
+   "New Version", paste the value. No shell involved at all.
+
+**Decision:** Use the GCP Console web UI for initial secret creation.
+The browser session is already authenticated with Advanced Protection
++ YubiKey. No credential touches the shell, its history, or any log.
+
+**Rationale:** For a finance app, the database credential is the highest-
+value secret. The extra clicks in the web UI are worth eliminating
+the shell history risk entirely. The `read -s` method is documented
+as a fallback for automation, but manual web UI entry is preferred
+for one-time setup.
