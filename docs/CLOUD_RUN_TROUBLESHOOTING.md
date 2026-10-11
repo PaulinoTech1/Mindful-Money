@@ -412,3 +412,45 @@ removed endpoint paths."
 connects to the database, and serves pages. The remaining issue is a
 frontend bug from an incomplete refactor, not an infrastructure problem.
 Once the fixed `app.js` is deployed, the app should be fully functional.
+
+## GitHub Actions WIF: service account impersonation denied
+
+**Symptom:** GitHub Actions workflow authenticates via Workload Identity
+Federation successfully, but the Docker push fails with:
+```
+ERROR: (gcloud.auth.docker-helper) There was a problem refreshing your
+current auth tokens: ('Unable to acquire impersonated credentials',
+'Permission iam.serviceAccounts.getAccessToken denied on resource
+(or it may not exist).')
+```
+
+**Cause:** The Workload Identity Pool was granted `roles/run.admin`,
+`roles/artifactregistry.writer`, and `roles/iam.serviceAccountUser` at
+the project level. But `serviceAccountUser` is not sufficient for
+Workload Identity Federation impersonation. The pool needs the
+`roles/iam.workloadIdentityUser` role **on the specific service account**
+being impersonated.
+
+**Fix:**
+```bash
+gcloud iam service-accounts add-iam-policy-binding SERVICE_ACCOUNT_EMAIL \
+  --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/attribute.repository/ORG/REPO" \
+  --role="roles/iam.workloadIdentityUser"
+```
+
+**Why this is easy to miss:** The GCP docs for Workload Identity
+Federation emphasize the pool-level IAM grants (run.admin, etc.), but
+the service-account-level `workloadIdentityUser` binding is documented
+separately under "impersonation." The error message
+(`getAccessToken denied`) does not name the missing role directly.
+
+**Complete WIF setup checklist for Cloud Run deploys:**
+1. Create workload identity pool
+2. Create OIDC provider for `https://token.actions.githubusercontent.com`
+   with attribute condition on the repo
+3. Grant pool `roles/run.admin` on the project
+4. Grant pool `roles/artifactregistry.writer` on the Artifact Registry repo
+5. Grant pool `roles/iam.workloadIdentityUser` **on the service account**
+   (this is the step most often missed)
+6. Add `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT` as
+   GitHub Actions secrets
