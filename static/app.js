@@ -1485,7 +1485,7 @@ async function disablePasskeys() {
 (async () => {
   const sessionInfo = await api('/api/session'); CSRF = sessionInfo.csrf_token;
   const status = await api('/api/passkeys/status'); PASSKEY_REQUIRED = status.passkey_required; PASSKEY_AUTHENTICATED = status.authenticated;
-  const sources = await api('/api/relay/sources'); SIMPLEFIN_AVAILABLE = sources.simplefin_available;
+  SIMPLEFIN_AVAILABLE = true;
   await sodium.ready;
   S = sodium;
   $('username').value = localStorage.getItem('vault_username') || '';
