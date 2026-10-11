@@ -25,8 +25,57 @@ env:
   REPO_NAME: mindful-money
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: |
+          python -m pytest test_demo.py -x -q
+        env:
+          VAULT_ENV: test
+
+      - name: Check migrations
+        run: |
+          # Verify migration chain is valid (no broken revises/down_revision)
+          python -c "
+          import os
+          versions_dir = 'migrations/versions'
+          revisions = {}
+          for f in os.listdir(versions_dir):
+              if f.endswith('.py'):
+                  with open(os.path.join(versions_dir, f)) as fp:
+                      content = fp.read()
+                      # Extract revision and down_revision
+                      import re
+                      rev = re.search(r'^revision:\s*str\s*=\s*[\"\']([^\"\']+)[\"\']', content, re.M)
+                      down = re.search(r'^down_revision.*=[\s]*[\"\']([^\"\']+)[\"\']', content, re.M)
+                      if rev:
+                          revisions[rev.group(1)] = down.group(1) if down else None
+          # Check chain integrity
+          seen = set()
+          for rev, down in revisions.items():
+              if down and down != 'None' and down not in revisions:
+                  print(f'BROKEN: {rev} references missing {down}')
+                  exit(1)
+          print(f'Migration chain OK: {len(revisions)} revisions')
+          "
+
   deploy:
     runs-on: ubuntu-latest
+    needs: test
     steps:
       - name: Checkout
         uses: actions/checkout@v4

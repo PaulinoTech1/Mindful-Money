@@ -146,8 +146,13 @@ class ServerCase(unittest.TestCase):
         return getattr(self.client, method)(path, headers=headers, **kwargs)
 
     def full_flow(self, passphrase="test passphrase"):
-        """relay -> encrypt in 'browser' -> store. Returns (sim, transactions)."""
-        txns = self.unsafe("post", "/api/relay").get_json()["transactions"]
+        """Generate test transactions -> encrypt in 'browser' -> store. Returns (sim, transactions)."""
+        # Static test data (replaces the removed /api/relay demo endpoint)
+        txns = [
+            {"id": "txn1", "amount": -50.00, "description": "Test Purchase 1", "posted": "2026-10-01"},
+            {"id": "txn2", "amount": 1000.00, "description": "Test Deposit", "posted": "2026-10-02"},
+            {"id": "txn3", "amount": -25.50, "description": "Test Purchase 2", "posted": "2026-10-03"},
+        ]
         sim = BrowserSim(passphrase)
         self.unsafe("post", "/api/records", json={"records": sim.encrypt_all(txns)})
         return sim, txns
@@ -264,19 +269,10 @@ class TestBrowserCrypto(unittest.TestCase):
 
 
 class TestServerAPI(ServerCase):
-    def test_relay_returns_transactions(self):
-        txns = self.unsafe("post", "/api/relay").get_json()["transactions"]
-        self.assertGreater(len(txns), 200)
-        self.assertEqual(
-            set(txns[0]), {"id", "merchant", "amount", "date", "pending", "account",
-                           "bank", "account_label", "account_type", "source"}
-        )
-
-    def test_relay_persists_nothing(self):
-        """The core relay guarantee: plaintext passes through, never lands."""
-        self.unsafe("post", "/api/relay")
-        self.assertEqual(self.client.get("/api/records").get_json()["records"], [])
-        self.assertNotIn(b"Blue Bottle", self.db_bytes())
+    def test_relay_endpoint_is_removed(self):
+        """The server-side relay was removed in the zero-knowledge refactor."""
+        response = self.unsafe("post", "/api/relay")
+        self.assertEqual(response.status_code, 404)
 
     def test_store_and_retrieve(self):
         sim, txns = self.full_flow()
@@ -340,9 +336,11 @@ class TestOptionalPasskeys(ServerCase):
 
     def test_protected_record_and_metadata_apis_require_authentication(self):
         self.set_required()
-        for method, path in (("get", "/api/records"), ("post", "/api/records"), ("post", "/api/relay"), ("get", "/api/server-view")):
+        for method, path in (("get", "/api/records"), ("post", "/api/records"), ("get", "/api/server-view")):
             response = getattr(self.client, method)(path, json={} if method == "post" else None, headers=self.headers() if method in {"post", "delete"} else None)
             self.assertEqual(response.status_code, 401, path)
+        # /api/relay was removed - should 404 even without auth
+        self.assertEqual(self.client.post("/api/relay").status_code, 404)
         self.assertEqual(self.client.delete("/api/records", headers=self.headers()).status_code, 409)
 
     def test_enrollment_requires_unlocked_vault(self):
@@ -468,7 +466,7 @@ class TestSecurityIncrement(ServerCase):
     def test_every_unsafe_endpoint_rejects_missing_origin_or_csrf(self):
         token = self.client.get("/api/session").get_json()["csrf_token"]
         endpoints = [
-            ("post", "/api/relay", None), ("post", "/api/records", {"records": []}),
+            ("post", "/api/records", {"records": []}),
             ("delete", "/api/records", None), ("post", "/api/vault/unlocked", None),
             ("post", "/api/logout", None), ("post", "/api/passkeys/login/options", None),
         ]
@@ -481,15 +479,15 @@ class TestSecurityIncrement(ServerCase):
         token = self.client.get("/api/session").get_json()["csrf_token"]
         hostile = ["null", "https://localhost:5000", "http://localhost.evil:5000", "http://localhost:5001", "http://user@localhost:5000", "http://localhost:5000/path"]
         for origin in hostile:
-            r = self.client.post("/api/relay", headers={"Origin": origin, "X-CSRF-Token": token})
+            r = self.client.post("/api/records", headers={"Origin": origin, "X-CSRF-Token": token}, json={"records": []})
             self.assertEqual(r.status_code, 403, origin)
-        self.assertEqual(self.unsafe("post", "/api/relay").status_code, 200)
+        self.assertEqual(self.unsafe("post", "/api/records", json={"records": []}).status_code, 200)
 
     def test_development_accepts_equivalent_loopback_origin(self):
         token = self.client.get("/api/session").get_json()["csrf_token"]
-        response = self.client.post("/api/relay", headers={
+        response = self.client.post("/api/records", headers={
             "Origin": "http://127.0.0.1:5000", "X-CSRF-Token": token,
-        })
+        }, json={"records": []})
         self.assertEqual(response.status_code, 200)
 
     def test_upload_validation_is_atomic(self):
@@ -608,7 +606,7 @@ class TestProductionHardening(ServerCase):
         static = self.client.get("/static/app.js")
         self.assertEqual(static.headers["Cache-Control"], "public, max-age=300")
         self.assertEqual(self.client.get("/api/session").headers["Cache-Control"], "no-store")
-        error = self.client.post("/api/relay")
+        error = self.client.post("/api/records", json={"records": []})
         self.assertEqual(error.headers["Cache-Control"], "no-store")
 
     def test_csp_source_regressions(self):
@@ -658,7 +656,7 @@ class TestProductionHardening(ServerCase):
         cookie = self.client.get_cookie(server_app.COOKIE_NAME).value
         def attempt(_):
             client = server_app.app.test_client(); client.set_cookie(server_app.COOKIE_NAME, cookie)
-            return client.post("/api/relay", headers={"Origin":server_app.ORIGIN,"X-CSRF-Token":token}).status_code
+            return client.post("/api/records", headers={"Origin":server_app.ORIGIN,"X-CSRF-Token":token}, json={"records": []}).status_code
         try:
             with ThreadPoolExecutor(max_workers=6) as pool:
                 statuses = list(pool.map(attempt, range(10)))
@@ -1325,14 +1323,17 @@ class TestTenantIsolation(ServerCase):
             self.assertEqual(sess["identity_id"], 2)
         self.assertEqual([r["sealed"] for r in signed_out.get("/api/records").get_json()["records"]], ["c" * 96])
 
-    def test_legacy_simplefin_credential_is_not_shared_with_other_tenants(self):
-        with patch.dict(os.environ, {"SIMPLEFIN_ACCESS_URL": "https://example.invalid/feed"}):
-            self.assertFalse(self.bob.get("/api/relay/sources").get_json()["simplefin_available"])
-            response = self.bob.post(
-                "/api/relay", headers=self._headers(self.bob), json={"source": "simplefin"}
-            )
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.get_json()["error"], "SimpleFin is not configured for this account")
+    def test_legacy_simplefin_relay_is_removed(self):
+        """The server-side SimpleFin relay was removed in the zero-knowledge
+        refactor. SimpleFin is now client-side only. These endpoints should 404."""
+        # /api/relay/sources was removed
+        response = self.bob.get("/api/relay/sources")
+        self.assertEqual(response.status_code, 404)
+        # /api/relay was removed
+        response = self.bob.post(
+            "/api/relay", headers=self._headers(self.bob), json={"source": "simplefin"}
+        )
+        self.assertEqual(response.status_code, 404)
 
 
 # ---------------------------------------------------------------- runner

@@ -134,12 +134,12 @@ def main() -> int:
             print("  Unlock")
             page.goto(base, wait_until="networkidle")
             check(page.is_visible("#gate"), "passphrase gate shown on first load")
-            missing_csrf = page.evaluate("() => fetch('/api/relay', {method: 'POST'}).then(r => r.status)")
+            missing_csrf = page.evaluate("() => fetch('/api/records', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({records: []})}).then(r => r.status)")
             check(missing_csrf == 403, "unsafe browser request without CSRF is rejected")
             csrf = page.evaluate("() => CSRF")
-            hostile = page.request.post(f"{base}/api/relay", headers={
+            hostile = page.request.post(f"{base}/api/records", headers={
                 "Origin": "http://localhost.evil", "X-CSRF-Token": csrf,
-            })
+            }, json={"records": []})
             check(hostile.status == 403, "unsafe request with hostile Origin is rejected")
             errors.clear()  # Chromium logs the deliberately rejected raw fetch as a resource error.
             page.screenshot(path=SHOTS / "1-unlock.png")

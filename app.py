@@ -204,6 +204,7 @@ def _log_detection(detection_type, detail=None):
         "detection_type": detection_type,
         **(detail or {}),
     })
+    LOG.warning('event="unusual_activity_detected" type="%s" client="%s"', detection_type, _client_log_id())
 
 
 def _sign_count_regressed(credential_payload, stored_sign_count) -> bool:
@@ -1038,13 +1039,13 @@ def list_audit_events():
     except ValueError:
         return api_error("Invalid limit or offset", 400)
     table = models.AuditEvent.__table__
-    query = select(table).order_by(table.c.occurred_at.desc()).limit(limit).offset(offset)
+    identity_id = current_identity_id()
+    if not identity_id:
+        return api_error("No identity", 403)
+    # Always scope to the current identity (tenant isolation)
+    query = select(table).where(table.c.identity_id == identity_id).order_by(table.c.occurred_at.desc()).limit(limit).offset(offset)
     if event_type:
         query = query.where(table.c.event_type == event_type)
-    # Only show events for the current identity
-    identity_id = current_identity_id()
-    if identity_id:
-        query = query.where(table.c.identity_id == identity_id)
     rows = db().execute(query).mappings().all()
     events = []
     for row in rows:
@@ -1068,17 +1069,20 @@ def acknowledge_audit_event(event_id):
     if denied: return denied
     table = models.AuditEvent.__table__
     conn = db()
-    # Verify the event exists and belongs to this identity
     identity_id = current_identity_id()
+    # Verify the event exists AND belongs to this identity (tenant isolation)
     existing = conn.execute(
-        select(table.c.id).where(table.c.id == event_id)
+        select(table.c.id).where(
+            table.c.id == event_id,
+            table.c.identity_id == identity_id,
+        )
     ).first()
     if not existing:
         return api_error("Event not found", 404)
-    # Mark as acknowledged
+    # Mark as acknowledged (scoped to this identity)
     conn.execute(
         update(table)
-        .where(table.c.id == event_id)
+        .where(table.c.id == event_id, table.c.identity_id == identity_id)
         .values(acknowledged_at=func.now(), acknowledged_by=identity_id)
     )
     _audit_event("INCIDENT_ACKNOWLEDGED", detail={"acknowledged_event_id": event_id})

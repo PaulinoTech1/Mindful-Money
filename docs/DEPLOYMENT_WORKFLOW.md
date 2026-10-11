@@ -77,3 +77,25 @@ Actions UI.
 
 See `docs/CLOUD_RUN_TROUBLESHOOTING.md` for the full history of manual
 deploy issues that motivated this change.
+
+## ZKP artifacts (disabled in production)
+
+The ZKP manual expense proof feature requires:
+- `zkp/manual_expense/target/vk` (verification key, 3.6KB, in repo)
+- `bb` executable (Barretenberg prover/verifier, not in repo)
+
+The `.dockerignore` excludes `zkp/`, so the production Cloud Run image does
+not include these artifacts. The app logs `zkp_artifacts_available=0` at
+startup and ZKP proof verification is disabled.
+
+**Impact:** The `/api/zkp/challenge` and `/api/records/manual` endpoints will
+return 503 (ZKP unavailable). Normal encrypted record storage (`/api/records`)
+is unaffected.
+
+**To enable:** Build the `bb` binary for linux/amd64, include it in the Docker
+image, and set `ZKP_BB_EXECUTABLE` and `ZKP_MANUAL_EXPENSE_VK_PATH`. This is
+not currently done because the ZKP feature is experimental and the binary
+build is non-trivial.
+
+**Status:** Honest limitation, not a bug. The feature is documented as
+unavailable in production until the artifacts are properly packaged.

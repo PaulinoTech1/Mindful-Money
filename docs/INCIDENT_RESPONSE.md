@@ -21,22 +21,22 @@ PROJECT="project-c89a7f58-b865-4112-bf8"
 SERVICE="mindful-money"
 
 # 1. Suspicious WebAuthn counter (possible cloned authenticator)
-gcloud logging metrics create mm_suspicious_counter \
+gcloud logging metrics create mm_suspicious_counter_event \
   --project=$PROJECT \
   --description="WebAuthn sign count regression - possible cloned authenticator" \
-  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"suspicious_counter\""
+  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"suspicious_counter_event\""
 
 # 2. Passkey auth failures (brute force indicator)
-gcloud logging metrics create mm_auth_failures \
+gcloud logging metrics create mm_authentication_failures \
   --project=$PROJECT \
   --description="Passkey authentication failures" \
-  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"passkey_auth_failure\""
+  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"authentication_failure\""
 
 # 3. Unusual activity detections
 gcloud logging metrics create mm_unusual_activity \
   --project=$PROJECT \
   --description="Browser-side unusual activity detector triggered" \
-  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"unusual_activity\""
+  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"unusual_activity_detected\""
 
 # 4. Rate limiting (potential abuse)
 gcloud logging metrics create mm_rate_limited \
@@ -62,7 +62,7 @@ gcloud alpha monitoring policies create \
   --project=$PROJECT \
   --display-name="Mindful Money: Possible cloned authenticator" \
   --condition-display-name="Suspicious WebAuthn counter" \
-  --condition-filter="metric.type=\"logging.googleapis.com/user/mm_suspicious_counter\"" \
+  --condition-filter="metric.type=\"logging.googleapis.com/user/mm_suspicious_counter_event\"" \
   --condition-threshold-value=1 \
   --condition-threshold-comparison="COMPARISON_GT" \
   --condition-threshold-duration="0s" \
@@ -101,7 +101,7 @@ gcloud alpha monitoring channels create \
 ```bash
 # Recent suspicious events
 gcloud logging read \
-  "resource.type=cloud_run_revision AND resource.labels.service_name=\"mindful-money\" AND (jsonPayload.event=\"suspicious_counter\" OR jsonPayload.event=\"passkey_auth_failure\")" \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=\"mindful-money\" AND (jsonPayload.event=\"suspicious_counter_event\" OR jsonPayload.event=\"authentication_failure\")" \
   --limit 20 --format json --freshness 1h
 ```
 
@@ -177,8 +177,8 @@ means the authenticator was likely cloned.
 Create a Cloud Monitoring dashboard for at-a-glance status:
 
 **Widgets to include:**
-- Auth success/failure rate (from `mm_auth_failures` metric)
-- Suspicious counter events (from `mm_suspicious_counter`)
+- Auth success/failure rate (from `mm_authentication_failures` metric)
+- Suspicious counter events (from `mm_suspicious_counter_event`)
 - Request rate and latency (automatic Cloud Run metrics)
 - Error rate (from `mm_app_errors`)
 - Instance count (automatic Cloud Run metric)
