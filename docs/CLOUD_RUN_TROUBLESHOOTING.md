@@ -277,3 +277,49 @@ alembic upgrade head
 
 The secret value stays in the shell environment and is never printed
 or pasted into chat.
+
+## App returns 500: Could not parse SQLAlchemy URL
+
+**Symptom:** Cloud Run logs show:
+```
+sqlalchemy.exc.ArgumentError: Could not parse SQLAlchemy URL from given URL string
+```
+at `db.py` line 30 in `_ensure_bound()` when calling `create_engine()`.
+
+**Cause:** The `VAULT_DATABASE_URL` secret contains an invalid value.
+Common cases:
+- Still has the placeholder text from initial setup
+- Missing the `postgresql://` scheme prefix
+- Truncated or has a trailing newline issue
+- Special characters in the password not URL-encoded
+
+**Diagnosis:** Check the secret length without printing it:
+```bash
+gcloud secrets versions access latest --secret=neon-db-url | wc -c
+```
+A valid Neon URL is 80+ characters. If it's under 50, it's the placeholder.
+
+**Fix:** Add a new version with the real URL using `read -s` to avoid
+shell history:
+```bash
+read -s NEON_URL
+# Paste the URL when prompted (hidden input), press Enter
+echo -n "$NEON_URL" | gcloud secrets versions add neon-db-url --data-file=-
+unset NEON_URL
+```
+
+The Cloud Run revision uses `neon-db-url:latest`, so it picks up the new
+version on the next container startup. If the app is already running,
+trigger a new revision:
+```bash
+gcloud run deploy mindful-money \
+  --image us-central1-docker.pkg.dev/PROJECT_ID/mindful-money/app:latest \
+  --region us-central1
+```
+
+**Valid format:**
+```
+postgresql://user:password@ep-xxx-xxx.us-east-2.aws.neon.tech/dbname?sslmode=require
+```
+Use the pooled connection string from the Neon dashboard (contains `-pooler`
+in the hostname).
