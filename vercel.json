@@ -1,1 +1,12 @@
-{"builds":[{"src":"app.py","use":"@vercel/python"}],"routes":[{"dest":"/static/$1","src":"/static/(.*)"},{"dest":"app.py","src":"/(.*)"}],"version":2}
+{
+  "version": 2,
+  "functions": {
+    "app.py": {
+      "runtime": "python3.12"
+    }
+  },
+  "routes": [
+    { "src": "/static/(.*)", "dest": "/static/$1" },
+    { "src": "/(.*)", "dest": "app.py" }
+  ]
+}
