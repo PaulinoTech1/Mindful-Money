@@ -226,3 +226,54 @@ permissions are confirmed working. If Step 2 then fails, the issue is
 isolated to Cloud Run configuration (env vars, secrets, IAM), not the
 build pipeline. This bisects the problem instead of debugging the
 opaque combined flow.
+
+## Cloud Build uses Compute service account, not Cloud Build SA
+
+**Symptom:** Push to Artifact Registry fails with permission denied,
+even after granting `roles/artifactregistry.writer` to
+`PROJECT_NUMBER@cloudbuild.gserviceaccount.com`.
+
+**Cause:** The build log shows:
+```
+The service account running this build .../serviceAccounts/PROJECT_NUMBER-compute@developer.gserviceaccount.com
+```
+Cloud Build is using the Compute Engine default service account, not
+the Cloud Build service account. The IAM grant went to the wrong identity.
+
+**Fix:** Grant the role to the Compute service account instead:
+```bash
+gcloud artifacts repositories add-iam-policy-binding mindful-money \
+  --location=us-central1 \
+  --member="serviceAccount:PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
+```
+
+## Alembic not found after pip install in Cloud Shell
+
+**Symptom:** `pip install alembic` succeeds but `alembic: command not found`.
+
+**Cause:** Cloud Shell installs user packages to `~/.local/lib/python3.12/site-packages`
+with binaries in `~/.local/bin`, which is not in the default PATH.
+
+**Fix:**
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Or use the module directly:
+```bash
+python3 -m alembic upgrade head
+```
+
+## Running migrations from Cloud Shell
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+pip install alembic sqlalchemy "psycopg[binary]"
+export VAULT_DATABASE_URL=$(gcloud secrets versions access latest --secret=neon-db-url)
+cd ~/Mindful-Money/Mindful-Money
+alembic upgrade head
+```
+
+The secret value stays in the shell environment and is never printed
+or pasted into chat.
