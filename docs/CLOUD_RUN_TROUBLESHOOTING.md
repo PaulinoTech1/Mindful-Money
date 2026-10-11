@@ -181,3 +181,48 @@ gcloud artifacts repositories add-iam-policy-binding mindful-money \
   --member="serviceAccount:PROJECT_NUMBER@cloudbuild.gserviceaccount.com" \
   --role="roles/artifactregistry.writer"
 ```
+
+## `gcloud run deploy --source` fails after Docker build succeeds
+
+**Symptom:** Multiple `gcloud run deploy --source .` attempts fail with
+"Build failed" even though `gcloud builds describe` shows the Docker step
+as SUCCESS. The image never appears in Artifact Registry
+(`gcloud artifacts docker images list` returns 0 items).
+
+**What was tried:**
+1. Enabled Secret Manager, Cloud Build, and Artifact Registry APIs
+2. Created the Artifact Registry repository `mindful-money`
+3. Granted `roles/artifactregistry.writer` to the Cloud Build service account
+4. Granted `roles/storage.objectViewer` to the Compute service account
+5. Granted `roles/secretmanager.secretAccessor` to the Cloud Run runtime
+   service account for both secrets
+
+**Hypothesis:** The `--source .` flow uses an internal registry path that
+does not match the manually created Artifact Registry repository. The
+push target is opaque and not configurable, making IAM debugging difficult.
+
+**Next try: Separate build from deploy**
+
+Instead of the combined `--source` flow, split into two explicit steps.
+This gives full control over the image tag and registry path:
+
+```bash
+# Step 1: Build and push to our known Artifact Registry path
+gcloud builds submit \
+  --region us-central1 \
+  --tag us-central1-docker.pkg.dev/PROJECT_ID/mindful-money/app:latest \
+  .
+
+# Step 2: Deploy from the pushed image (no build involved)
+gcloud run deploy mindful-money \
+  --image us-central1-docker.pkg.dev/PROJECT_ID/mindful-money/app:latest \
+  --region us-central1 \
+  --set-env-vars "VAULT_ENV=production,..." \
+  --set-secrets "VAULT_SECRET_KEY=mindful-money-secret:latest,VAULT_DATABASE_URL=neon-db-url:latest"
+```
+
+**Justification:** If Step 1 succeeds, the Dockerfile and registry
+permissions are confirmed working. If Step 2 then fails, the issue is
+isolated to Cloud Run configuration (env vars, secrets, IAM), not the
+build pipeline. This bisects the problem instead of debugging the
+opaque combined flow.
