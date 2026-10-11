@@ -361,3 +361,54 @@ value secret. The extra clicks in the web UI are worth eliminating
 the shell history risk entirely. The `read -s` method is documented
 as a fallback for automation, but manual web UI entry is preferred
 for one-time setup.
+
+## Frontend calls removed API endpoint (ZK refactor leftover)
+
+**Symptom:** Browser console shows:
+```
+/api/relay/sources:1 Failed to load resource: 404
+app.js:28 Uncaught (in promise) Error: Request failed.
+    at apiFetch (app.js:28:19)
+    at async app.js:1488:19
+```
+The app stuck on "Loading cryptography..." and never proceeds.
+
+**Cause:** The zero-knowledge refactor removed the server-side SimpleFin
+relay (`/api/relay` and `/api/relay/sources`), but `static/app.js` still
+called `/api/relay/sources` during boot to check if SimpleFin was available.
+The 404 threw an uncaught promise rejection that halted initialization
+before libsodium could finish loading.
+
+**Fix:** Remove the call. SimpleFin is now always available client-side
+(it's just JavaScript in `simplefin-client.js`). In `static/app.js`:
+```javascript
+// Before:
+const sources = await api('/api/relay/sources'); SIMPLEFIN_AVAILABLE = sources.simplefin_available;
+// After:
+SIMPLEFIN_AVAILABLE = true;
+```
+
+**Lesson:** When removing server endpoints, grep the frontend for all
+references. The refactor removed the Flask routes but missed the JS
+caller. A pre-deploy checklist should include: "search frontend for
+removed endpoint paths."
+
+## Current deployment status (2026-10-11)
+
+**Working:**
+- Cloud Run service deployed and running
+- Database migrations completed (3 migrations applied)
+- Secrets in Secret Manager (Flask key, Neon URL)
+- WebAuthn RP_ID/ORIGIN configured for the Cloud Run URL
+- Docker build pipeline functional
+
+**Not working:**
+- Frontend boot blocked by the `/api/relay/sources` 404 (fix pushed,
+  awaiting redeploy)
+- Browser IAM access: Cloud Run IAM incompatible with browser navigation,
+  removed in favor of app-level WebAuthn
+
+**Honest assessment:** The infrastructure is solid. The app deploys,
+connects to the database, and serves pages. The remaining issue is a
+frontend bug from an incomplete refactor, not an infrastructure problem.
+Once the fixed `app.js` is deployed, the app should be fully functional.
