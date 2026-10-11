@@ -135,3 +135,49 @@ docker build -t mindful-money-test .
 
 This catches Dockerfile syntax errors, missing files, and dependency
 issues before involving GCP.
+
+## Cloud Run cannot access Secret Manager secrets
+
+**Symptom:** Deploy fails after Docker build succeeds. The container
+cannot start because it cannot read the secrets.
+
+**Cause:** The Cloud Run runtime service account
+(`PROJECT_NUMBER-compute@developer.gserviceaccount.com`) does not have
+the `secretmanager.secretAccessor` role on the secrets.
+
+**Fix:**
+```bash
+PROJECT_NUMBER=$(gcloud projects describe PROJECT_ID --format="value(projectNumber)")
+
+gcloud secrets add-iam-policy-binding mindful-money-secret \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+
+gcloud secrets add-iam-policy-binding neon-db-url \
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+## Artifact Registry push denied
+
+**Symptom:** `gcloud builds submit` succeeds in building but fails pushing:
+```
+denied: Permission 'artifactregistry.repositories.uploadArtifacts' denied
+```
+
+**Cause:** The Artifact Registry repository does not exist, or the Cloud
+Build service account lacks push permission.
+
+**Fix:**
+```bash
+# Create the repository
+gcloud artifacts repositories create mindful-money \
+  --repository-format=docker \
+  --location=us-central1
+
+# Grant Cloud Build push access
+gcloud artifacts repositories add-iam-policy-binding mindful-money \
+  --location=us-central1 \
+  --member="serviceAccount:PROJECT_NUMBER@cloudbuild.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
+```
