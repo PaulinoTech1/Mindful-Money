@@ -1,0 +1,10 @@
+# Cloud Run ignores most files; keep the image lean
+.git/
+.github/
+screenshots/
+zkp/
+deploy/
+docker-compose.yml
+test_*.py
+*.md
+!README.md
