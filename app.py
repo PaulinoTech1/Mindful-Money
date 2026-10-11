@@ -257,7 +257,11 @@ CSP = "; ".join([
     "default-src 'none'", "base-uri 'none'", "object-src 'none'", "frame-ancestors 'none'",
     "form-action 'self'", "script-src 'self' 'wasm-unsafe-eval'", "script-src-attr 'none'",
     "style-src 'self'", "style-src-attr 'none'", "img-src 'self' data:", "font-src 'self'",
-    "connect-src 'self'", "worker-src 'self'", "manifest-src 'self'", "media-src 'none'", "frame-src 'none'",
+    # connect-src allows https: (not just 'self') because SimpleFin bridge
+    # fetches happen client-side directly to user-configured bridge hosts.
+    # The client validates HTTPS and refuses redirects. Server never sees
+    # the access URL or plaintext.
+    "connect-src 'self' https:", "worker-src 'self'", "manifest-src 'self'", "media-src 'none'", "frame-src 'none'",
 ] + (["upgrade-insecure-requests"] if PRODUCTION else []))
 
 
