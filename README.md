@@ -241,6 +241,44 @@ Flask development server or a public Gunicorn TCP listener. See
 TLS, exact-origin WebAuthn configuration, filesystem permissions, systemd
 confinement, persistent rate limits, backup/restore, upgrades, and validation.
 
+### Cloud Run deployment
+
+The recommended managed deployment is Google Cloud Run. See
+[`docs/HOSTING_DECISION.md`](docs/HOSTING_DECISION.md) for why Cloud Run was
+chosen over Vercel, Render, and other options.
+
+```bash
+# From Google Cloud Shell (already authenticated)
+
+# Enable required APIs (one-time)
+gcloud services enable run.googleapis.com secretmanager.googleapis.com cloudbuild.googleapis.com
+
+# Create secrets
+openssl rand -base64 64 | tr -d '\n' | gcloud secrets create mindful-money-secret --data-file=-
+echo -n "YOUR_NEON_URL" | gcloud secrets create neon-db-url --data-file=-
+
+# Deploy (private - no --allow-unauthenticated)
+gcloud run deploy mindful-money \
+  --source . \
+  --region us-central1 \
+  --set-env-vars "VAULT_ENV=production,VAULT_AUTH_POLICY=required,VAULT_RP_ID=placeholder,VAULT_ORIGIN=https://placeholder,VAULT_TRUST_PROXY=1,VAULT_CSP_MODE=enforce" \
+  --set-secrets "VAULT_SECRET_KEY=mindful-money-secret:latest,VAULT_DATABASE_URL=neon-db-url:latest"
+
+# Grant yourself access (private service)
+gcloud run services add-iam-policy-binding mindful-money \
+  --region us-central1 \
+  --member="user:YOUR_EMAIL@gmail.com" \
+  --role="roles/run.invoker"
+
+# Update RP_ID and ORIGIN to the real URL, then redeploy
+gcloud run deploy mindful-money \
+  --region us-central1 \
+  --update-env-vars "VAULT_RP_ID=actual-host.run.app,VAULT_ORIGIN=https://actual-host.run.app"
+```
+
+See [`docs/CLOUD_RUN_TROUBLESHOOTING.md`](docs/CLOUD_RUN_TROUBLESHOOTING.md)
+for common deployment issues and fixes.
+
 Flask emits a strict CSP (`default-src 'none'`, self-only scripts/styles/connect,
 no inline handlers/styles, narrow `wasm-unsafe-eval` for vendored libsodium),
 application security headers, sensitive-response `no-store`, and production
