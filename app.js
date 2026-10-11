@@ -150,8 +150,9 @@ async function load() {
 
   // Migrate older ciphertext in-browser when it predates encrypted account
   // metadata. The server still receives only re-sealed records.
+  // Zero-knowledge: demo metadata is generated client-side.
   if (decrypted.some((t) => !t.bank || !t.account_label || !t.account_type || t.bank === 'Wells Forclosure')) {
-    const { transactions } = await (await fetch('/api/relay', { method: 'POST' })).json();
+    const transactions = generateDemoTransactions(6);
     const metadata = new Map(transactions.map((t) => [t.account, {
       bank: t.bank, account_label: t.account_label, account_type: t.account_type,
     }]));
@@ -177,10 +178,11 @@ async function load() {
 async function connect() {
   $('connectBtn').disabled = true;
   $('syncBtn').disabled = true;
-  $('connectNote').textContent = 'Fetching from bank\u2026';
+  $('connectNote').textContent = 'Generating demo transactions in your browser\u2026';
 
-  // The server relays plaintext in this response and stores none of it.
-  const { transactions } = await (await fetch('/api/relay', { method: 'POST' })).json();
+  // Zero-knowledge: demo data is generated client-side. The server never
+  // sees plaintext. Previously this called /api/relay which has been removed.
+  const transactions = generateDemoTransactions(6);
 
   $('connectNote').textContent = `Encrypting ${transactions.length} transactions in your browser\u2026`;
   await new Promise((r) => setTimeout(r, 30));
@@ -197,6 +199,51 @@ async function connect() {
   });
 
   $('connectNote').textContent = '';
+  $('connectBtn').disabled = false;
+  $('syncBtn').disabled = false;
+  await load();
+}
+
+async function connectSimpleFin() {
+  const accessUrl = prompt(
+    'Paste your SimpleFin access URL.\n\n' +
+    'It stays in your browser and is never sent to the server. ' +
+    'Get one from your bank via a SimpleFin bridge app.'
+  );
+  if (!accessUrl || !accessUrl.trim()) return;
+
+  $('connectSimplefinBtn').disabled = true;
+  $('connectBtn').disabled = true;
+  $('syncBtn').disabled = true;
+  $('connectNote').textContent = 'Fetching from SimpleFin in your browser\u2026';
+
+  let transactions;
+  try {
+    transactions = await fetchSimpleFinTransactions(accessUrl.trim(), 90);
+  } catch (e) {
+    $('connectNote').textContent = `SimpleFin error: ${e.message}`;
+    $('connectSimplefinBtn').disabled = false;
+    $('connectBtn').disabled = false;
+    $('syncBtn').disabled = false;
+    return;
+  }
+
+  $('connectNote').textContent = `Encrypting ${transactions.length} transactions in your browser\u2026`;
+  await new Promise((r) => setTimeout(r, 30));
+
+  const sealedRows = transactions.map((t) => ({
+    blind_index: blindIndex(t.id),
+    sealed: seal(t),
+  }));
+
+  await fetch('/api/records', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ records: sealedRows }),
+  });
+
+  $('connectNote').textContent = '';
+  $('connectSimplefinBtn').disabled = false;
   $('connectBtn').disabled = false;
   $('syncBtn').disabled = false;
   await load();
@@ -789,6 +836,10 @@ async function resetPassphrase() {
   $('pass').addEventListener('input', updatePassphraseEntropy);
   $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
   $('connectBtn').addEventListener('click', connect);
+  $('connectSimplefinBtn').addEventListener('click', connectSimpleFin);
+  // Show the SimpleFin button; the access URL is entered in-browser and
+  // never sent to the server.
+  $('connectSimplefinBtn').hidden = false;
   $('syncBtn').addEventListener('click', connect);
   $('viewToggle').addEventListener('click', toggleView);
   $('resetBtn').addEventListener('click', reset);

@@ -34,9 +34,7 @@ from webauthn.helpers.structs import (
 )
 
 import db as dbmod
-import fakebank
 import models
-import simplefin
 import zkp_verifier
 
 STATIC = Path(__file__).parent / "static"
@@ -133,7 +131,6 @@ RATE_LIMITS = {
     "login_verify": (int(os.environ.get("VAULT_RATE_LOGIN_VERIFY", "10")), 600),
     "registration": (int(os.environ.get("VAULT_RATE_REGISTRATION", "10")), 3600),
     "upload": (int(os.environ.get("VAULT_RATE_UPLOAD", "10")), 60),
-    "relay": (int(os.environ.get("VAULT_RATE_RELAY", "6")), 60),
     "delete": (int(os.environ.get("VAULT_RATE_DELETE", "3")), 3600),
     "zkp_challenge": (int(os.environ.get("VAULT_RATE_ZKP_CHALLENGE", "20")), 300),
     # Proof verification shells out to `bb` -- meaningfully more expensive
@@ -216,7 +213,6 @@ def _rate_group():
     if path.startswith("/api/passkeys/register/"): return "registration"
     if path == "/api/records" and method == "POST": return "upload"
     if path == "/api/records" and method == "DELETE": return "delete"
-    if path == "/api/relay": return "relay"
     if path == "/api/zkp/challenge": return "zkp_challenge"
     if path == "/api/records/manual": return "zkp_verify"
     if path == "/api/logout": return "logout"
@@ -564,45 +560,6 @@ def logout():
     session.clear()
     LOG.info('event="session_revoked" client="%s"', _client_log_id())
     return jsonify({"signed_out": True})
-
-@app.get("/api/relay/sources")
-def relay_sources():
-    # The legacy environment credential belongs only to the compatibility
-    # tenant. Never expose that bank feed to another authenticated identity.
-    available = current_identity_id() == DEFAULT_IDENTITY_ID and bool(os.environ.get("SIMPLEFIN_ACCESS_URL"))
-    return jsonify({"simplefin_available": available})
-
-@app.post("/api/relay")
-def relay():
-    denied = require_access()
-    if denied: return denied
-    owner_id = current_identity_id()
-    source = "fakebank"
-    if request.mimetype == "application/json" and request.data:
-        payload, error = _json_object()
-        if error: return error
-        if set(payload) - {"source"}: return api_error("Unknown field in relay request", 400)
-        source = payload.get("source", "fakebank")
-        if source not in {"fakebank", "simplefin"}: return api_error("Unknown transaction source", 400)
-    if source == "simplefin":
-        if owner_id != DEFAULT_IDENTITY_ID:
-            return api_error("SimpleFin is not configured for this account", 503)
-        try:
-            transactions = simplefin.generate()
-        except simplefin.SimpleFinNotConfigured:
-            return api_error("SimpleFin is not configured on this server", 503)
-        except simplefin.SimpleFinAccessRevoked:
-            LOG.warning('event="simplefin_fetch_failed" reason="access_revoked" client="%s"', _client_log_id())
-            return api_error(
-                "SimpleFin declined this connection. The stored access URL may have been "
-                "claimed elsewhere or revoked -- disable it and set up SimpleFin again.", 502,
-            )
-        except simplefin.SimpleFinError:
-            LOG.warning('event="simplefin_fetch_failed" client="%s"', _client_log_id())
-            return api_error("Could not fetch accounts from SimpleFin", 502)
-    else:
-        transactions = fakebank.generate(months=6)
-    return jsonify({"transactions": transactions})
 
 @app.post("/api/records")
 def put_records():
