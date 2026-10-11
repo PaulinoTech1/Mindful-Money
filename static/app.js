@@ -1518,3 +1518,4 @@ async function disablePasskeys() {
   if (PASSKEY_REQUIRED && !PASSKEY_AUTHENTICATED) { $('gate').hidden = true; $('passkeyGate').hidden = false; }
   else $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';
 })();
+// Deploy trigger 20261011225949
