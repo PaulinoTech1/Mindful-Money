@@ -454,3 +454,30 @@ separately under "impersonation." The error message
    (this is the step most often missed)
 6. Add `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT` as
    GitHub Actions secrets
+
+## GitHub Actions: gcloud uses wrong project
+
+**Symptom:** Workflow fails at "Deploy to Cloud Run" with:
+```
+ERROR: (gcloud.run.deploy) PERMISSION_DENIED: Cloud Run Admin API has not
+been used in project developer before or it is disabled.
+```
+
+**Cause:** The `gcloud` CLI in the GitHub Actions runner defaults to a
+project named `developer` (derived from the service account credentials)
+instead of the actual GCP project. The `--project` flag was missing from
+the deploy command.
+
+**Fix:** Add `--project ${{ env.PROJECT_ID }}` explicitly to all `gcloud`
+commands in the workflow:
+```yaml
+gcloud run deploy ${{ env.SERVICE_NAME }} \
+  --image "${{ env.IMAGE }}" \
+  --region ${{ env.REGION }} \
+  --project ${{ env.PROJECT_ID }} \
+  ...
+```
+
+**Lesson:** Never rely on gcloud's default project in CI. The credential
+file override (`gha-creds-*.json`) sets an unexpected default. Always
+pass `--project` explicitly in automation.
