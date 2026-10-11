@@ -107,3 +107,31 @@ gcloud run services list --region us-central1
 - Artifact Registry API not enabled: `gcloud services enable artifactregistry.googleapis.com`
 - Insufficient permissions for the Cloud Build service account to push images
 - The `--source .` upload succeeded but the image push failed silently
+
+## Testing the build without deploying
+
+To isolate whether the issue is the Docker build or the Cloud Run deploy:
+
+```bash
+# Build only (no deploy) - tags the image but doesn't run it
+gcloud builds submit \
+  --region us-central1 \
+  --tag us-central1-docker.pkg.dev/PROJECT_ID/mindful-money/test:latest \
+  .
+```
+
+If this succeeds, the Dockerfile is fine and the issue is in the
+deploy phase (IAM, secrets, env vars). If it fails, the issue is
+in the Docker build itself.
+
+## Manual Docker build test
+
+If Cloud Build logs are empty, test the Dockerfile locally first
+(requires Docker installed):
+
+```bash
+docker build -t mindful-money-test .
+```
+
+This catches Dockerfile syntax errors, missing files, and dependency
+issues before involving GCP.
