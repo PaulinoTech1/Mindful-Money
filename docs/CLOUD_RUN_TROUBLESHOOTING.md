@@ -82,3 +82,28 @@ gcloud run services add-iam-policy-binding mindful-money \
   --member="user:YOUR_EMAIL@gmail.com" \
   --role="roles/run.invoker"
 ```
+
+## Docker build succeeds but deploy fails
+
+**Symptom:** `gcloud builds describe` shows the `gcr.io/cloud-builders/docker`
+step as SUCCESS, but overall build status is FAILURE with empty logs.
+
+**Cause:** The failure is in the push to Artifact Registry or the Cloud Run
+deployment phase, not the Docker build itself. The Dockerfile is fine.
+
+**Diagnosis:**
+```bash
+# Get the latest build ID
+BUILD_ID=$(gcloud builds list --region us-central1 --limit 1 --format="value(id)")
+
+# Check step statuses
+gcloud builds describe $BUILD_ID --region us-central1 --format="json(steps[].name, steps[].status)"
+
+# Check if the service was created despite the failure
+gcloud run services list --region us-central1
+```
+
+**Common causes:**
+- Artifact Registry API not enabled: `gcloud services enable artifactregistry.googleapis.com`
+- Insufficient permissions for the Cloud Build service account to push images
+- The `--source .` upload succeeded but the image push failed silently
