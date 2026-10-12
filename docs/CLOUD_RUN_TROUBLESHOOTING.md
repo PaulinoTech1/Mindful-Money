@@ -504,3 +504,50 @@ gcloud iam service-accounts add-iam-policy-binding \
 ```
 
 Wait 2-3 minutes for IAM propagation, then re-run the workflow.
+
+## _seed_identity NotNullViolation on passkey_required (2026-10-12)
+
+**Symptom:** Every `/api/*` request returns 503 with
+`{"error":"The request could not be completed"}`. `/health` returns 200.
+Smoke tests fail on `/api/version` and `/api/passkeys/status`. No error
+appears in Cloud Run logs because the `SQLAlchemyError` handler does not
+log the exception.
+
+**Root cause:** `_seed_identity()` in `db.py` inserts the bootstrap
+identity row with only `id` and `user_handle`, relying on the Python-side
+`default=False` for the `passkey_required` column. That default does not
+fire on a Core `pg_insert` (it is an ORM-flush behavior), so PostgreSQL
+receives NULL for a NOT NULL column with no server default:
+
+```
+psycopg.errors.NotNullViolation: null value in column "passkey_required"
+of relation "vault_identity" violates not-null constraint
+```
+
+The rate limiter's `before_request` handler calls `db()` on every
+`/api/*` request, which calls `_seed_identity()`, so a single missing
+default takes down the entire API surface while `/health` (no DB touch)
+stays green.
+
+**Fix:** Set the value explicitly instead of relying on the default
+(`db.py`):
+
+```python
+.values(id=1, user_handle=secrets.token_bytes(32), passkey_required=False)
+```
+
+**Lesson:** Python-side column `default=` is not a substitute for a
+database `server_default` when using Core inserts (`pg_insert`,
+`insert()`). Either set values explicitly on Core inserts or add a
+`server_default` to the model. Silent error handlers
+(`@app.errorhandler(SQLAlchemyError)` returning 503 without logging)
+make this class of bug invisible in Cloud Logging; consider logging the
+exception before returning the generic error.
+
+**Diagnosis pattern:** reproduce the app's exact DB code path from Cloud
+Shell using the Secret Manager value directly (no paste):
+
+```bash
+export VAULT_DATABASE_URL=$(gcloud secrets versions access latest --secret=neon-db-url)
+python3 -c 'import os; from sqlalchemy import create_engine, inspect; e = create_engine(os.environ["VAULT_DATABASE_URL"]); print(sorted(inspect(e).get_table_names()))'
+```
