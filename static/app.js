@@ -1611,16 +1611,39 @@ async function disablePasskeys() {
 /* ---------- boot ---------- */
 
 (async () => {
-  const sessionInfo = await api('/api/session'); CSRF = sessionInfo.csrf_token;
-  const status = await api('/api/passkeys/status'); PASSKEY_REQUIRED = status.passkey_required; PASSKEY_AUTHENTICATED = status.authenticated; BOOTSTRAP_NEEDED = status.bootstrap_needed || false;
+  // Attach critical UI listeners first, so the page is interactive even
+  // if an API call fails. Previously a single failed fetch would abort
+  // the entire boot sequence and leave the UI dead.
+  try {
+    $('unlockBtn').addEventListener('click', unlock);
+    $('pass').addEventListener('input', updatePassphraseEntropy);
+    $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+    $('username').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+  } catch (e) {
+    console.error('Failed to attach UI listeners:', e);
+  }
+
+  try {
+    const sessionInfo = await api('/api/session'); CSRF = sessionInfo.csrf_token;
+    const status = await api('/api/passkeys/status');
+    PASSKEY_REQUIRED = status.passkey_required;
+    PASSKEY_AUTHENTICATED = status.authenticated;
+    BOOTSTRAP_NEEDED = status.bootstrap_needed || false;
+  } catch (e) {
+    console.error('Failed to fetch session status:', e);
+    // Continue with defaults; user can still try to unlock
+  }
   SIMPLEFIN_AVAILABLE = true;
-  await sodium.ready;
-  S = sodium;
-  $('username').value = localStorage.getItem('vault_username') || '';
-  $('unlockBtn').addEventListener('click', unlock);
-  $('pass').addEventListener('input', updatePassphraseEntropy);
-  $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
-  $('username').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+  try {
+    await sodium.ready;
+    S = sodium;
+  } catch (e) {
+    console.error('Failed to init crypto:', e);
+    $('gateNote').textContent = 'Failed to load cryptography. Refresh the page.';
+    return;
+  }
+  try {
+    $('username').value = localStorage.getItem('vault_username') || '';
   $('connectBtn').addEventListener('click', () => connect('fakebank'));
   $('syncBtn').addEventListener('click', () => connect('fakebank'));
   $('connectSimplefinBtn').addEventListener('click', () => connect('simplefin'));
@@ -1658,5 +1681,9 @@ async function disablePasskeys() {
   }
   else if (PASSKEY_REQUIRED && !PASSKEY_AUTHENTICATED) { $('gate').hidden = true; $('passkeyGate').hidden = false; }
   else $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';
+  } catch (e) {
+    console.error('Boot failed:', e);
+    $('gateNote').textContent = 'Failed to initialize. Refresh the page.';
+  }
 })();
 // Deploy trigger 20261011225949
