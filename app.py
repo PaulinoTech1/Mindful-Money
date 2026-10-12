@@ -1103,7 +1103,7 @@ def bootstrap_verify():
         conn.rollback()
         LOG.warning('event="authentication_failure" category="bootstrap_verification" client="%s"', _client_log_id())
         return api_error("Passkey registration could not be verified", 400)
-    _rotate_session(identity_id=owner_id, authenticated_at=time.time(), vault_unlocked=True)
+    _rotate_session(identity_id=owner_id, vault_unlocked=True)
     LOG.info('event="passkey_registered" category="bootstrap" client="%s"', _client_log_id())
     return jsonify({"verified": True, "csrf_token": session["csrf_token"]})
 
@@ -1219,10 +1219,8 @@ def login_verify():
     # Clear any lockout by logging a success (resets the failure window)
     conn.commit()
     # Preserve only the browser's non-authoritative UI hint across rotation.
-    # Successful verify_authentication_response() above, or a successful
-    # bootstrap registration ceremony (which also proves authenticator
-    # possession with user verification), establishes a fresh
-    # authenticated_at timestamp.
+    # Successful verify_authentication_response() above is the sole
+    # application path that establishes a fresh authenticated_at timestamp.
     client_vault_open = bool(session.get("vault_unlocked"))
     _rotate_session(identity_id=row["identity_id"],authenticated_at=time.time(),vault_unlocked=client_vault_open)
     LOG.info('event="authentication_success" client="%s"', _client_log_id())
@@ -1454,11 +1452,18 @@ def generate_kdf_salts():
 
 @app.post("/api/kdf/salts/migrate")
 def migrate_kdf_salts():
-    """Migrate from browser-local salts to server salts.
+    """Migrate from browser-local salts to server salts, or set salts from backup.
     
-    The client provides its current (browser-local) salts. The server
-    stores them as the canonical salts, so existing records remain readable.
-    This is a one-time migration per identity.
+    The client provides salts. The server stores them as the canonical salts.
+    
+    Two cases:
+    1. Legacy migration: records exist but no server salts. Sets the client's
+       current salts so existing records remain readable.
+    2. Backup restore: no records exist yet, but salts were auto-generated during
+       unlock. Allows overwriting with backup's salts (with explicit `force` flag).
+    
+    This is a one-time operation per identity, unless `force` is used for the
+    empty-vault restore case.
     """
     denied = require_access()
     if denied: return denied
@@ -1469,6 +1474,7 @@ def migrate_kdf_salts():
     if error: return error
     salt_enc_hex = payload.get("salt_enc")
     salt_idx_hex = payload.get("salt_idx")
+    force = payload.get("force", False)
     if not salt_enc_hex or not salt_idx_hex:
         return api_error("salt_enc and salt_idx required", 400)
     try:
@@ -1487,10 +1493,10 @@ def migrate_kdf_salts():
     ).first()
     if not row:
         return api_error("Identity not found", 404)
-    if row.kdf_salt_enc is not None:
-        # Salts already set. Overwriting is only safe when no records exist
-        # (nothing was encrypted with the old salts) -- this is the
-        # backup-restore-to-empty-vault case.
+    if row.kdf_salt_enc is not None and not force:
+        return api_error("Salts already set. Use force=true to overwrite (empty vault only).", 409)
+    if row.kdf_salt_enc is not None and force:
+        # Only allow force-overwrite if no records exist (fresh vault restore)
         record_table = models.Record.__table__
         record_count = conn.execute(
             select(func.count()).select_from(record_table).where(
@@ -1498,8 +1504,10 @@ def migrate_kdf_salts():
             )
         ).scalar() or 0
         if record_count > 0:
-            return api_error("Salts already set and records exist. Cannot migrate.", 409)
-        LOG.info('event="kdf_salts_overwritten_empty_vault" client="%s"', _client_log_id())
+            return api_error(
+                "Cannot overwrite salts: records exist. This would make them unreadable.", 409
+            )
+        LOG.warning('event="kdf_salts_force_overwritten" client="%s"', _client_log_id())
     
     conn.execute(
         update(table)

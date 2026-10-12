@@ -1,0 +1,131 @@
+name: PR Verification
+
+# Runs on pull requests without deployment credentials.
+# Verifies code changes before merge. The deploy workflow runs separately
+# on main and has GCP deployment authority.
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vault
+          POSTGRES_PASSWORD: vault_test_password
+          POSTGRES_DB: vault_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+
+      - name: Security audit production dependencies
+        run: |
+          pip-audit --desc -r requirements.txt
+
+      - name: Wait for PostgreSQL
+        run: |
+          python3 -c "
+          import time, socket
+          for i in range(30):
+              try:
+                  s = socket.create_connection(('localhost', 5432), timeout=2)
+                  s.close()
+                  print('PostgreSQL ready')
+                  break
+              except:
+                  time.sleep(1)
+          "
+
+      - name: Run full test suite
+        run: |
+          python -m pytest test_demo.py test_zkp_server.py -v --tb=short --no-header -rA
+        env:
+          VAULT_ENV: test
+          VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_test
+
+      - name: Verify migration chain
+        run: |
+          python3 << 'PYEOF'
+          import os, re, sys
+          versions_dir = 'migrations/versions'
+          revisions = {}
+          for f in sorted(os.listdir(versions_dir)):
+              if f.endswith('.py'):
+                  with open(os.path.join(versions_dir, f)) as fp:
+                      content = fp.read()
+                      rev = re.search(r'^revision:\s*str\s*=\s*["\']([^"\']+)["\']', content, re.M)
+                      down = re.search(r'^down_revision.*=[\s]*["\']([^"\']+)["\']', content, re.M)
+                      if rev:
+                          revisions[rev.group(1)] = down.group(1) if down else None
+          errors = sum(1 for rev, down in revisions.items() if down and down not in revisions)
+          if errors:
+              print(f"FAILED: {errors} broken migration references")
+              sys.exit(1)
+          print("Migration chain OK")
+          PYEOF
+
+  browser-test:
+    runs-on: ubuntu-latest
+    needs: verify
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vault
+          POSTGRES_PASSWORD: vault_test_password
+          POSTGRES_DB: vault_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          pip install playwright
+          python -m playwright install chromium --with-deps
+
+      - name: Run browser E2E test
+        run: |
+          python test_browser.py --headless 2>&1 | head -50
+        env:
+          VAULT_ENV: test
+          VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_test

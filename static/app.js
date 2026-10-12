@@ -63,9 +63,16 @@ const SALT_KEY_IDX = 'mm_salt_idx';
 
 async function getSalts() {
   // Fetch per-identity KDF salts from the server. Salts are not secret,
-  // just unique. The server generates random salts on first use.
-  // Falls back to localStorage for backward compatibility with existing
-  // vaults created before server-side salts were implemented.
+  // just unique per identity.
+  //
+  // STRICT: This function fails closed. It does NOT silently fall back to
+  // localStorage on auth errors (401/403) or server errors (500/network).
+  // Silent fallback would change key derivation without the user's knowledge,
+  // making existing records unreadable or creating a split-brain vault.
+  //
+  // The ONLY fallback is for legacy vaults: if localStorage already contains
+  // salts from before server-side salts existed, use those. Never generate
+  // new localStorage salts here.
   if (CACHED_SALTS) return CACHED_SALTS;
   try {
     const data = await api('/api/kdf/salts');
@@ -85,12 +92,23 @@ async function getSalts() {
       };
       return CACHED_SALTS;
     }
-    // Fallback: localStorage salts for legacy vaults
-    console.warn('Server salts unavailable, using localStorage fallback');
-    return {
-      enc: getOrCreateSalt(SALT_KEY_ENC),
-      idx: getOrCreateSalt(SALT_KEY_IDX),
-    };
+    // 401/403: authentication problem. Do NOT fall back; the user must auth.
+    if (e.status === 401 || e.status === 403) {
+      throw new Error('Authentication required for KDF salts. Please log in.');
+    }
+    // Legacy vaults: only use localStorage if salts ALREADY exist there.
+    // Never generate new localStorage salts (would create split-brain).
+    const existingEnc = localStorage.getItem(SALT_KEY_ENC);
+    const existingIdx = localStorage.getItem(SALT_KEY_IDX);
+    if (existingEnc && existingIdx) {
+      console.warn('Using legacy localStorage salts (vault predates server-side salts)');
+      return {
+        enc: Uint8Array.from(existingEnc.match(/../g).map(h => parseInt(h, 16))),
+        idx: Uint8Array.from(existingIdx.match(/../g).map(h => parseInt(h, 16))),
+      };
+    }
+    // No legacy salts, server error: fail closed
+    throw new Error('Could not retrieve KDF salts: ' + (e.message || 'server error'));
   }
 }
 
@@ -1635,10 +1653,19 @@ async function exportBackup() {
       })),
     };
 
-    // Compute integrity hash over canonical records array
-    const canonical = JSON.stringify(backup.records);
-    const hash = S.crypto_hash_sha256(S.from_string(canonical));
-    backup.integrity = S.to_hex(hash);
+    // Compute keyed integrity (HMAC-SHA256) over canonical records + metadata.
+    // Uses the encryption key, so an attacker who can modify the backup file
+    // but doesn't know the passphrase cannot forge a valid integrity value.
+    // This detects record omission, substitution, and reordering.
+    const canonical = JSON.stringify({
+      records: backup.records,
+      kdf: backup.kdf,
+      record_count: backup.record_count,
+    });
+    const hmacKey = KEYS.enc; // 32-byte encryption key
+    const hmac = S.crypto_auth_hmacsha256(S.from_string(canonical), hmacKey);
+    backup.integrity = S.to_hex(hmac);
+    backup.integrity_alg = "hmac-sha256";
 
     // Download
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
@@ -1652,50 +1679,6 @@ async function exportBackup() {
   } catch (e) {
     alert('Backup failed: ' + e.message);
     console.error('Backup export failed:', e);
-  }
-}
-
-async function adoptBackupSalts(backup) {
-  // Store the backup's salts as this vault's canonical salts, then re-derive
-  // keys from them. CACHED_SALTS must be cleared first: getSalts() caches per
-  // page-load, and without this deriveKeys() would reuse the stale salts.
-  await api('/api/kdf/salts/migrate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      salt_enc: backup.kdf.salt_enc,
-      salt_idx: backup.kdf.salt_idx,
-    }),
-  });
-  CACHED_SALTS = null;
-  const pass = $('pass').value;
-  if (!pass) throw new Error('Enter your passphrase to restore backup.');
-  KEYS = await deriveKeys(pass);
-}
-
-async function ensureBackupSalts(backup) {
-  // Make the vault's KDF salts match the backup's, adopting them via
-  // /api/kdf/salts/migrate when the vault is empty. Throws when the vault
-  // already holds records encrypted under different salts.
-  let saltResp = null;
-  try {
-    saltResp = await api('/api/kdf/salts');
-  } catch (e) {
-    if (e.status === 409 && e.message.includes('Salt migration required')) {
-      throw new Error('Vault already has records with different salts.');
-    }
-    if (e.status === 404 || e.message.includes('not found')) {
-      await adoptBackupSalts(backup);  // no salts set yet
-      return;
-    }
-    throw e;
-  }
-  if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
-    const probe = await api('/api/records?limit=1&offset=0');
-    if ((probe.total || 0) > 0) {
-      throw new Error('Backup salts do not match vault salts. Use the same vault or migrate first.');
-    }
-    await adoptBackupSalts(backup);  // empty vault: safe to adopt
   }
 }
 
@@ -1719,16 +1702,80 @@ async function importBackup(event) {
     if (backup.record_count !== backup.records.length) throw new Error('Record count mismatch (file may be truncated)');
     if (!backup.kdf || !backup.kdf.salt_enc || !backup.kdf.salt_idx) throw new Error('Missing KDF salts');
 
-    // Adopt the backup's KDF salts, then re-derive keys from them.
-    // GET /api/kdf/salts never auto-generates (404 when unset); generation is
-    // explicit via POST /api/kdf/salts/generate, and overwrite via
-    // POST /api/kdf/salts/migrate is only allowed on an empty vault.
-    await ensureBackupSalts(backup);
+    // Apply backup salts if vault has none set (fresh vault restore)
+    // This must happen before deriving keys, so we check via API
+    try {
+      const saltResp = await api('/api/kdf/salts');
+      // Salts are set - verify they match, or if they were auto-generated
+      // during unlock (fresh vault), overwrite with backup's salts
+      if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
+        // Try force-overwrite (only works if no records exist)
+        try {
+          await api('/api/kdf/salts/migrate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              salt_enc: backup.kdf.salt_enc,
+              salt_idx: backup.kdf.salt_idx,
+              force: true,
+            }),
+          });
+          // Clear cached salts and re-derive
+          CACHED_SALTS = null;
+          const pass = $('pass').value;
+          if (!pass) throw new Error('Enter your passphrase to restore backup.');
+          KEYS = await deriveKeys(pass);
+        } catch (forceErr) {
+          throw new Error('Backup salts do not match vault salts. Use the same vault or migrate first.');
+        }
+      }
+    } catch (e) {
+      if (e.status === 409 && e.message.includes('Salt migration required')) {
+        // Vault has records but no salts - shouldn't happen on restore to fresh vault
+        throw new Error('Vault already has records with different salts.');
+      } else if (e.status === 404 || e.message.includes('not found')) {
+        // No salts set - apply backup salts via migrate endpoint
+        await api('/api/kdf/salts/migrate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            salt_enc: backup.kdf.salt_enc,
+            salt_idx: backup.kdf.salt_idx,
+          }),
+        });
+        // Re-derive keys with the new salts
+        const pass = $('pass').value;
+        if (!pass) throw new Error('Enter your passphrase to restore backup.');
+        KEYS = await deriveKeys(pass);
+      } else {
+        throw e;
+      }
+    }
 
-    // Verify integrity
-    const canonical = JSON.stringify(backup.records);
-    const hash = S.to_hex(S.crypto_hash_sha256(S.from_string(canonical)));
-    if (hash !== backup.integrity) throw new Error('Integrity check failed (file corrupted)');
+    // Verify keyed integrity (HMAC-SHA256). Must match the algorithm used at export.
+    // Supports legacy unkeyed SHA-256 for backups created before this change.
+    const verifyCanonical = JSON.stringify({
+      records: backup.records,
+      kdf: backup.kdf,
+      record_count: backup.record_count,
+    });
+    let integrityOk = false;
+    if (backup.integrity_alg === "hmac-sha256") {
+      const expected = S.to_hex(S.crypto_auth_hmacsha256(
+        S.from_string(verifyCanonical), KEYS.enc
+      ));
+      integrityOk = S.to_hex(S.from_string(expected)) === S.to_hex(S.from_string(backup.integrity));
+      // Constant-time comparison via libsodium
+      integrityOk = S.crypto_verify_32(
+        S.from_hex(expected), S.from_hex(backup.integrity)
+      ) === 0;
+    } else {
+      // Legacy: unkeyed SHA-256 over records array only
+      const legacyCanonical = JSON.stringify(backup.records);
+      const hash = S.to_hex(S.crypto_hash_sha256(S.from_string(legacyCanonical)));
+      integrityOk = hash === backup.integrity;
+    }
+    if (!integrityOk) throw new Error('Integrity check failed (file corrupted or tampered)');
 
     // Verify canary decrypts (proves passphrase+salts are correct)
     try {
@@ -1859,7 +1906,7 @@ async function bootstrapPasskey() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bootstrap_token: token }),
     });
-    const credential = await navigator.credentials.create({ publicKey: publicKeyOptions(options) });
+    const credential = await navigator.credentials.create({ publicKey: options });
     const result = await api('/api/passkeys/bootstrap/verify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ credential: credentialJSON(credential), label: 'Primary passkey', bootstrap_token: token }),
