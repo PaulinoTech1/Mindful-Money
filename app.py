@@ -983,7 +983,22 @@ def passkey_status():
 @app.post("/api/passkeys/bootstrap/options")
 def bootstrap_options():
     """First-time passkey enrollment. Only allowed when no passkeys exist
-    for the current identity. This is the bootstrap flow for new deployments."""
+    for the current identity. This is the bootstrap flow for new deployments.
+
+    SECURITY: Requires VAULT_BOOTSTRAP_TOKEN to prevent unauthorized
+    enrollment if the vault is publicly reachable before the owner sets it up.
+    The token must be provided in the request body as {"bootstrap_token": "..."}.
+    """
+    # Verify bootstrap token (prevents unauthorized first-enrollment)
+    bootstrap_token = os.environ.get("VAULT_BOOTSTRAP_TOKEN")
+    if bootstrap_token:
+        payload, error = _json_object()
+        if error: return error
+        provided = payload.get("bootstrap_token", "")
+        # Use constant-time comparison to prevent timing attacks
+        if not secrets.compare_digest(str(provided), bootstrap_token):
+            LOG.warning('event="bootstrap_token_mismatch" client="%s"', _client_log_id())
+            return api_error("Invalid bootstrap token", 403)
     owner_id = current_identity_id()
     table = models.PasskeyCredential.__table__
     count = db().execute(select(func.count()).select_from(table).where(
@@ -1007,7 +1022,17 @@ def bootstrap_options():
 @app.post("/api/passkeys/bootstrap/verify")
 def bootstrap_verify():
     """Verify bootstrap registration. Only allowed when no passkeys exist.
-    Does not require prior authentication (this IS the first authentication)."""
+    Does not require prior authentication (this IS the first authentication).
+    Requires VAULT_BOOTSTRAP_TOKEN if set."""
+    # Verify bootstrap token (same as bootstrap_options)
+    bootstrap_token = os.environ.get("VAULT_BOOTSTRAP_TOKEN")
+    payload, error = _json_object()
+    if error: return error
+    if bootstrap_token:
+        provided = payload.get("bootstrap_token", "")
+        if not secrets.compare_digest(str(provided), bootstrap_token):
+            LOG.warning('event="bootstrap_token_mismatch" client="%s"', _client_log_id())
+            return api_error("Invalid bootstrap token", 403)
     owner_id = current_identity_id()
     table = models.PasskeyCredential.__table__
     count = db().execute(select(func.count()).select_from(table).where(
@@ -1018,8 +1043,7 @@ def bootstrap_verify():
     if challenge_row is None:
         return api_error("Passkey ceremony could not be verified", 400)
     challenge = challenge_row["challenge"]
-    payload, error = _json_object()
-    if error: return error
+    # payload already parsed above for token check
     credential = payload.get("credential"); label = payload.get("label", "Passkey")
     if not isinstance(credential, dict) or not isinstance(label, str) or not label.strip() or len(label.strip()) > MAX_LABEL_LENGTH:
         return api_error("Passkey registration could not be verified", 400)
@@ -1328,6 +1352,23 @@ def get_kdf_salts():
         return api_error("Identity not found", 404)
     # Generate salts if not set (first use)
     if row.kdf_salt_enc is None or row.kdf_salt_idx is None:
+        # CRITICAL: Check if records exist. If so, the client was using
+        # browser-local salts. Generating new server salts now would make
+        # existing records unreadable. The client must migrate first.
+        record_table = models.Record.__table__
+        record_count = conn.execute(
+            select(func.count()).select_from(record_table).where(
+                record_table.c.identity_id == identity_id
+            )
+        ).scalar() or 0
+        if record_count > 0:
+            LOG.warning('event="salt_migration_required" identity="%s" records="%d"',
+                        identity_id, record_count)
+            return api_error(
+                "Salt migration required: existing records use browser-local salts. "
+                "Use POST /api/kdf/salts/migrate with your current salts to migrate.",
+                409
+            )
         import secrets
         salt_enc = secrets.token_bytes(16)
         salt_idx = secrets.token_bytes(16)
@@ -1346,6 +1387,54 @@ def get_kdf_salts():
         "salt_idx": salt_idx.hex(),
         "kdf_version": row.kdf_version,
     })
+
+
+@app.post("/api/kdf/salts/migrate")
+def migrate_kdf_salts():
+    """Migrate from browser-local salts to server salts.
+    
+    The client provides its current (browser-local) salts. The server
+    stores them as the canonical salts, so existing records remain readable.
+    This is a one-time migration per identity.
+    """
+    denied = require_access()
+    if denied: return denied
+    identity_id = current_identity_id()
+    if not identity_id:
+        return api_error("No identity", 403)
+    payload, error = _json_object()
+    if error: return error
+    salt_enc_hex = payload.get("salt_enc")
+    salt_idx_hex = payload.get("salt_idx")
+    if not salt_enc_hex or not salt_idx_hex:
+        return api_error("salt_enc and salt_idx required", 400)
+    try:
+        salt_enc = bytes.fromhex(salt_enc_hex)
+        salt_idx = bytes.fromhex(salt_idx_hex)
+        if len(salt_enc) != 16 or len(salt_idx) != 16:
+            raise ValueError("Invalid salt length")
+    except (ValueError, TypeError):
+        return api_error("Invalid salt format (must be 32 hex chars)", 400)
+    
+    table = models.VaultIdentity.__table__
+    conn = db()
+    row = conn.execute(
+        select(table.c.kdf_salt_enc, table.c.kdf_salt_idx)
+        .where(table.c.id == identity_id)
+    ).first()
+    if not row:
+        return api_error("Identity not found", 404)
+    if row.kdf_salt_enc is not None:
+        return api_error("Salts already migrated", 409)
+    
+    conn.execute(
+        update(table)
+        .where(table.c.id == identity_id)
+        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, updated_at=func.now())
+    )
+    conn.commit()
+    LOG.info('event="kdf_salts_migrated" client="%s"', _client_log_id())
+    return jsonify({"migrated": True})
 
 
 @app.get("/api/audit/events")

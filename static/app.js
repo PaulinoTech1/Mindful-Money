@@ -1665,6 +1665,37 @@ async function importBackup(event) {
     if (backup.record_count !== backup.records.length) throw new Error('Record count mismatch (file may be truncated)');
     if (!backup.kdf || !backup.kdf.salt_enc || !backup.kdf.salt_idx) throw new Error('Missing KDF salts');
 
+    // Apply backup salts if vault has none set (fresh vault restore)
+    // This must happen before deriving keys, so we check via API
+    try {
+      const saltResp = await api('/api/kdf/salts');
+      // If we get here without 409, salts are already set - verify they match
+      if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
+        throw new Error('Backup salts do not match vault salts. Use the same vault or migrate first.');
+      }
+    } catch (e) {
+      if (e.status === 409 && e.message.includes('Salt migration required')) {
+        // Vault has records but no salts - shouldn't happen on restore to fresh vault
+        throw new Error('Vault already has records with different salts.');
+      } else if (e.status === 404 || e.message.includes('not found')) {
+        // No salts set - apply backup salts via migrate endpoint
+        await api('/api/kdf/salts/migrate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            salt_enc: backup.kdf.salt_enc,
+            salt_idx: backup.kdf.salt_idx,
+          }),
+        });
+        // Re-derive keys with the new salts
+        const pass = $('pass').value;
+        if (!pass) throw new Error('Enter your passphrase to restore backup.');
+        KEYS = await deriveKeys(pass);
+      } else {
+        throw e;
+      }
+    }
+
     // Verify integrity
     const canonical = JSON.stringify(backup.records);
     const hash = S.to_hex(S.crypto_hash_sha256(S.from_string(canonical)));
@@ -1787,12 +1818,22 @@ async function bootstrapPasskey() {
   const note = $('passkeyGateNote');
   try {
     if (!window.PublicKeyCredential) throw new Error('This browser does not support WebAuthn passkeys.');
+    // Prompt for bootstrap token (prevents unauthorized enrollment)
+    const token = prompt('Enter the bootstrap token (from VAULT_BOOTSTRAP_TOKEN):');
+    if (!token) {
+      note.textContent = 'Bootstrap cancelled.';
+      return;
+    }
     note.textContent = 'Creating your passkey…';
-    const options = await api('/api/passkeys/bootstrap/options', { method: 'POST' });
+    const options = await api('/api/passkeys/bootstrap/options', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bootstrap_token: token }),
+    });
     const credential = await navigator.credentials.create({ publicKey: options });
     const result = await api('/api/passkeys/bootstrap/verify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ credential: credentialJSON(credential), label: 'Primary passkey' }),
+      body: JSON.stringify({ credential: credentialJSON(credential), label: 'Primary passkey', bootstrap_token: token }),
     });
     CSRF = result.csrf_token;
     PASSKEY_REQUIRED = true; PASSKEY_AUTHENTICATED = true; BOOTSTRAP_NEEDED = false;
