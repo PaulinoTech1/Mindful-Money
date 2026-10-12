@@ -54,8 +54,22 @@ const credentialJSON = (c) => ({
    Fixed salts so a page reload can re-derive the same key without a signup
    flow. A real build generates random salts per user at signup and stores
    them alongside the public key. Do not ship this constant.            */
-const DEMO_SALT_ENC  = new Uint8Array([73,26,201,4,155,88,17,240,63,129,7,198,44,90,231,12]);
-const DEMO_SALT_IDX  = new Uint8Array([9,144,37,222,101,58,175,20,86,3,249,130,66,11,193,77]);
+const SALT_KEY_ENC = 'mm_salt_enc';
+const SALT_KEY_IDX = 'mm_salt_idx';
+
+function getOrCreateSalt(storageKey) {
+  let saltHex = localStorage.getItem(storageKey);
+  if (!saltHex) {
+    // Generate a random 16-byte salt on first use. Stored in localStorage
+    // (not secret, just unique per browser). If cleared, old data becomes
+    // unreadable - this is correct behavior for a fresh vault.
+    const salt = new Uint8Array(16);
+    crypto.getRandomValues(salt);
+    saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('');
+    localStorage.setItem(storageKey, saltHex);
+  }
+  return Uint8Array.from(saltHex.match(/../g).map(h => parseInt(h, 16)));
+}
 
 /* ---------- categorization: on the device, never on the server ---------- */
 
@@ -308,10 +322,15 @@ async function deriveKeys(passphrase) {
   const ops = S.crypto_pwhash_OPSLIMIT_INTERACTIVE;
   const mem = S.crypto_pwhash_MEMLIMIT_INTERACTIVE;
 
+  // Per-browser random salts (generated on first use, stored in localStorage).
+  // Unique per browser, not shared across users. Salts are not secret.
+  const saltEnc = getOrCreateSalt(SALT_KEY_ENC);
+  const saltIdx = getOrCreateSalt(SALT_KEY_IDX);
+
   // Seeded keypair so the same passphrase always yields the same identity.
-  const seed = S.crypto_pwhash(32, passphrase, DEMO_SALT_ENC, ops, mem, A);
+  const seed = S.crypto_pwhash(32, passphrase, saltEnc, ops, mem, A);
   const kp = S.crypto_box_seed_keypair(seed);
-  const indexKey = S.crypto_pwhash(32, passphrase, DEMO_SALT_IDX, ops, mem, A);
+  const indexKey = S.crypto_pwhash(32, passphrase, saltIdx, ops, mem, A);
 
   return { publicKey: kp.publicKey, privateKey: kp.privateKey, indexKey };
 }
@@ -416,23 +435,10 @@ async function load(duringUnlock = false) {
   let decrypted = records.map((r) => open(r.sealed));
 
   // Records written by older versions do not contain encrypted institution
-  // metadata. Fetch it again, merge and re-seal it here in the browser so the
-  // names become visible without ever adding plaintext columns server-side.
-  if (decrypted.some((t) => !t.bank || !t.account_label || !t.account_type || t.bank === 'Wells Forclosure')) {
-    const { transactions } = await api('/api/relay', { method: 'POST' });
-    const metadata = new Map(transactions.map((t) => [t.account, {
-      bank: t.bank, account_label: t.account_label, account_type: t.account_type,
-    }]));
-    decrypted = decrypted.map((t) => ({ ...t, ...(metadata.get(t.account) || {}) }));
-    const migrated = records.map((record, index) => ({
-      blind_index: record.blind_index,
-      sealed: seal(decrypted[index]),
-    }));
-    await api('/api/records', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: migrated }),
-    });
-  }
+  // metadata. This migration path was removed with the server-side relay.
+  // Users with old records should re-import via the client-side SimpleFin
+  // or demo data flow, which now generates metadata directly.
+  // (Previously: fetched from /api/relay, which no longer exists.)
 
   TXNS = decrypted.map((t) => ({
     ...t, category: t.category || categorize(t.merchant),
@@ -456,12 +462,21 @@ async function connect(source = 'fakebank') {
   [$('connectBtn'), $('syncBtn'), $('connectSimplefinBtn'), $('syncSimplefinBtn')].forEach((b) => { b.disabled = true; });
   $('connectNote').textContent = source === 'simplefin' ? 'Fetching from SimpleFin\u2026' : 'Fetching from bank\u2026';
 
-  // The server relays plaintext in this response and stores none of it.
-  const { transactions } = await api('/api/relay', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source }),
-  });
+  // Client-side only: transactions never touch the server as plaintext.
+  // SimpleFin access URL is prompt-only, never stored.
+  let transactions;
+  if (source === 'simplefin') {
+    const accessUrl = prompt('Enter your SimpleFin Access URL (from https://beta-bridge.simplefin.org):');
+    if (!accessUrl) {
+      $('connectNote').textContent = 'Cancelled.';
+      [$('connectBtn'), $('syncBtn'), $('connectSimplefinBtn'), $('syncSimplefinBtn')].forEach((b) => { b.disabled = false; });
+      return;
+    }
+    transactions = await fetchSimpleFinTransactions(accessUrl, 90);
+  } else {
+    // Demo data generated client-side (deterministic, same as old fakebank.py)
+    transactions = generateDemoTransactions(12);
+  }
 
   $('connectNote').textContent = `Encrypting ${transactions.length} transactions in your browser\u2026`;
   await new Promise((r) => setTimeout(r, 30));
