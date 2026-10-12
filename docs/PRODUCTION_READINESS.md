@@ -1,18 +1,14 @@
 # Production Readiness Plan
 
 **Date:** 2026-10-11
-**Current status:** Working prototype deployed on Cloud Run. Functional but not production-hardened.
+**Updated:** 2026-10-12
+**Current status:** All P0, P1, P2, P3 items complete. Awaiting first successful deploy.
 **Goal:** Production-ready for personal use with real financial data.
 
-## Priority 0: Blockers (fix before real data)
+## Priority 0: Blockers (fix before real data) - ✅ ALL DONE
 
-### P0.1: Health check endpoint
-**Problem:** No `/health` or `/ready` endpoint. Cloud Run can't verify the app is healthy.
-**Action:**
-- Add `GET /health` (returns 200, no auth, checks DB connectivity)
-- Add `GET /ready` (returns 200 if migrations are current)
-- Configure Cloud Run health checks to use these
-**Effort:** 1 hour
+### P0.1: Health check endpoint ✅
+**Status:** Complete. `GET /health` and `GET /ready` implemented.
 
 ### P0.2: Database migrations in CI/CD
 **Problem:** Migrations are manual. Easy to deploy code that requires a migration that hasn't run.

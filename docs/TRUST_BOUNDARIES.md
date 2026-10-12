@@ -117,7 +117,7 @@ Session cookies use:
 
 Sessions are stored in the `server_sessions` table with:
 - Hashed session IDs (SHA-256, not reversible)
-- Idle timeout (30 minutes) and absolute timeout (8 hours)
+- Idle timeout (15 minutes) and absolute timeout (4 hours)
 - Revocation support via `/api/session/revoke`
 
 **Note:** Cookie name is `vault_session` (not `__Host-` prefixed). The `__Host-`

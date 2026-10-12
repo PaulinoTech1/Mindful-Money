@@ -45,6 +45,9 @@ events rather than relying on the acknowledgment columns.
 - `SUSPICIOUS_COUNTER_EVENT` (WebAuthn sign count regression)
 - `UNUSUAL_ACTIVITY_DETECTED` (browser-side detector)
 - `INCIDENT_ACKNOWLEDGED` (analyst marked an event as reviewed)
+- `HONEYPOT_HIT` (attacker probed a honeypot endpoint like /wp-admin)
+- `ACCOUNT_LOCKED` (5+ failed logins in 15 min triggered 30-min lockout)
+- `STEP_UP_REQUIRED` (destructive op attempted without fresh auth)
 
 **Incident response API:**
 - `GET /api/audit/events` - list events (filter by `event_type`, paginate with `limit`/`offset`)
