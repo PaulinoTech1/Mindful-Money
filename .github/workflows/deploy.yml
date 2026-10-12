@@ -74,36 +74,52 @@ jobs:
 
       - name: Run tests
         run: |
-          python -m pytest test_demo.py -x -q -v 2>&1 | head -100
+          echo "=== Python version ==="
+          python3 --version
+          echo "=== Installed packages ==="
+          pip list | grep -i -E "pytest|nacl|flask|sqlalchemy|psycopg|webauthn"
+          echo "=== Running tests with full verbose output ==="
+          python -m pytest test_demo.py -v --tb=long --no-header -rA 2>&1
+          echo "=== Test exit code: $? ==="
         env:
           VAULT_ENV: test
           VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_test
 
       - name: Check migrations
         run: |
-          # Verify migration chain is valid (no broken revises/down_revision)
-          python -c "
-          import os
+          echo "=== Checking migration chain integrity ==="
+          python3 << 'PYEOF'
+          import os, re, sys
           versions_dir = 'migrations/versions'
           revisions = {}
-          for f in os.listdir(versions_dir):
+          print(f"Scanning {versions_dir}/...")
+          for f in sorted(os.listdir(versions_dir)):
               if f.endswith('.py'):
-                  with open(os.path.join(versions_dir, f)) as fp:
+                  path = os.path.join(versions_dir, f)
+                  with open(path) as fp:
                       content = fp.read()
-                      # Extract revision and down_revision
-                      import re
-                      rev = re.search(r'^revision:\s*str\s*=\s*[\"\']([^\"\']+)[\"\']', content, re.M)
-                      down = re.search(r'^down_revision.*=[\s]*[\"\']([^\"\']+)[\"\']', content, re.M)
+                      rev = re.search(r'^revision:\s*str\s*=\s*["\']([^"\']+)["\']', content, re.M)
+                      down = re.search(r'^down_revision.*=[\s]*["\']([^"\']+)["\']', content, re.M)
                       if rev:
-                          revisions[rev.group(1)] = down.group(1) if down else None
+                          rev_id = rev.group(1)
+                          down_id = down.group(1) if down else None
+                          revisions[rev_id] = down_id
+                          print(f"  {f}: revision={rev_id}, down_revision={down_id}")
+                      else:
+                          print(f"  WARNING: {f} has no revision ID")
+          print(f"\nFound {len(revisions)} revisions")
           # Check chain integrity
-          seen = set()
+          errors = 0
           for rev, down in revisions.items():
-              if down and down != 'None' and down not in revisions:
-                  print(f'BROKEN: {rev} references missing {down}')
-                  exit(1)
-          print(f'Migration chain OK: {len(revisions)} revisions')
-          "
+              if down and down not in revisions:
+                  print(f"  BROKEN: {rev} references missing down_revision {down}")
+                  errors += 1
+          if errors:
+              print(f"\nFAILED: {errors} broken migration references")
+              sys.exit(1)
+          print("\nMigration chain OK")
+          PYEOF
+          echo "=== Migration check exit code: $? ==="
 
   deploy:
     runs-on: ubuntu-latest
