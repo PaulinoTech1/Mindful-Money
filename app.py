@@ -1877,14 +1877,14 @@ def generate_kdf_salts():
     conn.execute(
         update(table)
         .where(table.c.id == identity_id)
-        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, kdf_version=2, updated_at=func.now())
+        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, kdf_version=3, updated_at=func.now())
     )
     conn.commit()
-    LOG.info('event="kdf_salts_generated" kdf_version=2 client="%s"', _client_log_id())
+    LOG.info('event="kdf_salts_generated" kdf_version=3 client="%s"', _client_log_id())
     return jsonify({
         "salt_enc": salt_enc.hex(),
         "salt_idx": salt_idx.hex(),
-        "kdf_version": 2,
+        "kdf_version": 3,
         "generated": True,
     })
 

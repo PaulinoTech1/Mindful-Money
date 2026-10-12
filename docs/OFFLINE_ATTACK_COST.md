@@ -8,10 +8,13 @@
 | Version | Algorithm | Ops | Memory | Description |
 |---------|-----------|-----|--------|-------------|
 | v1 | Argon2id | 2 | 64 MB | Legacy (libsodium INTERACTIVE) |
-| v2 | Argon2id | 3 | 256 MB | Current (libsodium MODERATE) |
+| v2 | Argon2id | 3 | 256 MB | Previous (libsodium MODERATE) |
+| v3 | Argon2id | 5 | 512 MB | Current (aggressive) |
 
-New vaults use v2. Existing v1 vaults keep v1 until the user explicitly upgrades
-(to avoid lockout from parameter mismatch).
+New vaults use v3. Existing vaults keep their version until the user
+explicitly upgrades (to avoid lockout from parameter mismatch).
+If a browser cannot allocate 512MB (e.g., mobile), the client automatically
+falls back to v2 for that session and notifies the user.
 
 ## Passphrase Requirements
 
@@ -29,11 +32,17 @@ New vaults use v2. Existing v1 vaults keep v1 until the user explicitly upgrades
 - Each GPU can test ~50,000 passphrases/second (conservative estimate for
   Argon2id with 256MB; actual throughput is lower due to memory bandwidth)
 
-### 60-bit passphrase vs Argon2id-MODERATE
+### 60-bit passphrase vs Argon2id v3 (512MB, 5 ops)
 
 - Search space: 2^60 ≈ 1.15 × 10^18 passphrases
+- Attacker with 10,000 GPUs: ~15,000 guesses/second/GPU (memory-bound at 512MB)
+  = 1.5 × 10^8 guesses/second total
+- Time to exhaust: 1.15 × 10^18 / 1.5 × 10^8 ≈ 7.7 × 10^9 seconds
+- **≈ 244 years** to exhaust, **≈ 122 years** on average
+
+### 60-bit passphrase vs Argon2id v2 (256MB, 3 ops) - for comparison
+
 - Attacker with 10,000 GPUs: 10,000 × 50,000 = 5 × 10^8 guesses/second
-- Time to exhaust: 1.15 × 10^18 / 5 × 10^8 ≈ 2.3 × 10^9 seconds
 - **≈ 73 years** to exhaust, **≈ 36 years** on average
 
 ### 80-bit passphrase (recommended: 6-word diceware)
@@ -41,11 +50,16 @@ New vaults use v2. Existing v1 vaults keep v1 until the user explicitly upgrades
 - Search space: 2^80 ≈ 1.2 × 10^24
 - Same attacker: **≈ 76 million years** on average
 
-### Comparison: v1 (INTERACTIVE, 64MB)
+### Comparison across versions (60-bit passphrase, 10k GPUs)
 
-- GPU throughput: ~200,000 guesses/second (4x faster due to lower memory)
-- 60-bit passphrase vs 10,000 GPUs: **≈ 9 years** on average
-- This is why v2 is the default for new vaults.
+| Version | Avg. time to crack |
+|---------|-------------------|
+| v1 (64MB, 2 ops) | **≈ 9 years** |
+| v2 (256MB, 3 ops) | **≈ 36 years** |
+| v3 (512MB, 5 ops) | **≈ 122 years** |
+
+The jump from v2 to v3 is ~3.4x. Diminishing returns apply: the 60-bit
+entropy floor matters more than KDF tuning beyond this point.
 
 ## Memory-Hardness Rationale
 

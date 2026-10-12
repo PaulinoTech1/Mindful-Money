@@ -90,7 +90,7 @@ async function getSalts() {
       CACHED_SALTS = {
         enc: Uint8Array.from(data.salt_enc.match(/../g).map(h => parseInt(h, 16))),
         idx: Uint8Array.from(data.salt_idx.match(/../g).map(h => parseInt(h, 16))),
-        kdf_version: data.kdf_version || 2,
+        kdf_version: data.kdf_version || 3,
         isNewVault: true,
       };
       return CACHED_SALTS;
@@ -376,10 +376,22 @@ async function submitManualTransaction(event) {
 
 // KDF parameters by version.
 // v1: libsodium INTERACTIVE (ops=2, mem=64MB) - legacy, weaker
-// v2: libsodium MODERATE (ops=3, mem=256MB) - current default
+// v2: libsodium MODERATE (ops=3, mem=256MB) - previous default
+// v3: aggressive (ops=5, mem=512MB) - current default for new vaults
 // The version is stored server-side per identity. Existing vaults keep
 // their version until the user explicitly upgrades (to avoid lockout).
+//
+// v3 impact: deriveKeys runs Argon2id twice per unlock. Expect ~8-20s on
+// desktop, ~20-60s on phones. If the browser cannot allocate 512MB,
+// deriveKeys falls back to v2 automatically (see below).
 function kdfParams(version) {
+  if (version >= 3) {
+    return {
+      ops: 5,
+      mem: 512 * 1024 * 1024,
+      version: 3,
+    };
+  }
   if (version >= 2) {
     return {
       ops: S.crypto_pwhash_OPSLIMIT_MODERATE,
@@ -437,9 +449,7 @@ function checkPassphraseStrength(passphrase) {
 
 async function deriveKeys(passphrase, kdfVersion) {
   const A = S.crypto_pwhash_ALG_ARGON2ID13;
-  const params = kdfParams(kdfVersion || 1);
-  const ops = params.ops;
-  const mem = params.mem;
+  let params = kdfParams(kdfVersion || 1);
 
   // Per-identity salts from the server (not secret, just unique).
   // Falls back to localStorage for legacy vaults.
@@ -447,12 +457,49 @@ async function deriveKeys(passphrase, kdfVersion) {
   const saltEnc = salts.enc;
   const saltIdx = salts.idx;
 
-  // Seeded keypair so the same passphrase always yields the same identity.
-  const seed = S.crypto_pwhash(32, passphrase, saltEnc, ops, mem, A);
-  const kp = S.crypto_box_seed_keypair(seed);
-  const indexKey = S.crypto_pwhash(32, passphrase, saltIdx, ops, mem, A);
+  // Try the requested KDF version. If v3 (512MB) fails (e.g., mobile browser
+  // cannot allocate the memory), fall back to v2 automatically rather than
+  // bricking the unlock. The fallback is logged and surfaced to the user.
+  let ops = params.ops;
+  let mem = params.mem;
+  let usedVersion = params.version;
+  let fellBack = false;
 
-  return { publicKey: kp.publicKey, privateKey: kp.privateKey, indexKey, kdfVersion: params.version, seed };
+  const tryDerive = (o, m) => {
+    const seed = S.crypto_pwhash(32, passphrase, saltEnc, o, m, A);
+    const kp = S.crypto_box_seed_keypair(seed);
+    const indexKey = S.crypto_pwhash(32, passphrase, saltIdx, o, m, A);
+    return { seed, kp, indexKey };
+  };
+
+  let result;
+  try {
+    result = tryDerive(ops, mem);
+  } catch (e) {
+    if (params.version >= 3) {
+      console.warn('v3 KDF (512MB) failed, falling back to v2:', e.message);
+      const fallback = kdfParams(2);
+      result = tryDerive(fallback.ops, fallback.mem);
+      usedVersion = 2;
+      fellBack = true;
+    } else {
+      throw e;
+    }
+  }
+
+  if (fellBack && typeof $('gateNote') !== 'undefined' && $('gateNote')) {
+    $('gateNote').textContent = 'Note: used lighter key derivation (device memory limit). ' +
+      'Consider a desktop browser for maximum security.';
+  }
+
+  return {
+    publicKey: result.kp.publicKey,
+    privateKey: result.kp.privateKey,
+    indexKey: result.indexKey,
+    kdfVersion: usedVersion,
+    seed: result.seed,
+    kdfFallback: fellBack,
+  };
 }
 
 /* ---------- recovery key ---------- */
