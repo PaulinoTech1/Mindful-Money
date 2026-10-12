@@ -243,13 +243,7 @@ jobs:
             exit 1
           }
           for JS_FILE in "app.js" "simplefin-client.js" "recovery-words.js"; do
-            EXPECTED=$(echo "$MANIFEST" | python3 -c "
-import sys, json
-try:
-    print(json.load(sys.stdin)['files']['$JS_FILE']['sha256'])
-except KeyError:
-    print('MISSING')
-")
+            EXPECTED=$(echo "$MANIFEST" | python3 -c "import sys, json; print(json.load(sys.stdin).get('files', {}).get('$JS_FILE', {}).get('sha256', 'MISSING'))")
             if [ "$EXPECTED" = "MISSING" ]; then
               echo "WARNING: $JS_FILE not in manifest, skipping"
               continue
