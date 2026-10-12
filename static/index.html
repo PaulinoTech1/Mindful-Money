@@ -60,7 +60,7 @@
       <div class="formRow">
         <label class="srOnly" for="pass">Passphrase</label>
         <input id="pass" type="password" placeholder="Any passphrase" autocomplete="off">
-        <button type="button" id="togglePass" aria-label="Show passphrase" style="margin-left: 4px;">👁</button>
+        <button type="button" id="togglePass" aria-label="Show passphrase" class="ml-1">👁</button>
         <button class="primary" id="unlockBtn">Unlock</button>
       </div>
       <output class="entropyMeasure" id="passEntropy" for="pass" aria-live="polite">Shannon entropy: 0.00 bits — enter a passphrase.</output>
@@ -91,8 +91,8 @@
       <p class="lede">Connect the demo bank to fetch six months of transactions. They will be encrypted in your browser before anything is stored.</p>
       <button class="primary" id="connectBtn">Connect demo bank</button>
       <button class="primary" id="connectSimplefinBtn" hidden>Connect via SimpleFin</button>
-      <div style="margin-top: 1em;">
-        <label for="csvFile" class="primary" style="cursor: pointer; display: inline-block;">Upload bank CSV</label>
+      <div class="mt-4">
+        <label for="csvFile" class="primary inline-block-btn">Upload bank CSV</label>
         <input type="file" id="csvFile" accept=".csv" hidden>
       </div>
       <p class="hint" id="connectNote"></p>

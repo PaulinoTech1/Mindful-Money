@@ -997,7 +997,7 @@ def bootstrap_options():
         rp_id=RP_ID, rp_name=RP_NAME,
         user_id=bytes(ident["user_handle"]),
         user_name=f"vault-{owner_id}",
-        challenge=_new_challenge("bootstrap", owner_id),
+        challenge=_new_challenge("registration", owner_id),
         authenticator_selection=AuthenticatorSelectionCriteria(
             resident_key=ResidentKeyRequirement.PREFERRED,
             user_verification=UserVerificationRequirement.REQUIRED),
@@ -1014,7 +1014,7 @@ def bootstrap_verify():
         table.c.identity_id == owner_id)).scalar_one()
     if count > 0:
         return api_error("Bootstrap not available: passkeys already enrolled", 403)
-    challenge_row = _take_challenge("bootstrap", owner_id)
+    challenge_row = _take_challenge("registration", owner_id)
     if challenge_row is None:
         return api_error("Passkey ceremony could not be verified", 400)
     challenge = challenge_row["challenge"]

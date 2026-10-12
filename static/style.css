@@ -328,3 +328,8 @@ td.num { color: #233d54; text-align: right; }
   .chatForm input, .chatForm .primary { display: block; width: 100%; }
   .chatForm .primary { margin-top: 9px; }
 }
+
+/* Utility classes (replacing inline styles for CSP compliance) */
+.ml-1 { margin-left: 4px; }
+.mt-4 { margin-top: 1em; }
+.inline-block-btn { cursor: pointer; display: inline-block; }
