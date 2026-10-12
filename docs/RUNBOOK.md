@@ -181,3 +181,29 @@ tarpit delays.
 
 Watch for `honeypot_rate_limited` events in logs. Frequent triggers indicate
 an active flooding attempt. The webhook alert for `HONEYPOT_HIT` will also fire.
+
+## GitHub Secrets are write-only (2026-10-12)
+
+GitHub Actions secrets cannot be viewed after being set. The UI masks all
+values permanently. If you need to recover a secret value (e.g., the
+`GCP_SERVICE_ACCOUNT` email for IAM troubleshooting), don't look in GitHub.
+
+Instead, find it on the GCP side:
+
+```bash
+# List service accounts in the project
+gcloud iam service-accounts list --project=project-c89a7f58-b865-4112-bf8
+
+# Identify which one GitHub uses: check for the Workload Identity binding
+gcloud iam service-accounts get-iam-policy <candidate-email> \
+  --project=project-c89a7f58-b865-4112-bf8 \
+  --flatten="bindings[].members" \
+  --format="table(bindings.role,bindings.members)" \
+  --filter="bindings.members:github"
+```
+
+The service account with a `principalSet://.../attribute.repository/PaulinoTech1/Mindful-Money`
+member is the GitHub deployer. In our case: `mindful-money-deploy@project-c89a7f58-b865-4112-bf8.iam.gserviceaccount.com`.
+
+**Lesson:** Keep a local record of which service account maps to which secret
+when you set them up. GitHub won't show you again.
