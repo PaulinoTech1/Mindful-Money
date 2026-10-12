@@ -57,8 +57,11 @@ jobs:
 
       - name: Security audit dependencies
         run: |
-          echo "=== Running pip-audit ==="
-          pip-audit --desc 2>&1 || echo "pip-audit found issues (see above)"
+          echo "=== Running pip-audit on production dependencies ==="
+          # Fail the build on vulnerabilities in production dependencies.
+          # Dev dependencies (pytest) are audited separately and don't block.
+          pip-audit --desc --ignore-vuln PYSEC-00000 2>&1
+          echo "=== Production dependency audit passed ==="
 
       - name: Wait for PostgreSQL
         run: |
@@ -84,13 +87,10 @@ jobs:
           echo "=== Installed packages ==="
           pip list | grep -i -E "pytest|nacl|flask|sqlalchemy|psycopg|webauthn"
           echo "=== Running tests with full verbose output ==="
-          # Note: Only TestBrowserCrypto passes currently. The server API tests
-          # (TestServerAPI, TestDestructiveRecordAuthorization, etc.) are broken
-          # due to outdated auth model assumptions. They need to be rewritten.
-          # See: docs/POST_MORTEM_STALE_DEPLOY.md (test tech debt section)
-          # Running only the passing crypto tests to unblock deploys.
-          python -m pytest test_demo.py -v --tb=long --no-header -rA \
-            -k "TestBrowserCrypto" 2>&1
+          # Full regression suite: authentication, tenant isolation, privacy,
+          # cryptography, and lifecycle tests. All 88 tests must pass.
+          # See: docs/POST_MORTEM_STALE_DEPLOY.md for history.
+          python -m pytest test_demo.py -v --tb=short --no-header -rA 2>&1
           echo "=== Test exit code: $? ==="
         env:
           VAULT_ENV: test
@@ -131,6 +131,18 @@ jobs:
           print("\nMigration chain OK")
           PYEOF
           echo "=== Migration check exit code: $? ==="
+
+      - name: Test migrations on fresh database
+        run: |
+          echo "=== Testing alembic upgrade head on fresh database ==="
+          # Create a fresh test database for migration testing
+          PGPASSWORD=vault_test_password psql -h localhost -U vault -d postgres -c "DROP DATABASE IF EXISTS vault_migrate_test;" 2>&1
+          PGPASSWORD=vault_test_password psql -h localhost -U vault -d postgres -c "CREATE DATABASE vault_migrate_test OWNER vault;" 2>&1
+          # Run all migrations
+          VAULT_ENV=test alembic upgrade head 2>&1
+          echo "=== Migration test exit code: $? ==="
+        env:
+          VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_migrate_test
 
   deploy:
     runs-on: ubuntu-latest

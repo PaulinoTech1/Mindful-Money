@@ -133,6 +133,21 @@ class ServerCase(unittest.TestCase):
             conn.execute(text(f"TRUNCATE TABLE {','.join(_ALL_TABLES)} RESTART IDENTITY CASCADE"))
         server_app.app.config["TESTING"] = True
         self.client = server_app.app.test_client()
+        # Default to authenticated state (VAULT_AUTH_POLICY=required in production).
+        # Tests for unauthenticated behavior should call self.deauthenticate().
+        self.authenticate()
+
+    def authenticate(self, unlocked=False):
+        """Set session to authenticated state (passkey verified)."""
+        with self.client.session_transaction() as sess:
+            sess["identity_id"] = 1
+            sess["authenticated_at"] = __import__("time").time()
+            sess["vault_unlocked"] = unlocked
+
+    def deauthenticate(self):
+        """Clear session to unauthenticated state."""
+        with self.client.session_transaction() as sess:
+            sess.clear()
 
     def raw_conn(self):
         return self._engine.connect()
@@ -232,7 +247,7 @@ class TestServerAPI(ServerCase):
         self.full_flow()
         v = self.client.get("/api/server-view").get_json()
         self.assertEqual(set(v["columns"]), {"id", "blind_index", "sealed", "bytes", "stored_at"})
-        self.assertGreater(v["record_count"], 200)
+        self.assertEqual(v["record_count"], 3)
         # Nothing in the response should be readable text from a transaction.
         blob = json.dumps(v)
         for name in ALL_MERCHANTS:
@@ -266,23 +281,19 @@ class TestOptionalPasskeys(ServerCase):
             server_app.db().execute(table.update().where(table.c.id == 1).values(passkey_required=required))
             server_app.db().commit()
 
-    def authenticate(self, unlocked=False):
-        with self.client.session_transaction() as sess:
-            sess["identity_id"] = 1
-            sess["authenticated_at"] = __import__("time").time()
-            sess["vault_unlocked"] = unlocked
-
     def test_passphrase_only_mode_preserves_records_api(self):
         self.assertEqual(self.client.get("/api/records").status_code, 200)
         self.assertEqual(self.client.post("/api/records", json={"records": []}, headers=self.headers()).status_code, 200)
 
     def test_protected_record_and_metadata_apis_require_authentication(self):
         self.set_required()
+        self.deauthenticate()
         for method, path in (("get", "/api/records"), ("post", "/api/records"), ("get", "/api/server-view")):
             response = getattr(self.client, method)(path, json={} if method == "post" else None, headers=self.headers() if method in {"post", "delete"} else None)
             self.assertEqual(response.status_code, 401, path)
-        # /api/relay was removed - should 404 even without auth
-        self.assertEqual(self.client.post("/api/relay").status_code, 404)
+        # /api/relay was removed - should 404 even without auth (pass Origin so the
+        # request reaches routing instead of being rejected by the origin check)
+        self.assertEqual(self.client.post("/api/relay", headers=self.headers()).status_code, 404)
         self.assertEqual(self.client.delete("/api/records", headers=self.headers()).status_code, 409)
 
     def test_enrollment_requires_unlocked_vault(self):
@@ -297,7 +308,13 @@ class TestOptionalPasskeys(ServerCase):
             first = self.client.post("/api/passkeys/register/verify", json={"credential": {}}, headers=self.headers())
         second = self.client.post("/api/passkeys/register/verify", json={"credential": {}}, headers=self.headers())
         self.assertEqual((first.status_code, second.status_code), (400, 400))
-        self.assertFalse(self.client.get("/api/passkeys/status").get_json()["passkey_required"])
+        # The status endpoint reports passkey_required=True whenever the deployment
+        # policy is "required"; the protection flag that a failed registration must
+        # not flip lives on the identity row.
+        with server_app.app.app_context():
+            table = models.VaultIdentity.__table__
+            row = server_app.db().execute(table.select().where(table.c.id == 1)).first()
+        self.assertFalse(row.passkey_required)
 
     def test_expired_challenge_is_rejected(self):
         with self.client.session_transaction() as sess:
@@ -349,11 +366,15 @@ class TestOptionalPasskeys(ServerCase):
 
     def test_disable_requires_authentication_unlock_and_confirmation(self):
         self.set_required()
+        self.deauthenticate()
         self.assertEqual(self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers()).status_code, 401)
         self.authenticate(unlocked=True)
         self.assertEqual(self.client.post("/api/passkeys/disable", json={}, headers=self.headers()).status_code, 400)
-        self.assertEqual(self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers()).status_code, 200)
-        self.assertEqual(self.client.get("/api/records").status_code, 200)
+        # Deployment policy forbids disabling protection when VAULT_AUTH_POLICY=required;
+        # exercise the success path with the policy relaxed (test-only).
+        with patch.object(server_app, "AUTH_POLICY", "optional"):
+            self.assertEqual(self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers()).status_code, 200)
+            self.assertEqual(self.client.get("/api/records").status_code, 200)
 
     def test_csrf_rejects_protected_writes(self):
         self.set_required(); self.authenticate()
@@ -593,8 +614,8 @@ class TestProductionHardening(ServerCase):
             self.assertEqual(conn.execute(text("SELECT COUNT(*) FROM rate_limits")).fetchone()[0], 0)
 
     def test_concurrent_rate_updates_are_atomic(self):
-        original = server_app.RATE_LIMITS["relay"]
-        server_app.RATE_LIMITS["relay"] = (3, 60)
+        original = server_app.RATE_LIMITS["upload"]
+        server_app.RATE_LIMITS["upload"] = (3, 60)
         token = self.client.get("/api/session").get_json()["csrf_token"]
         cookie = self.client.get_cookie(server_app.COOKIE_NAME).value
         def attempt(_):
@@ -606,7 +627,7 @@ class TestProductionHardening(ServerCase):
             self.assertLessEqual(statuses.count(200), 3)
             self.assertEqual(set(statuses), {200, 429})
         finally:
-            server_app.RATE_LIMITS["relay"] = original
+            server_app.RATE_LIMITS["upload"] = original
 
     def test_failed_webauthn_attempt_consumes_failure_budget(self):
         with server_app.app.app_context():
@@ -702,10 +723,14 @@ class TestPrivacyGuarantee(ServerCase):
         self.assertEqual(leaked, [], f"plaintext merchants on disk: {leaked}")
 
     def test_no_bank_name_reaches_disk(self):
+        # The server-side bank integration was removed in the zero-knowledge
+        # refactor; the sensitive free-text field is now the transaction
+        # description, which must only ever exist on disk as ciphertext.
         self.full_flow()
         raw = self.db_bytes()
-        leaked = [meta["bank"] for meta in fakebank.ACCOUNTS.values() if meta["bank"].encode() in raw]
-        self.assertEqual(leaked, [], f"plaintext bank names on disk: {leaked}")
+        leaked = [d for d in ("Test Purchase 1", "Test Deposit", "Test Purchase 2")
+                  if d.encode() in raw]
+        self.assertEqual(leaked, [], f"plaintext descriptions on disk: {leaked}")
 
     def test_no_readable_amounts_reach_disk(self):
         """Amount strings must not survive. Short digit runs can collide with
@@ -731,7 +756,7 @@ class TestPrivacyGuarantee(ServerCase):
         with self.raw_conn() as conn:
             rows = conn.execute(text("SELECT blind_index, sealed FROM records")).fetchall()
 
-        self.assertGreater(len(rows), 200)
+        self.assertEqual(len(rows), 3)
         for blind, sealed in rows:
             self.assertRegex(blind, r"^[0-9a-f]{64}$")
             self.assertRegex(sealed, r"^[0-9a-f]+$")
@@ -747,18 +772,21 @@ class TestPrivacyGuarantee(ServerCase):
         sim, original = self.full_flow()
         stored = self.client.get("/api/records").get_json()["records"]
         recovered = [sim.open(r["sealed"]) for r in stored]
-        self.assertEqual({t["bank"] for t in recovered}, {m["bank"] for m in fakebank.ACCOUNTS.values()})
-        expected = {account: round(sum(-t["amount"] for t in original if t["account"] == account), 2)
-                    for account in fakebank.ACCOUNTS}
-        derived = {account: round(sum(-t["amount"] for t in recovered if t["account"] == account), 2)
-                   for account in fakebank.ACCOUNTS}
-        self.assertEqual(derived, expected)
+        self.assertEqual(
+            {t["description"] for t in recovered},
+            {"Test Purchase 1", "Test Deposit", "Test Purchase 2"},
+        )
+        expected_net = round(sum(t["amount"] for t in original), 2)
+        derived_net = round(sum(t["amount"] for t in recovered), 2)
+        self.assertEqual(derived_net, expected_net)
         self.assertTrue(all(set(r) == {"id", "blind_index", "sealed"} for r in stored))
 
     def test_shipped_javascript_contains_no_bank_names(self):
+        # No institution or merchant names may be baked into the shipped client;
+        # all financial labels arrive only inside user-encrypted payloads.
         script = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
-        for meta in fakebank.ACCOUNTS.values():
-            self.assertNotIn(meta["bank"], script)
+        for merchant in ALL_MERCHANTS:
+            self.assertNotIn(merchant, script)
 
     def test_a_second_user_cannot_read_the_first(self):
         alice, txns = self.full_flow("alice passphrase")
@@ -775,15 +803,15 @@ class TestPrivacyGuarantee(ServerCase):
 
         by_month: dict[str, list[float]] = {}
         for t in txns:
-            k = t["date"][:7]
+            k = t["posted"][:7]
             slot = by_month.setdefault(k, [0.0, 0.0])
             if t["amount"] < 0:
                 slot[0] -= t["amount"]
             else:
                 slot[1] += t["amount"]
 
-        self.assertGreaterEqual(len(by_month), 5, "need several months for a trend chart")
-        self.assertTrue(all(v[0] or v[1] for v in by_month.values()))
+        # -50.00 and -25.50 in expenses, 1000.00 in income, all in 2026-10.
+        self.assertEqual(by_month, {"2026-10": [75.5, 1000.0]})
 
 
 # ---------------------------------------------------------------- audit log
@@ -837,7 +865,12 @@ class TestAuditLog(ServerCase):
     def test_passkey_removal_is_audited(self):
         with server_app.app.app_context():
             table = models.PasskeyCredential.__table__
-            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred", credential_public_key=b"\x01", label="Key"))
+            # Seed two keys: removing the final passkey is rejected with 409
+            # while the deployment policy requires authentication.
+            server_app.db().execute(table.insert(), [
+                {"identity_id": 1, "credential_id": b"cred", "credential_public_key": b"\x01", "label": "Key"},
+                {"identity_id": 1, "credential_id": b"cred2", "credential_public_key": b"\x02", "label": "Spare"},
+            ])
             server_app.db().commit()
         with self.client.session_transaction() as sess:
             sess["identity_id"] = 1
@@ -901,7 +934,10 @@ class TestAuditLog(ServerCase):
             sess["identity_id"] = 1
             sess["vault_unlocked"] = True
             sess["authenticated_at"] = time.time()
-        self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers())
+        # Deployment policy forbids disabling protection when VAULT_AUTH_POLICY=required;
+        # audit the success path with the policy relaxed (test-only).
+        with patch.object(server_app, "AUTH_POLICY", "optional"):
+            self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers())
         rows = self.audit_rows()
         self.assertEqual([r["event_type"] for r in rows], ["PASSKEY_PROTECTION_DISABLED"])
 
@@ -959,7 +995,10 @@ class TestStepUpAuthentication(ServerCase):
 
     def test_adding_another_passkey_requires_recent_authentication(self):
         self.seed_existing_passkey()
-        self.unlock(authenticated_at=None)
+        # Authenticated within the session TTL but outside the step-up window:
+        # the vault may be open, yet adding a passkey still requires a recent
+        # WebAuthn ceremony.
+        self.unlock(authenticated_at=time.time() - server_app.VAULT_STEPUP_WINDOW_SECONDS - 1)
         self.assertEqual(self.client.post("/api/passkeys/register/options", headers=self.headers()).status_code, 401)
 
     def test_adding_another_passkey_succeeds_with_fresh_authentication(self):
@@ -974,6 +1013,12 @@ class TestStepUpAuthentication(ServerCase):
 
     def test_removal_succeeds_with_fresh_authentication(self):
         self.seed_existing_passkey()
+        # A second key: removing the final passkey is rejected with 409 while
+        # the deployment policy requires authentication.
+        with server_app.app.app_context():
+            table = models.PasskeyCredential.__table__
+            server_app.db().execute(table.insert().values(identity_id=1, credential_id=b"cred2", credential_public_key=b"\x02", label="Spare"))
+            server_app.db().commit()
         self.unlock(authenticated_at=time.time())
         self.assertEqual(self.client.delete("/api/passkeys/Y3JlZA", headers=self.headers()).status_code, 200)
 
@@ -986,7 +1031,10 @@ class TestStepUpAuthentication(ServerCase):
     def test_disable_succeeds_with_fresh_authentication(self):
         self.seed_existing_passkey()
         self.unlock(authenticated_at=time.time())
-        response = self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers())
+        # Deployment policy forbids disabling protection when VAULT_AUTH_POLICY=required;
+        # exercise the success path with the policy relaxed (test-only).
+        with patch.object(server_app, "AUTH_POLICY", "optional"):
+            response = self.client.post("/api/passkeys/disable", json={"confirm_unlocked": True}, headers=self.headers())
         self.assertEqual(response.status_code, 200)
 
 
@@ -1029,6 +1077,7 @@ class TestDestructiveRecordAuthorization(ServerCase):
 
     def test_registered_passkey_with_unauthenticated_session_is_rejected(self):
         self.seed_record(); self.seed_passkey()
+        self.deauthenticate()
         response = self.client.delete("/api/records", headers=self.headers())
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.record_count(), 1)
@@ -1053,19 +1102,26 @@ class TestDestructiveRecordAuthorization(ServerCase):
 
     def test_vault_unlocked_alone_cannot_authorize_delete(self):
         self.seed_record(); self.seed_passkey()
-        with self.client.session_transaction() as sess:
-            sess["vault_unlocked"] = True
+        # The browser's vault-open hint with no WebAuthn authentication at all.
+        self.authorize(None, unlocked=True)
         response = self.client.delete("/api/records", headers=self.headers())
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.record_count(), 1)
 
     def test_vault_unlocked_endpoint_cannot_authorize_delete_or_refresh_authentication(self):
         self.seed_record(); self.seed_passkey()
+        with self.client.session_transaction() as sess:
+            before = sess.get("authenticated_at")
         unlocked = self.client.post("/api/vault/unlocked", headers=self.headers())
         self.assertEqual(unlocked.status_code, 200)
         with self.client.session_transaction() as sess:
             self.assertTrue(sess["vault_unlocked"])
-            self.assertIsNone(sess.get("authenticated_at"))
+            # The UI hint must not mint or refresh WebAuthn authentication.
+            self.assertEqual(sess.get("authenticated_at"), before)
+        # Expire the WebAuthn authentication: destructive operations stay rejected.
+        stale = time.time() - server_app.VAULT_STEPUP_WINDOW_SECONDS - 1
+        with self.client.session_transaction() as sess:
+            sess["authenticated_at"] = stale
         self.assertEqual(self.client.post("/api/passkeys/register/options", headers=self.headers()).status_code, 401)
         response = self.client.delete("/api/records", headers=self.headers())
         self.assertEqual(response.status_code, 401)
@@ -1115,13 +1171,16 @@ class TestDestructiveRecordAuthorization(ServerCase):
     def test_unlock_hint_rejects_passphrase_and_key_payloads(self):
         passphrase = "must-never-be-stored-passphrase"
         encryption_key = "must-never-be-stored-key"
+        with self.client.session_transaction() as sess:
+            before = sess.get("authenticated_at")
         response = self.unsafe("post", "/api/vault/unlocked", json={
             "passphrase": passphrase, "encryption_key": encryption_key,
         })
         self.assertEqual(response.status_code, 400)
         with self.client.session_transaction() as sess:
             self.assertFalse(sess.get("vault_unlocked", False))
-            self.assertIsNone(sess.get("authenticated_at"))
+            # The rejected request must not touch WebAuthn authentication state.
+            self.assertEqual(sess.get("authenticated_at"), before)
         database = self.db_bytes()
         self.assertNotIn(passphrase.encode(), database)
         self.assertNotIn(encryption_key.encode(), database)
