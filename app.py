@@ -626,6 +626,21 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.get("/api/version")
+def version():
+    """Build version info. No auth required. Used by CI to verify the
+    deployed revision matches the tested commit.
+    
+    Returns:
+        - commit: GITHUB_SHA (short) or "unknown" if not set
+        - built_at: ISO timestamp of container build (if available)
+    """
+    return jsonify({
+        "commit": os.environ.get("GITHUB_SHA", "unknown")[:12],
+        "built_at": os.environ.get("BUILD_TIMESTAMP", "unknown"),
+    })
+
+
 # ------------------------------------------------------------------
 # Honeypot endpoints: common attack paths that should never be hit
 # by legitimate users. Any hit is logged as a security event.

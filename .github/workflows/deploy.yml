@@ -171,7 +171,10 @@ jobs:
           # Note: --no-cache ensures fresh builds but does not improve reproducibility.
           # For stronger supply-chain assurance: pin base image by digest,
           # pin all Python dependencies with hashes, and use verified build provenance.
-          docker build --no-cache -t "$IMAGE" .
+          docker build --no-cache \
+            --build-arg GITHUB_SHA="${{ github.sha }}" \
+            --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$IMAGE" .
           docker push "$IMAGE"
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
@@ -184,3 +187,41 @@ jobs:
             --set-env-vars "VAULT_ENV=production,VAULT_AUTH_POLICY=required,VAULT_RP_ID=mindful-money-k23ukkh5cq-uc.a.run.app,VAULT_ORIGIN=https://mindful-money-k23ukkh5cq-uc.a.run.app,VAULT_TRUST_PROXY=1,VAULT_CSP_MODE=enforce" \
             --set-secrets "VAULT_SECRET_KEY=mindful-money-secret:latest,VAULT_DATABASE_URL=neon-db-url:latest" \
             --quiet
+
+      - name: Post-deploy smoke tests
+        run: |
+          echo "=== Waiting for deployment to stabilize ==="
+          sleep 30
+          
+          BASE_URL="https://mindful-money-31393284277.us-central1.run.app"
+          EXPECTED_SHA="${{ github.sha }}"
+          EXPECTED_SHORT=$(echo "$EXPECTED_SHA" | cut -c1-12)
+          
+          echo "=== Checking /health ==="
+          HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/health")
+          if [ "$HEALTH_CODE" != "200" ]; then
+            echo "FAILED: /health returned $HEALTH_CODE"
+            exit 1
+          fi
+          echo "Health check passed"
+          
+          echo "=== Checking /api/version ==="
+          VERSION=$(curl -s "$BASE_URL/api/version")
+          DEPLOYED_SHA=$(echo "$VERSION" | python3 -c "import sys, json; print(json.load(sys.stdin).get('commit', 'unknown'))")
+          echo "Expected: $EXPECTED_SHORT"
+          echo "Deployed: $DEPLOYED_SHA"
+          if [ "$DEPLOYED_SHA" != "$EXPECTED_SHORT" ]; then
+            echo "FAILED: Deployed commit does not match expected (stale deployment!)"
+            exit 1
+          fi
+          echo "Version check passed"
+          
+          echo "=== Checking /api/passkeys/status ==="
+          STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/passkeys/status")
+          if [ "$STATUS_CODE" = "404" ] || [ "$STATUS_CODE" = "500" ]; then
+            echo "FAILED: /api/passkeys/status returned $STATUS_CODE"
+            exit 1
+          fi
+          echo "API status check passed"
+          
+          echo "=== All smoke tests passed ==="

@@ -1,6 +1,12 @@
 # Mindful Money - Cloud Run deployment
 FROM python:3.12-slim
 
+# Build args for version tracking (set by CI)
+ARG GITHUB_SHA=unknown
+ARG BUILD_TIMESTAMP=unknown
+ENV GITHUB_SHA=${GITHUB_SHA}
+ENV BUILD_TIMESTAMP=${BUILD_TIMESTAMP}
+
 # Security: run as non-root
 RUN useradd --create-home --shell /bin/bash appuser
 WORKDIR /home/appuser/app

@@ -279,3 +279,63 @@ pass) to unblock deploys. The broken tests are documented here as tech debt.
 All changes in this session are code-only. No GCP resources created,
 no IAM changes made, no billing implications. The only pending cost
 is the normal Cloud Run usage (already running).
+
+## Addendum: Verification System Overhaul (2026-10-12)
+
+### Stage 1: Restore Trust in CI (Complete)
+
+**Problem:** CI ran only 6 of 88 tests (6.8%). The 82 excluded tests covered
+authentication, tenant isolation, privacy, and lifecycle. Deployment gate was
+meaningless for security properties.
+
+**Root cause:** Tests were written when `VAULT_AUTH_POLICY` was optional.
+When the policy became `required`, 43 tests failed because they didn't
+authenticate. Rather than fix the fixtures, CI was narrowed to the 6 crypto
+tests that didn't need auth.
+
+**Fix:**
+1. `ServerCase.setUp()` now authenticates by default (matches production)
+2. Added `authenticate()`/`deauthenticate()`/`csrf()` helpers to base class
+3. Fixed 43 failures:
+   - Tests expecting 401 now call `deauthenticate()` first
+   - Stale data-model references updated (fakebank removal, 3 static txns)
+   - Policy-gated endpoints (final passkey protection, disable protection)
+   - Step-up timing (explicit stale timestamps vs `unlock(None)`)
+   - Rate limit group names (`relay` → `upload`)
+
+**CI changes:**
+- Full suite: `pytest test_demo.py` (was `-k "TestBrowserCrypto"`)
+- pip-audit now fails build on production vulnerabilities (was `|| echo`)
+- Added `alembic upgrade head` on fresh database (was regex chain check only)
+
+**Result:** 88/88 passing, then 99/99 with Stage 2 additions.
+
+### Stage 2: Prove the Privacy Model (Complete)
+
+Added 11 high-value security tests organized around guarantees, not functions:
+
+**TestCrossDeviceRecovery** (4 tests):
+- Backup export contains no plaintext (DB scan for distinctive values)
+- Export/import roundtrip preserves data (decrypts correctly)
+- Wrong passphrase cannot decrypt (raises exception)
+- Tampered backup fails integrity (authenticated encryption)
+
+**TestAuthorizationBoundary** (4 tests):
+- Bootstrap requires token when `VAULT_BOOTSTRAP_TOKEN` configured
+- Bootstrap rejected with 403 when passkeys already exist
+- Cross-user record access returns empty (tenant isolation, not 403)
+- Cross-user delete doesn't affect other tenants
+
+**TestPlaintextExposure** (3 tests):
+- Distinctive value `PRIVATE-MERCHANT-TEST-4821` never in DB
+- Audit logs contain no transaction plaintext
+- Blind indexes are valid hex, not reversible to plaintext
+
+**Result:** 99/99 passing. Every security invariant is now enforced automatically.
+
+### Stage 3: Prove Deployment (In Progress)
+
+Remaining work:
+- Expose `GITHUB_SHA` via version endpoint or Cloud Run metadata
+- Post-deploy smoke tests: verify live revision matches commit, `/health` returns 200, critical API behavior
+- Branch protection requiring verification jobs before merge
