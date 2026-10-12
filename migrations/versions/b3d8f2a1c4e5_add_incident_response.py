@@ -46,10 +46,28 @@ def upgrade() -> None:
         ["id"],
         ondelete="SET NULL",
     )
-    # Add new event types to the enum
-    # Note: PostgreSQL requires ALTER TYPE ... ADD VALUE
-    op.execute("ALTER TYPE audit_event_type ADD VALUE 'UNUSUAL_ACTIVITY_DETECTED'")
-    op.execute("ALTER TYPE audit_event_type ADD VALUE 'INCIDENT_ACKNOWLEDGED'")
+    # Add new event types to the CHECK constraint
+    # Note: The event_type column uses a CHECK constraint (not a native PG enum),
+    # so we drop and recreate the constraint with the expanded value list.
+    # This mirrors the approach in d5e6f7a8b9c0_add_honeypot_event_types.py.
+    conn = op.get_bind()
+    result = conn.execute(sa.text("""
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = 'audit_events'::regclass
+        AND contype = 'c'
+        AND pg_get_constraintdef(oid) LIKE '%event_type%'
+    """))
+    for row in result:
+        op.execute(sa.text(f'ALTER TABLE audit_events DROP CONSTRAINT IF EXISTS "{row[0]}"'))
+    op.execute(sa.text(
+        "ALTER TABLE audit_events ADD CONSTRAINT audit_events_event_type_check "
+        "CHECK (event_type IN ("
+        "'PASSKEY_REGISTERED', 'PASSKEY_REMOVED', 'PASSKEY_AUTH_SUCCESS', "
+        "'PASSKEY_AUTH_FAILURE', 'PASSKEY_PROTECTION_DISABLED', "
+        "'SESSION_REVOKED', 'SUSPICIOUS_COUNTER_EVENT', "
+        "'UNUSUAL_ACTIVITY_DETECTED', 'INCIDENT_ACKNOWLEDGED'"
+        "))"
+    ))
 
 
 def downgrade() -> None:
