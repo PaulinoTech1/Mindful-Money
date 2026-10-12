@@ -1,5 +1,9 @@
 # Vault — working prototype
 
+## TL;DR
+
+A privacy-first personal finance tracker (Vault). Client-side encryption, passkeys, and memory-hard key derivation mean the server never sees your plaintext. Goal: personal finance software you do not have to trust with your data.
+
 **Architecture update (2026-10-11):** The server-side bank relay (`/api/relay`,
 `fakebank.py`, `simplefin.py`) has been removed. Bank data ingestion is now
 entirely client-side via `static/simplefin-client.js`. The server never sees
