@@ -336,10 +336,23 @@ def _rate_group():
 
 
 def _rate_subject(group):
-    ip = request.remote_addr or "unknown"
+    """Rate limit bucket key.
+    
+    Authenticated: keyed by identity ID (per-account limits).
+    Unauthenticated: keyed by client IP via _client_log_id() (trusted remote_addr).
+    
+    Previously used session ID for anonymous users, which allowed budget reset
+    by clearing cookies. Now uses the client IP so anonymous abuse is tracked
+    consistently regardless of session rotation.
+    """
     identity = session.get("identity_id")
-    principal = f"identity:{identity}" if identity else f"session:{_sid_hash(session.sid)}"
-    raw = f"{group}|{ip}|{principal}".encode()
+    if identity:
+        principal = f"identity:{identity}"
+    else:
+        # Anonymous: use trusted client IP, not session ID
+        # _client_log_id() is HMAC(remote_addr), not spoofable via headers
+        principal = f"anon:{_client_log_id()}"
+    raw = f"{group}|{principal}".encode()
     return hmac.new(RATE_KEY, raw, hashlib.sha256).hexdigest()
 
 

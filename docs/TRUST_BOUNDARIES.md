@@ -103,8 +103,10 @@ You do NOT need to trust:
 2. Do not claim compliance with any framework (SOC 2, HIPAA, PCI DSS, etc.).
 3. Consider a formal security review before handling real financial data.
 4. Consider code signing or SRI for the served JavaScript.
-5. The per-browser salt storage (localStorage) means clearing browser data
-   loses access to encrypted records. Document this for users.
+5. KDF salts are stored server-side per identity (migrated from legacy
+   browser-local storage). Clearing browser data no longer loses access.
+   Legacy vaults with localStorage salts can migrate via /api/kdf/salts/migrate.
+   Backup files include salts for cross-device recovery.
 
 ## Session security
 

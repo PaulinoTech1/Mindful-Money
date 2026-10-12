@@ -718,7 +718,29 @@ async function handleCSVUpload(event) {
 
     // Parse client-side. Raw CSV never touches the server.
     $('connectNote').textContent = 'Parsing transactions...';
-    const transactions = parseBankCSV(text);
+    const parseResult = parseBankCSV(text);
+    const transactions = parseResult.transactions;
+    const recon = parseResult.reconciliation;
+
+    // Import preview: show reconciliation before uploading
+    // Encrypted financial misinformation is still misinformation.
+    let previewMsg = `CSV Import Preview:\n\n` +
+      `Total rows: ${recon.total_rows}\n` +
+      `Accepted: ${recon.accepted}\n` +
+      `Rejected: ${recon.rejected.length}\n` +
+      `Total debits: $${recon.total_debits.toFixed(2)}\n` +
+      `Total credits: $${recon.total_credits.toFixed(2)}\n`;
+    if (recon.rejected.length > 0) {
+      previewMsg += `\nRejected rows:\n` +
+        recon.rejected.slice(0, 10).map(r => `  Row ${r.row}: ${r.reason}`).join('\n');
+      if (recon.rejected.length > 10)
+        previewMsg += `\n  ... and ${recon.rejected.length - 10} more`;
+    }
+    previewMsg += `\n\nProceed with import?`;
+    if (!confirm(previewMsg)) {
+      $('connectNote').textContent = 'Import cancelled.';
+      return;
+    }
 
     $('connectNote').textContent = `Encrypting ${transactions.length} transactions in your browser...`;
     await new Promise((r) => setTimeout(r, 30));

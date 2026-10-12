@@ -678,17 +678,26 @@ function parseBankCSV(csvText) {
   }
 
   var transactions = [];
+  var rejected = [];
+  var seenIds = {};
   for (var i = 1; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
     var cols = parseCSVLine(lines[i]);
+    var rowNum = i + 1;
 
     var date = cols[dateIdx] ? cols[dateIdx].trim() : "";
     var merchant = cols[descIdx] ? cols[descIdx].trim() : "";
-    if (!date || !merchant) continue;
+    if (!date || !merchant) {
+      rejected.push({row: rowNum, reason: !date ? "missing date" : "missing merchant/description"});
+      continue;
+    }
 
     // Normalize date to YYYY-MM-DD
     date = normalizeDate(date);
-    if (!date) continue;
+    if (!date) {
+      rejected.push({row: rowNum, reason: "unparseable date: " + cols[dateIdx]});
+      continue;
+    }
 
     var amount;
     if (amountIdx !== -1) {
@@ -698,14 +707,23 @@ function parseBankCSV(csvText) {
       var credit = parseAmount(cols[creditIdx] || "0");
       amount = credit - debit;
     }
-    if (amount === null || isNaN(amount)) continue;
+    if (amount === null || isNaN(amount)) {
+      rejected.push({row: rowNum, reason: "unparseable amount"});
+      continue;
+    }
 
     // Sanitize: strip control chars, limit length, prevent code injection
     // (data is encrypted before storage, but defense in depth)
     merchant = merchant.replace(/[\x00-\x1F\x7F]/g, "").slice(0, 200);
 
+    var txnId = "csv-" + i + "-" + Math.abs(hashStr(date + merchant + amount));
+    if (seenIds[txnId]) {
+      rejected.push({row: rowNum, reason: "duplicate of row " + seenIds[txnId]});
+      continue;
+    }
+    seenIds[txnId] = rowNum;
     transactions.push({
-      id: "csv-" + i + "-" + Math.abs(hashStr(date + merchant + amount)),
+      id: txnId,
       date: date,
       merchant: merchant,
       amount: Math.round(amount * 100) / 100,
@@ -718,10 +736,25 @@ function parseBankCSV(csvText) {
     });
   }
 
-  if (!transactions.length) {
-    throw new Error("No valid transactions found in CSV");
+  // Reconciliation: track what was accepted, rejected, and why
+  var reconciliation = {
+    total_rows: lines.length - 1,
+    accepted: transactions.length,
+    rejected: rejected,
+    total_debits: 0,
+    total_credits: 0,
+  };
+  for (var j = 0; j < transactions.length; j++) {
+    if (transactions[j].amount < 0) reconciliation.total_debits -= transactions[j].amount;
+    else reconciliation.total_credits += transactions[j].amount;
   }
-  return transactions;
+
+  if (!transactions.length) {
+    throw new Error("No valid transactions found in CSV. " +
+      rejected.length + " rows rejected: " +
+      rejected.slice(0, 3).map(function(r) { return "row " + r.row + " (" + r.reason + ")"; }).join("; "));
+  }
+  return { transactions: transactions, reconciliation: reconciliation };
 }
 
 function parseCSVLine(line) {

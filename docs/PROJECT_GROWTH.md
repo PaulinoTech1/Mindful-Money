@@ -130,11 +130,12 @@ Actions deploy had ever succeeded. 14 workflow runs failed silently.
 | `928c8ec0` | Bypassable rate limit (XFF), dead-end mistake artifacts |
 | `0f46a7dd` | ASN logging via bundled GeoLite2 database |
 
-**Tarpit design:**
+**Deception design (redesigned per review):**
 - Fake WordPress, phpMyAdmin, XML-RPC, .env, git config, robots.txt
-- Random 3-12s delays waste attacker time
+- Perceived vulnerabilities (XFF-based fake counter) vs actual controls (trusted IP limits)
+- Simulated async operations instead of time.sleep (zero worker blocking)
 - Intentional "mistakes" (fake creds in HTML comments, TODOs, old versions)
-- Rate limiter trusts X-Forwarded-For (bypassable by mid-tier analysts by design)
+- Passwords never collected from fake forms
 - ASN logging reveals attacker infrastructure (VPS, VPN, Tor, residential)
 
 **Cost controls:**
@@ -146,7 +147,7 @@ Actions deploy had ever succeeded. 14 workflow runs failed silently.
 
 | Metric | Start | End |
 |---|---|---|
-| Tests passing | 6/88 (6.8%) | 110/110 |
+| Tests passing | 6/88 (6.8%) | 141/141 |
 | CI deploy success | 0/14 runs | Blocked on IAM (code ready) |
 | Security tests | 0 | 25+ (recovery, authz, exposure, honeypot) |
 | Browser tests | 0 | 20 (Playwright real-browser) |
@@ -155,10 +156,25 @@ Actions deploy had ever succeeded. 14 workflow runs failed silently.
 | Bootstrap protection | None | Token-required, fail-closed |
 | Honeypot | Basic 404 | Full tarpit with ASN intel |
 
+## Phase 9: Deep review fixes
+
+| Finding | Fix |
+|---|---|
+| Backup used nonexistent `KEYS.enc` | Domain-separated `backupAuthKey()` via BLAKE2b |
+| Integrity allowed unkeyed downgrade | HMAC-SHA256 only, no fallback |
+| Recovery mutated salts before validation | Transactional: validate with candidate keys first |
+| Session resurrection race | `WHERE revoked_at IS NULL` on upsert |
+| Anonymous rate limit via session ID | Now keyed by trusted client IP |
+| Honeypot DB writes before rate limit | Rate limit checked first, sampling |
+| Double webhook on honeypot | Removed (audit_event already fires it) |
+| Passphrase retained in DOM | Cleared after derivation |
+| CSV silent row drops | Preview with reconciliation report |
+| test_browser.py stale expectations | Format checks, not hardcoded values |
+
 ## What remains
 
 1. **IAM fix** (Boss): `gcloud iam service-accounts add-iam-policy-binding` for `actAs`
-2. **Playwright test** (in progress): real-browser recovery proof
-3. **Production verification**: smoke tests confirm deployed commit matches
-4. **Migrations**: `alembic upgrade head` on production database
-5. **Bootstrap**: set token, enroll first passkey, remove token
+2. **Production verification**: smoke tests confirm deployed commit matches
+3. **Migrations**: `alembic upgrade head` on production database
+4. **Bootstrap**: set token, enroll first passkey, remove token
+5. **Dependency locking**: pin production versions (currently ranges)

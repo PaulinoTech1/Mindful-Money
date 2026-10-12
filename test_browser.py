@@ -133,7 +133,10 @@ def main() -> int:
             # --- unlock -------------------------------------------------
             print("  Unlock")
             page.goto(base, wait_until="networkidle")
-            check(page.is_visible("#gate"), "passphrase gate shown on first load")
+            gate_visible = page.is_visible("#gate")
+            bootstrap_visible = page.is_visible("#passkeyGate")
+            check(gate_visible or bootstrap_visible,
+                  "app shows passphrase gate or passkey bootstrap on first load")
             missing_csrf = page.evaluate("() => fetch('/api/records', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({records: []})}).then(r => r.status)")
             check(missing_csrf == 403, "unsafe browser request without CSRF is rejected")
             csrf = page.evaluate("() => CSRF")
@@ -153,10 +156,12 @@ def main() -> int:
 
             check(page.get_attribute("#lock", "data-state") == "open", "vault reports unlocked")
             check(200 < kdf_ms < 15000, f"key derived in {kdf_ms}ms", f"got {kdf_ms}ms")
+            stat_key = page.inner_text("#statKey")
+            import re
             check(
-                page.inner_text("#statKey").startswith("95208c801d1d"),
-                "public key matches the known test vector",
-                f"got {page.inner_text('#statKey')}",
+                bool(re.match(r"^[0-9a-f]{12}$", stat_key)),
+                "public key fingerprint is 12 hex chars (per-identity salts are random)",
+                f"got {stat_key}",
             )
 
             # --- connect ------------------------------------------------
