@@ -377,18 +377,19 @@ async function submitManualTransaction(event) {
 // KDF parameters by version.
 // v1: libsodium INTERACTIVE (ops=2, mem=64MB) - legacy, weaker
 // v2: libsodium MODERATE (ops=3, mem=256MB) - previous default
-// v3: aggressive (ops=5, mem=512MB) - current default for new vaults
+// v3: aggressive ops (ops=5, mem=256MB) - current default for new vaults
 // The version is stored server-side per identity. Existing vaults keep
 // their version until the user explicitly upgrades (to avoid lockout).
 //
-// v3 impact: deriveKeys runs Argon2id twice per unlock. Expect ~8-20s on
-// desktop, ~20-60s on phones. If the browser cannot allocate 512MB,
-// deriveKeys falls back to v2 automatically (see below).
+// v3 uses 256MB (not 512MB) because iOS Safari's Jetsam killer terminates
+// tabs that allocate large WASM heaps with zero warning. 256MB is the
+// practical iOS ceiling; 5 ops still gives 1.67x the work per guess over v2.
+// If allocation fails anyway, deriveKeys falls back to v2 (see below).
 function kdfParams(version) {
   if (version >= 3) {
     return {
       ops: 5,
-      mem: 512 * 1024 * 1024,
+      mem: 256 * 1024 * 1024,
       version: 3,
     };
   }
@@ -457,7 +458,7 @@ async function deriveKeys(passphrase, kdfVersion) {
   const saltEnc = salts.enc;
   const saltIdx = salts.idx;
 
-  // Try the requested KDF version. If v3 (512MB) fails (e.g., mobile browser
+  // Try the requested KDF version. If v3 fails (e.g., mobile browser
   // cannot allocate the memory), fall back to v2 automatically rather than
   // bricking the unlock. The fallback is logged and surfaced to the user.
   let ops = params.ops;
@@ -477,7 +478,7 @@ async function deriveKeys(passphrase, kdfVersion) {
     result = tryDerive(ops, mem);
   } catch (e) {
     if (params.version >= 3) {
-      console.warn('v3 KDF (512MB) failed, falling back to v2:', e.message);
+      console.warn('v3 KDF failed, falling back to v2:', e.message);
       const fallback = kdfParams(2);
       result = tryDerive(fallback.ops, fallback.mem);
       usedVersion = 2;

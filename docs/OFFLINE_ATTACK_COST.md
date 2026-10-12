@@ -9,12 +9,19 @@
 |---------|-----------|-----|--------|-------------|
 | v1 | Argon2id | 2 | 64 MB | Legacy (libsodium INTERACTIVE) |
 | v2 | Argon2id | 3 | 256 MB | Previous (libsodium MODERATE) |
-| v3 | Argon2id | 5 | 512 MB | Current (aggressive) |
+| v3 | Argon2id | 5 | 256 MB | Current (aggressive ops) |
 
 New vaults use v3. Existing vaults keep their version until the user
 explicitly upgrades (to avoid lockout from parameter mismatch).
-If a browser cannot allocate 512MB (e.g., mobile), the client automatically
+If a browser cannot allocate the memory, the client automatically
 falls back to v2 for that session and notifies the user.
+
+**Why 256MB and not 512MB:** iOS Safari's Jetsam (OOM killer) terminates
+tabs with zero warning on large WASM heap allocations. Research shows
+~196MB WASM allocations failing on iPhone 14 Pro Max, and production WASM
+projects cap iOS at 256MB. 512MB would brick unlocks on many iPhones.
+The 5 ops still provide 1.67x the computational work over v2 at the
+same memory footprint.
 
 ## Passphrase Requirements
 
@@ -32,13 +39,13 @@ falls back to v2 for that session and notifies the user.
 - Each GPU can test ~50,000 passphrases/second (conservative estimate for
   Argon2id with 256MB; actual throughput is lower due to memory bandwidth)
 
-### 60-bit passphrase vs Argon2id v3 (512MB, 5 ops)
+### 60-bit passphrase vs Argon2id v3 (256MB, 5 ops)
 
 - Search space: 2^60 ≈ 1.15 × 10^18 passphrases
-- Attacker with 10,000 GPUs: ~15,000 guesses/second/GPU (memory-bound at 512MB)
-  = 1.5 × 10^8 guesses/second total
-- Time to exhaust: 1.15 × 10^18 / 1.5 × 10^8 ≈ 7.7 × 10^9 seconds
-- **≈ 244 years** to exhaust, **≈ 122 years** on average
+- Attacker with 10,000 GPUs: ~30,000 guesses/second/GPU (memory-bound at 256MB,
+  1.67x slower than v2 due to 5 ops vs 3 ops) = 3 × 10^8 guesses/second total
+- Time to exhaust: 1.15 × 10^18 / 3 × 10^8 ≈ 3.8 × 10^9 seconds
+- **≈ 122 years** to exhaust, **≈ 61 years** on average
 
 ### 60-bit passphrase vs Argon2id v2 (256MB, 3 ops) - for comparison
 
@@ -56,10 +63,11 @@ falls back to v2 for that session and notifies the user.
 |---------|-------------------|
 | v1 (64MB, 2 ops) | **≈ 9 years** |
 | v2 (256MB, 3 ops) | **≈ 36 years** |
-| v3 (512MB, 5 ops) | **≈ 122 years** |
+| v3 (256MB, 5 ops) | **≈ 61 years** |
 
-The jump from v2 to v3 is ~3.4x. Diminishing returns apply: the 60-bit
-entropy floor matters more than KDF tuning beyond this point.
+The jump from v2 to v3 is ~1.7x (pure computational hardness; same memory
+bottleneck). Diminishing returns apply: the 60-bit entropy floor matters
+more than KDF tuning beyond this point.
 
 ## Memory-Hardness Rationale
 
