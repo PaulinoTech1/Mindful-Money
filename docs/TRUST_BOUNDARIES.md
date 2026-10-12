@@ -50,7 +50,7 @@ Sealed records are padded to fixed bucket sizes, closing the prior merchant-name
 
 ## Recovery
 
-An optional recovery key (256-bit, 32-word mnemonic) encrypts the vault seed. The server stores only the ciphertext. See `docs/RECOVERY.md` for threat model and current limitations (re-encryption flow incomplete, no threshold, no hardware binding).
+An optional recovery key (256-bit, 32-word mnemonic) encrypts the vault seed. The server stores only the ciphertext. Automatic re-encryption of existing records under a new passphrase is implemented. See `docs/RECOVERY.md` for the exact steps and remaining limitations (single point of failure, no threshold, passkey still required for blob fetch, no hardware binding).
 
 ## ZKP limitations
 
