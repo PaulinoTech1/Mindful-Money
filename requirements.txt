@@ -6,4 +6,3 @@ gunicorn>=23,<24; platform_system != "Windows"
 SQLAlchemy>=2.0,<3
 alembic>=1.13,<2
 psycopg[binary]>=3.1,<4
-pytest>=8,<9

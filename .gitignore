@@ -10,3 +10,4 @@ e2e-test.db*
 static/zkp/node_modules/
 static/zkp/dist/
 zkp/manual_expense/target/smoke/
+.pytest_cache/

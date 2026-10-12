@@ -52,16 +52,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install pytest pip-audit
+          pip install -r requirements-dev.txt
 
-      - name: Security audit dependencies
+      - name: Security audit production dependencies
         run: |
-          echo "=== Running pip-audit on production dependencies ==="
-          # Fail the build on vulnerabilities in production dependencies.
-          # Dev dependencies (pytest) are audited separately and don't block.
-          pip-audit --desc --ignore-vuln PYSEC-00000 2>&1
+          echo "=== Auditing production dependencies (blocks on vulnerabilities) ==="
+          # Only production deps are audited here. pytest and other dev tools
+          # are in requirements-dev.txt and do not ship to Cloud Run.
+          pip-audit --desc -r requirements.txt 2>&1
           echo "=== Production dependency audit passed ==="
+
+      - name: Security audit dev dependencies (informational)
+        run: |
+          echo "=== Auditing dev dependencies (informational only) ==="
+          pip-audit --desc -r requirements-dev.txt 2>&1 || echo "Dev dependency issues noted (non-blocking)"
 
       - name: Wait for PostgreSQL
         run: |
@@ -90,7 +94,7 @@ jobs:
           # Full regression suite: authentication, tenant isolation, privacy,
           # cryptography, and lifecycle tests. All 88 tests must pass.
           # See: docs/POST_MORTEM_STALE_DEPLOY.md for history.
-          python -m pytest test_demo.py -v --tb=short --no-header -rA 2>&1
+          python -m pytest test_demo.py test_zkp_server.py -v --tb=short --no-header -rA 2>&1
           echo "=== Test exit code: $? ==="
         env:
           VAULT_ENV: test
@@ -139,10 +143,13 @@ jobs:
           PGPASSWORD=vault_test_password psql -h localhost -U vault -d postgres -c "DROP DATABASE IF EXISTS vault_migrate_test;" 2>&1
           PGPASSWORD=vault_test_password psql -h localhost -U vault -d postgres -c "CREATE DATABASE vault_migrate_test OWNER vault;" 2>&1
           # Run all migrations
-          VAULT_ENV=test alembic upgrade head 2>&1
+          # Note: migrations/env.py reads VAULT_DATABASE_URL (not VAULT_TEST_DATABASE_URL)
+          VAULT_ENV=test VAULT_DATABASE_URL="postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_migrate_test" alembic upgrade head 2>&1
           echo "=== Migration test exit code: $? ==="
-        env:
-          VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_migrate_test
+          # Verify expected tables exist after migration
+          PGPASSWORD=vault_test_password psql -h localhost -U vault -d vault_migrate_test -c "\dt" 2>&1 | grep -q "audit_events" || (echo "FAILED: audit_events table missing after migration" && exit 1)
+          PGPASSWORD=vault_test_password psql -h localhost -U vault -d vault_migrate_test -c "\dt" 2>&1 | grep -q "records" || (echo "FAILED: records table missing after migration" && exit 1)
+          echo "=== Migration schema verified ==="
 
   deploy:
     runs-on: ubuntu-latest

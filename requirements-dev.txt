@@ -1,0 +1,4 @@
+# Development dependencies (testing, not deployed)
+-r requirements.txt
+pytest>=8,<9
+pip-audit
