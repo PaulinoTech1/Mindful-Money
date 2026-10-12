@@ -13,6 +13,7 @@ let CHARTS = {};
 let CSRF = '';
 let PASSKEY_REQUIRED = false;
 let PASSKEY_AUTHENTICATED = false;
+let BOOTSTRAP_NEEDED = false;
 let SIMPLEFIN_AVAILABLE = false;
 let EDITING_TRANSACTION_ID = null;
 let ANOMALIES = new Map();
@@ -1548,6 +1549,25 @@ async function loginPasskey() {
   } catch (error) { note.textContent = webauthnMessage(error); }
 }
 
+async function bootstrapPasskey() {
+  const note = $('passkeyGateNote');
+  try {
+    if (!window.PublicKeyCredential) throw new Error('This browser does not support WebAuthn passkeys.');
+    note.textContent = 'Creating your passkey…';
+    const options = await api('/api/passkeys/bootstrap/options', { method: 'POST' });
+    const credential = await navigator.credentials.create({ publicKey: options });
+    const result = await api('/api/passkeys/bootstrap/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ credential: credentialJSON(credential), label: 'Primary passkey' }),
+    });
+    CSRF = result.csrf_token;
+    PASSKEY_REQUIRED = true; PASSKEY_AUTHENTICATED = true; BOOTSTRAP_NEEDED = false;
+    $('passkeyGate').hidden = true; $('gate').hidden = false;
+    $('gate').querySelector('h1').textContent = 'Create your vault passphrase';
+    $('gateNote').textContent = 'Passkey created. Now choose a passphrase to encrypt your data.';
+  } catch (error) { note.textContent = webauthnMessage(error); }
+}
+
 async function refreshSecurity() {
   $('passkeyState').textContent = PASSKEY_REQUIRED ? 'Enabled' : 'Not enabled';
   $('enablePasskeyBtn').hidden = PASSKEY_REQUIRED;
@@ -1592,7 +1612,7 @@ async function disablePasskeys() {
 
 (async () => {
   const sessionInfo = await api('/api/session'); CSRF = sessionInfo.csrf_token;
-  const status = await api('/api/passkeys/status'); PASSKEY_REQUIRED = status.passkey_required; PASSKEY_AUTHENTICATED = status.authenticated;
+  const status = await api('/api/passkeys/status'); PASSKEY_REQUIRED = status.passkey_required; PASSKEY_AUTHENTICATED = status.authenticated; BOOTSTRAP_NEEDED = status.bootstrap_needed || false;
   SIMPLEFIN_AVAILABLE = true;
   await sodium.ready;
   S = sodium;
@@ -1624,7 +1644,19 @@ async function disablePasskeys() {
   $('addExpenseCancel').addEventListener('click', () => $('addExpenseDialog').close());
   $('addExpenseCancelX').addEventListener('click', () => $('addExpenseDialog').close());
   initChat();
-  if (PASSKEY_REQUIRED && !PASSKEY_AUTHENTICATED) { $('gate').hidden = true; $('passkeyGate').hidden = false; }
+  if (BOOTSTRAP_NEEDED) {
+    // First-time setup: no passkeys exist. Show bootstrap enrollment.
+    $('gate').hidden = true; $('passkeyGate').hidden = false;
+    $('passkeyGate').querySelector('h1').textContent = 'Set up your passkey';
+    $('passkeyGateNote').textContent = 'This is a new vault. Create a passkey to secure it.';
+    // Replace login button with bootstrap button
+    const loginBtn = $('passkeyLoginBtn');
+    if (loginBtn) {
+      loginBtn.textContent = 'Create passkey';
+      loginBtn.onclick = bootstrapPasskey;
+    }
+  }
+  else if (PASSKEY_REQUIRED && !PASSKEY_AUTHENTICATED) { $('gate').hidden = true; $('passkeyGate').hidden = false; }
   else $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';
 })();
 // Deploy trigger 20261011225949

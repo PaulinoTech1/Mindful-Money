@@ -880,7 +880,82 @@ def passkey_status():
     count=db().execute(select(func.count()).select_from(table).where(
         table.c.identity_id == current_identity_id()
     )).scalar_one()
-    return jsonify({"passkey_required":auth_required(),"authenticated":authenticated(),"has_usable_passkey":count>0})
+    return jsonify({"passkey_required":auth_required(),"authenticated":authenticated(),"has_usable_passkey":count>0,
+                    "bootstrap_needed":count==0})
+
+@app.post("/api/passkeys/bootstrap/options")
+def bootstrap_options():
+    """First-time passkey enrollment. Only allowed when no passkeys exist
+    for the current identity. This is the bootstrap flow for new deployments."""
+    owner_id = current_identity_id()
+    table = models.PasskeyCredential.__table__
+    count = db().execute(select(func.count()).select_from(table).where(
+        table.c.identity_id == owner_id)).scalar_one()
+    if count > 0:
+        return api_error("Bootstrap not available: passkeys already enrolled", 403)
+    ident = identity(owner_id)
+    if ident is None:
+        return api_error("Account is unavailable", 401)
+    options = generate_registration_options(
+        rp_id=RP_ID, rp_name=RP_NAME,
+        user_id=bytes(ident["user_handle"]),
+        user_name=f"vault-{owner_id}",
+        challenge=_new_challenge("bootstrap", owner_id),
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.PREFERRED,
+            user_verification=UserVerificationRequirement.REQUIRED),
+        attestation=AttestationConveyancePreference.NONE)
+    return app.response_class(options_to_json(options), mimetype="application/json")
+
+@app.post("/api/passkeys/bootstrap/verify")
+def bootstrap_verify():
+    """Verify bootstrap registration. Only allowed when no passkeys exist.
+    Does not require prior authentication (this IS the first authentication)."""
+    owner_id = current_identity_id()
+    table = models.PasskeyCredential.__table__
+    count = db().execute(select(func.count()).select_from(table).where(
+        table.c.identity_id == owner_id)).scalar_one()
+    if count > 0:
+        return api_error("Bootstrap not available: passkeys already enrolled", 403)
+    challenge_row = _take_challenge("bootstrap", owner_id)
+    if challenge_row is None:
+        return api_error("Passkey ceremony could not be verified", 400)
+    challenge = challenge_row["challenge"]
+    payload, error = _json_object()
+    if error: return error
+    credential = payload.get("credential"); label = payload.get("label", "Passkey")
+    if not isinstance(credential, dict) or not isinstance(label, str) or not label.strip() or len(label.strip()) > MAX_LABEL_LENGTH:
+        return api_error("Passkey registration could not be verified", 400)
+    label = label.strip()
+    conn = db()
+    try:
+        result = verify_registration_response(
+            credential=credential, expected_challenge=challenge,
+            expected_rp_id=RP_ID, expected_origin=ORIGIN,
+            require_user_verification=True)
+        conn.execute(insert(table).values(
+            identity_id=owner_id, credential_id=result.credential_id,
+            credential_public_key=result.credential_public_key,
+            sign_count=result.sign_count,
+            transports=(credential.get("response") or {}).get("transports", []),
+            device_type=str(result.credential_device_type),
+            backed_up=bool(result.credential_backed_up), label=label,
+        ))
+        identity_table = models.VaultIdentity.__table__
+        conn.execute(update(identity_table).where(identity_table.c.id == owner_id).values(
+            passkey_required=True, updated_at=func.now()))
+        _audit_event("PASSKEY_REGISTERED", credential_id=result.credential_id,
+                     detail={"label": label, "bootstrap": True})
+        conn.commit()
+    except IntegrityError:
+        conn.rollback(); return api_error("Passkey registration conflict", 409)
+    except (WebAuthnException, ValueError, KeyError, TypeError):
+        conn.rollback()
+        LOG.warning('event="authentication_failure" category="bootstrap_verification" client="%s"', _client_log_id())
+        return api_error("Passkey registration could not be verified", 400)
+    _rotate_session(identity_id=owner_id, vault_unlocked=True)
+    LOG.info('event="passkey_registered" category="bootstrap" client="%s"', _client_log_id())
+    return jsonify({"verified": True, "csrf_token": session["csrf_token"]})
 
 @app.post("/api/passkeys/register/options")
 def register_options():
