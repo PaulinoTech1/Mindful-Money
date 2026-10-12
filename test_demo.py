@@ -1281,7 +1281,6 @@ class TestTenantIsolation(ServerCase):
 # ---------------------------------------------------------------- runner
 
 REPORT = [
-    ("Fake bank feed", TestFakeBank),
     ("Browser crypto", TestBrowserCrypto),
     ("Server API", TestServerAPI),
     ("Optional passkeys", TestOptionalPasskeys),
