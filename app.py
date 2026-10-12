@@ -693,25 +693,36 @@ TARPIT_MAX_DELAY = 12  # seconds
 # Note: _tarpit_delay() is defined below with rate limiting.
 # See _honeypot_log() section for the full implementation.
 
-def _fake_wordpress_login():
-    """Convincing fake WordPress login page. Attackers will waste time
-    trying credentials against it.
+def _fake_wordpress_login(attempts_remaining=5, login_failed=False):
+    """Convincing fake WordPress login page.
     
     Contains intentional 'mistakes': HTML comments suggesting debug mode,
     a fake version number with known CVEs, and a commented-out test credential.
     All lead nowhere.
+    
+    The attempts_remaining counter is XFF-based deception: attacker changes
+    X-Forwarded-For, counter resets, they believe they bypassed a rate limit.
+    The real limit is independent.
     """
-    return """<!DOCTYPE html>
+    error_html = ""
+    if login_failed:
+        error_html = '<div id="login_error" style="color:#d63638;border-left:4px solid #d63638;padding:12px;margin-bottom:20px;background:#fff;">' \
+                     '<strong>Error:</strong> The username or password you entered is incorrect.</div>'
+    counter_html = f'<p style="color:#646970;font-size:13px;">Login attempts remaining: {attempts_remaining}</p>' \
+                   if attempts_remaining <= 5 else ""
+    return f"""<!DOCTYPE html>
 <html lang="en-US">
 <head><meta charset="UTF-8"><title>Log In &lsaquo; WordPress</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f0f1;color:#3c434a} #login{width:320px;margin:auto;padding:8% 0 0} .button{background:#2271b1;color:#fff;border:1px solid #2271b1;padding:0 12px;height:32px;cursor:pointer} input{width:100%;padding:3px;margin:2px 6px 16px 0;border:1px solid #8c8f94}</style>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f0f1;color:#3c434a}} #login{{width:320px;margin:auto;padding:8% 0 0}} .button{{background:#2271b1;color:#fff;border:1px solid #2271b1;padding:0 12px;height:32px;cursor:pointer}} input{{width:100%;padding:3px;margin:2px 6px 16px 0;border:1px solid #8c8f94}}</style>
 </head><body>
 <!-- TODO: disable WP_DEBUG before production push - exposes paths in errors -->
 <!-- Test account: wp_admin / TempPass123! (remove before go-live) -->
 <div id="login"><h1>WordPress</h1>
+{error_html}
 <form method="post" action="/wp-login.php">
 <p><label>Username or Email Address<br><input type="text" name="log"></label></p>
 <p><label>Password<br><input type="password" name="pwd"></label></p>
+{counter_html}
 <p><input type="submit" class="button" value="Log In"></p>
 </form></div>
 <!-- WordPress 5.8.3 | PHP 7.4.21 -->
@@ -741,13 +752,18 @@ REDIS_URL=redis://:p@ssw0rd123@localhost:6379/0
 # Backup bucket: s3://vault-backups-prod (migrating to Glacier)
 """
 
-def _fake_phpmyadmin():
-    """Fake phpMyAdmin login. Attackers love database admin panels."""
-    return """<!DOCTYPE html>
+def _fake_phpmyadmin(login_failed=False):
+    """Fake phpMyAdmin login. Attackers love database admin panels.
+    Does NOT log submitted passwords."""
+    error_html = ""
+    if login_failed:
+        error_html = '<p style="color:red;">#1045 - Access denied for user</p>'
+    return f"""<!DOCTYPE html>
 <html><head><title>phpMyAdmin</title>
-<style>body{font-family:sans-serif;background:#e9e9e9} .login{width:400px;margin:100px auto;background:#fff;padding:20px;border:1px solid #ccc} input{width:100%;padding:8px;margin:5px 0} .btn{background:#444;color:#fff;padding:10px;border:none;cursor:pointer;width:100%}</style>
+<style>body{{font-family:sans-serif;background:#e9e9e9}} .login{{width:400px;margin:100px auto;background:#fff;padding:20px;border:1px solid #ccc}} input{{width:100%;padding:8px;margin:5px 0}} .btn{{background:#444;color:#fff;padding:10px;border:none;cursor:pointer;width:100%}}</style>
 </head><body><div class="login">
 <h2>phpMyAdmin</h2><p>Welcome to phpMyAdmin</p>
+{error_html}
 <form method="post">
 <p>Username:<br><input type="text" name="pma_username"></p>
 <p>Password:<br><input type="password" name="pma_password"></p>
@@ -780,56 +796,79 @@ def _fake_git_config():
 @app.route("/wp-admin", methods=["GET", "POST"])
 @app.route("/wp-login.php", methods=["GET", "POST"])
 def honeypot_wordpress():
-    """Tarpit: fake WordPress with delay. Attackers waste time on credential stuffing."""
+    """Deception: fake WordPress login.
+    
+    Shows a fake "attempts remaining" counter based on X-Forwarded-For.
+    Attacker changes XFF, counter resets, they believe they bypassed a limit.
+    Real rate limit (_honeypot_rate_limited) uses trusted remote_addr and is
+    unaffected.
+    
+    Does NOT log submitted passwords. Only logs that an attempt occurred.
+    """
     _honeypot_log()
-    _tarpit_delay()
-    # If they POST credentials, log them and pretend to "process" slowly
+    if _honeypot_rate_limited():
+        # Over budget: minimal response, no deception frills
+        return jsonify({"error": "Not found"}), 404
     if request.method == "POST":
-        _tarpit_delay()  # Extra delay for POST (simulates slow auth)
+        # Log the attempt, NOT the credentials
         LOG.warning('event="honeypot_credential_attempt" path="%s" client="%s"',
                     request.path, _client_log_id())
-    return _fake_wordpress_login(), 200, {"Content-Type": "text/html"}
+        # Always "fail" the login, show remaining attempts (XFF-based deception)
+        remaining = _deception_attempts_remaining()
+        return _fake_wordpress_login(attempts_remaining=remaining,
+                                     login_failed=True), 200, {"Content-Type": "text/html"}
+    # Peek at current count without consuming an attempt (GET is free)
+    import hashlib
+    xff_id = _deception_xff_identity()
+    key = hashlib.sha256(xff_id.encode()).hexdigest()[:12]
+    used = _deception_attempt_counters.get(key, 0)
+    remaining = max(0, 5 - used)
+    return _fake_wordpress_login(attempts_remaining=remaining), 200, {"Content-Type": "text/html"}
 
 @app.route("/xmlrpc.php", methods=["GET", "POST"])
 def honeypot_xmlrpc():
-    """Tarpit: fake XML-RPC. Scanners will try pingback attacks."""
+    """Deception: fake XML-RPC. Scanners will try pingback attacks."""
     _honeypot_log()
-    _tarpit_delay()
+    if _honeypot_rate_limited():
+        return jsonify({"error": "Not found"}), 404
     return _fake_xmlrpc(), 200, {"Content-Type": "text/xml"}
 
 @app.route("/.env", methods=["GET"])
 def honeypot_env():
-    """Tarpit: fake secrets. Attackers will try these dead credentials."""
+    """Deception: fake secrets. Attackers will try these dead credentials."""
     _honeypot_log()
-    _tarpit_delay()
+    if _honeypot_rate_limited():
+        return jsonify({"error": "Not found"}), 404
     LOG.warning('event="honeypot_env_exfiltrated" client="%s"', _client_log_id())
     return _fake_env_file(), 200, {"Content-Type": "text/plain"}
 
 @app.route("/phpmyadmin", methods=["GET", "POST"])
 def honeypot_phpmyadmin():
-    """Tarpit: fake database admin. High-value target for attackers."""
+    """Deception: fake database admin. Does NOT log submitted passwords."""
     _honeypot_log()
-    _tarpit_delay()
+    if _honeypot_rate_limited():
+        return jsonify({"error": "Not found"}), 404
     if request.method == "POST":
-        _tarpit_delay()
         LOG.warning('event="honeypot_credential_attempt" path="%s" client="%s"',
                     request.path, _client_log_id())
+        return _fake_phpmyadmin(login_failed=True), 200, {"Content-Type": "text/html"}
     return _fake_phpmyadmin(), 200, {"Content-Type": "text/html"}
 
 @app.route("/.git/config", methods=["GET"])
 def honeypot_git():
-    """Tarpit: fake git config."""
+    """Deception: fake git config."""
     _honeypot_log()
-    _tarpit_delay()
+    if _honeypot_rate_limited():
+        return jsonify({"error": "Not found"}), 404
     return _fake_git_config(), 200, {"Content-Type": "text/plain"}
 
 @app.route("/robots.txt", methods=["GET"])
 def honeypot_robots():
-    """Tarpit: robots.txt that disallows 'interesting' paths.
-    Attackers love robots.txt - it tells them where to look.
-    Every disallowed path is a dead end."""
-    _honeypot_log()
-    _tarpit_delay()
+    """Deception: robots.txt directing scanners to dead ends.
+    No delay - kept cheap for legitimate crawlers."""
+    # Light logging only, no rate limit check (cheap endpoint)
+    LOG.info('event="honeypot_hit" path="/robots.txt" method="GET" client="%s"',
+             _client_log_id())
     return """User-agent: *
 Disallow: /admin/
 Disallow: /backup/
@@ -840,30 +879,58 @@ Disallow: /staging/
 # TODO: remove /backup-2024-01.zip before launch
 """, 200, {"Content-Type": "text/plain"}
 
+@app.route("/backup/export", methods=["POST"])
+def honeypot_backup_start():
+    """Deception: simulated async backup export.
+    
+    Instead of time.sleep(12) occupying a worker, return immediately with
+    a job ID. The attacker polls /backup/status for progress. Each poll
+    is cheap. The deception stays interactive without blocking workers.
+    """
+    _honeypot_log()
+    if _honeypot_rate_limited():
+        return jsonify({"error": "Not found"}), 404
+    job_id = _deception_start_backup_job()
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Backup export queued. Poll /backup/status for progress.",
+        "status_url": f"/backup/status?job_id={job_id}",
+    }), 202
+
+@app.route("/backup/status", methods=["GET"])
+def honeypot_backup_status():
+    """Deception: fake backup job progress. Cheap per-poll, never completes."""
+    _honeypot_log()
+    if _honeypot_rate_limited():
+        return jsonify({"error": "Not found"}), 404
+    job_id = request.args.get("job_id", "")
+    status = _deception_backup_status(job_id)
+    if not status:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(status), 200
+
 @app.route("/backup.zip", methods=["GET"])
 @app.route("/backup-2024-01.zip", methods=["GET"])
 @app.route("/db_backup.sql", methods=["GET"])
 def honeypot_backup():
-    """Tarpit: fake backup file. Serves garbage that looks like a zip header.
-    Attackers will waste time downloading and analyzing it."""
+    """Deception: redirect to async export. The old direct download is gone;
+    the attacker must use the job API, which keeps them engaged longer."""
     _honeypot_log()
-    _tarpit_delay()
-    LOG.warning('event="honeypot_backup_download" client="%s"', _client_log_id())
-    # Fake ZIP header followed by garbage - looks real, contains nothing
-    fake_zip = b"PK\x03\x04" + b"\x00" * 100 + b"fake backup data - " * 1000
-    return fake_zip, 200, {
-        "Content-Type": "application/zip",
-        "Content-Disposition": "attachment; filename=backup.zip",
-    }
+    if _honeypot_rate_limited():
+        return jsonify({"error": "Not found"}), 404
+    return jsonify({
+        "error": "Direct download disabled",
+        "message": "Use POST /backup/export to queue a backup job.",
+    }), 410
 
 @app.route("/api/admin", methods=["GET", "POST"])
 @app.route("/admin", methods=["GET", "POST"])
 @app.route("/api/v1/admin", methods=["GET", "POST"])
 @app.route("/server-status", methods=["GET"])
 def honeypot():
-    """Generic tarpit: delay then 404. For paths without specific fake content."""
+    """Generic deception: 404 for paths without specific fake content."""
     _honeypot_log()
-    _tarpit_delay()
     return jsonify({"error": "Not found"}), 404
 
 def _honeypot_log():
@@ -908,60 +975,98 @@ def _honeypot_log():
     except Exception:
         pass
 
-# In-memory per-IP honeypot hit tracking (resets on instance restart, which is fine
-# for abuse mitigation - persistent attackers get a fresh budget per instance, but
-# the max-instances cap bounds total cost)
+# In-memory per-client honeypot hit tracking (resets on instance restart).
+# Keyed by HMAC of request.remote_addr (trusted, not spoofable).
+# This is the REAL resource budget. It cannot be bypassed by header spoofing.
 _honeypot_hits = {}
-HONEYPOT_MAX_HITS_PER_MINUTE = 10
-
-def _honeypot_rate_limit_key():
-    """Get the rate limit key for honeypot throttling.
-    
-    INTENTIONAL WEAKNESS (tarpit design): This trusts the X-Forwarded-For header,
-    which an attacker can spoof. The real authentication (_client_log_id) uses
-    request.remote_addr and ignores XFF. A mid-tier analyst who compares the two
-    will spot the discrepancy and bypass the rate limit by rotating XFF values.
-    
-    This is deliberate: unsophisticated scanners hit the limit and give up or
-    slow down. Skilled analysts bypass it and invest more time in the tarpit,
-    which is exactly what we want - the longer they engage with fake content,
-    the more we learn and the less time they spend on real targets.
-    """
-    # Trust XFF if present (spoofable) - intentional for tarpit design
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        # Take the first IP (client's claimed address)
-        return xff.split(",")[0].strip()
-    return request.remote_addr or "unknown"
+HONEYPOT_MAX_HITS_PER_MINUTE = 30
 
 def _honeypot_rate_limited():
     """Check if this client has exceeded the honeypot rate limit.
-    Returns True if they should skip the tarpit delay (fail fast)."""
+    
+    Uses _client_log_id() which is HMAC(request.remote_addr) - the trusted
+    client IP, not spoofable via X-Forwarded-For. This is the real resource
+    budget. Returns True if the client should get minimal-cost responses.
+    """
     import time
-    # Use the spoofable key (intentional - see above)
-    key = _honeypot_rate_limit_key()
-    # Hash it for the log (don't store raw IPs in memory longer than needed)
-    import hashlib, hmac
-    client_id = hmac.new(RATE_KEY, key.encode(), hashlib.sha256).hexdigest()[:12]
+    client_id = _client_log_id()
     now = time.time()
     cutoff = now - 60
     _honeypot_hits[client_id] = [t for t in _honeypot_hits.get(client_id, []) if t > cutoff]
     _honeypot_hits[client_id].append(now)
     if len(_honeypot_hits[client_id]) > HONEYPOT_MAX_HITS_PER_MINUTE:
-        LOG.warning('event="honeypot_rate_limited" client="%s"', _client_log_id())
+        LOG.warning('event="honeypot_rate_limited" client="%s"', client_id)
         return True
     return False
 
-def _tarpit_delay():
-    """Random delay to waste attacker's time. Skipped if rate-limited."""
-    if _honeypot_rate_limited():
-        # Abuser is flooding: skip delay, return immediately to save our costs
-        LOG.warning('event="honeypot_rate_limited" client="%s"', _client_log_id())
-        return
+# --- Deception layer ---
+# The visible "vulnerabilities" below are entirely cosmetic. They change what
+# the attacker SEES, not what the server DOES. The real resource limits above
+# are independent and cannot be affected by these.
+
+def _deception_xff_identity():
+    """Get the attacker's claimed identity from X-Forwarded-For.
+    
+    This is DELIBERATELY spoofable. It's used ONLY for cosmetic deception:
+    the fake WordPress page shows a "login attempts remaining" counter that
+    resets when XFF changes. The attacker believes they bypassed a rate limit.
+    In reality, the real budget (_honeypot_rate_limited) is unaffected.
+    
+    Perceived vulnerability (fake counter resets) vs actual vulnerability
+    (none - real limits use trusted remote_addr).
+    """
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+# Fake per-XFF login attempt counters (cosmetic only)
+_deception_attempt_counters = {}
+
+def _deception_attempts_remaining():
+    """Return fake 'attempts remaining' for the deception layer.
+    Resets when XFF changes. Purely cosmetic - does not affect real limits.
+    """
+    import hashlib
+    xff_id = _deception_xff_identity()
+    key = hashlib.sha256(xff_id.encode()).hexdigest()[:12]
+    used = _deception_attempt_counters.get(key, 0) + 1
+    _deception_attempt_counters[key] = used
+    return max(0, 5 - used)
+
+# Fake async backup jobs (simulated long-running operation)
+# Instead of time.sleep(12) occupying a worker, return immediately with a job ID.
+# Polling returns plausible progress. Interactive deception, zero worker blocking.
+_deception_backup_jobs = {}
+
+def _deception_start_backup_job():
+    """Start a fake backup export job. Returns job ID immediately."""
     import secrets, time
-    delay = TARPIT_MIN_DELAY + secrets.randbelow(TARPIT_MAX_DELAY - TARPIT_MIN_DELAY + 1)
-    delay += secrets.randbelow(1000) / 1000.0
-    time.sleep(delay)
+    job_id = secrets.token_hex(8)
+    _deception_backup_jobs[job_id] = {"started": time.time(), "polls": 0}
+    LOG.warning('event="honeypot_backup_job_started" job="%s" client="%s"',
+                job_id, _client_log_id())
+    return job_id
+
+def _deception_backup_status(job_id):
+    """Return fake backup job progress. Advances on each poll."""
+    import time
+    job = _deception_backup_jobs.get(job_id)
+    if not job:
+        return None
+    job["polls"] += 1
+    elapsed = time.time() - job["started"]
+    # Fake progress: 0-100% over ~5 minutes of polling
+    progress = min(99, int((elapsed / 300) * 100) + job["polls"] * 2)
+    progress = min(99, progress)  # Never quite finishes
+    return {
+        "job_id": job_id,
+        "status": "preparing",
+        "progress": progress,
+        "message": f"Compressing database dump... {progress}%"
+                   if progress < 50 else
+                   f"Encrypting backup archive... {progress}%",
+    }
 
 
 @app.get("/ready")

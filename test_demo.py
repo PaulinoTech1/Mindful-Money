@@ -1667,48 +1667,72 @@ class TestPlaintextExposure(ServerCase):
 
 
 class TestHoneypotTarpit(ServerCase):
-    """Honeypot tarpits: convincing fakes that waste attacker time.
-    
-    These tests verify the tarpit serves realistic content (not just 404)
-    and logs the hit. We mock the delay to keep tests fast.
+    """Deception system: perceived vulnerabilities, no actual weaknesses.
+
+    The real rate limiter uses trusted remote_addr. The visible "bypass"
+    (XFF-based attempt counter) is cosmetic only.
     """
+
+    def setUp(self):
+        super().setUp()
+        import app as server_app
+        server_app._honeypot_hits.clear()
+        server_app._deception_attempt_counters.clear()
+        server_app._deception_backup_jobs.clear()
 
     def test_wordpress_honeypot_serves_fake_login(self):
         """GET /wp-login.php returns convincing fake WordPress page."""
-        from unittest.mock import patch
-        with patch("app._tarpit_delay"):  # Skip delay in tests
-            response = self.client.get("/wp-login.php")
+        response = self.client.get("/wp-login.php")
         self.assertEqual(response.status_code, 200)
         html = response.get_data(as_text=True)
         self.assertIn("WordPress", html)
         self.assertIn('name="log"', html)
         self.assertIn('name="pwd"', html)
 
+    def test_wordpress_shows_fake_attempt_counter(self):
+        """Fake attempt counter is XFF-based deception, not real limit."""
+        r1 = self.client.get("/wp-login.php", headers={"X-Forwarded-For": "10.99.99.1"})
+        self.assertIn("Login attempts remaining: 5", r1.get_data(as_text=True))
+        r2 = self.client.post("/wp-login.php", headers={"X-Forwarded-For": "10.99.99.1"},
+                              data={"log": "admin", "pwd": "wrong"})
+        self.assertIn("Login attempts remaining: 4", r2.get_data(as_text=True))
+        self.assertIn("incorrect", r2.get_data(as_text=True))
+        r3 = self.client.get("/wp-login.php", headers={"X-Forwarded-For": "10.99.99.2"})
+        self.assertIn("Login attempts remaining: 5", r3.get_data(as_text=True))
+
+    def test_wordpress_does_not_log_passwords(self):
+        """Submitted passwords are NOT stored in audit events."""
+        import app as server_app
+        test_password = "SuperSecretTestPassword123!"
+        self.client.post("/wp-login.php", data={"log": "admin", "pwd": test_password})
+        with server_app.app.app_context():
+            conn = server_app.db()
+            events = models.AuditEvent.__table__
+            hits = conn.execute(
+                events.select().where(events.c.event_type == "HONEYPOT_HIT")
+            ).fetchall()
+            for h in hits:
+                detail_str = str(h.detail) if h.detail else ""
+                self.assertNotIn(test_password, detail_str)
+
     def test_env_honeypot_serves_fake_secrets(self):
         """GET /.env returns plausible but fake secrets."""
-        from unittest.mock import patch
-        with patch("app._tarpit_delay"):
-            response = self.client.get("/.env")
+        response = self.client.get("/.env")
         self.assertEqual(response.status_code, 200)
         text = response.get_data(as_text=True)
         self.assertIn("DB_PASSWORD", text)
-        # Must NOT contain real secrets
         self.assertNotIn("vault_test_password", text)
 
     def test_phpmyadmin_honeypot_serves_fake_login(self):
         """GET /phpmyadmin returns fake database admin login."""
-        from unittest.mock import patch
-        with patch("app._tarpit_delay"):
-            response = self.client.get("/phpmyadmin")
+        response = self.client.get("/phpmyadmin")
         self.assertEqual(response.status_code, 200)
-        html = response.get_data(as_text=True)
-        self.assertIn("phpMyAdmin", html)
+        self.assertIn("phpMyAdmin", response.get_data(as_text=True))
 
     def test_honeypot_hit_is_audited(self):
         """Honeypot hits create HONEYPOT_HIT audit events."""
-        from unittest.mock import patch
-        with patch("app._tarpit_delay"):
-            self.client.get("/wp-admin")
+        import app as server_app
+        self.client.get("/wp-admin")
         with server_app.app.app_context():
             conn = server_app.db()
             events = models.AuditEvent.__table__
@@ -1716,78 +1740,59 @@ class TestHoneypotTarpit(ServerCase):
                 events.select().where(events.c.event_type == "HONEYPOT_HIT")
             ).fetchall()
             self.assertGreaterEqual(len(hits), 1)
-            # Verify path was logged
             paths = [h.detail.get("path") for h in hits if h.detail]
             self.assertIn("/wp-admin", paths)
 
     def test_honeypot_does_not_reveal_trap(self):
-        """Generic honeypot paths return 404 (not 403 or custom error)."""
-        from unittest.mock import patch
-        with patch("app._tarpit_delay"):
-            for path in ["/admin", "/api/admin", "/server-status"]:
-                response = self.client.get(path)
-                self.assertEqual(response.status_code, 404)
+        """Generic honeypot paths return 404."""
+        for path in ["/admin", "/api/admin", "/server-status"]:
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 404)
 
-    def test_robots_txt_disallows_fake_paths(self):
-        """/robots.txt lists tempting dead-end paths."""
-        from unittest.mock import patch
-        with patch("app._tarpit_delay"):
-            response = self.client.get("/robots.txt")
+    def test_robots_txt_is_cheap(self):
+        """/robots.txt has no rate limit check (cheap for crawlers)."""
+        response = self.client.get("/robots.txt")
         self.assertEqual(response.status_code, 200)
         text = response.get_data(as_text=True)
         self.assertIn("Disallow: /backup/", text)
-        self.assertIn("Disallow: /admin/", text)
 
-    def test_fake_backup_serves_garbage(self):
-        """Fake backup endpoints serve ZIP-looking garbage."""
-        from unittest.mock import patch
-        with patch("app._tarpit_delay"):
-            response = self.client.get("/backup.zip")
-        self.assertEqual(response.status_code, 200)
-        data = response.get_data()
-        self.assertTrue(data.startswith(b"PK\x03\x04"))  # ZIP magic
+    def test_backup_export_is_async(self):
+        """POST /backup/export returns job ID immediately (no sleep)."""
+        import time
+        start = time.time()
+        response = self.client.post("/backup/export")
+        elapsed = time.time() - start
+        self.assertEqual(response.status_code, 202)
+        self.assertLess(elapsed, 2.0)
+        data = response.get_json()
+        self.assertIn("job_id", data)
 
-    def test_rate_limit_bypass_via_xff(self):
-        """Rate limiter trusts X-Forwarded-For (intentional weakness).
-        A mid-tier analyst can bypass by rotating XFF values."""
-        from unittest.mock import patch
+    def test_backup_status_polling(self):
+        """GET /backup/status returns fake progress."""
+        r = self.client.post("/backup/export")
+        job_id = r.get_json()["job_id"]
+        r2 = self.client.get(f"/backup/status?job_id={job_id}")
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.get_json()["status"], "preparing")
+
+    def test_real_rate_limit_uses_trusted_ip(self):
+        """XFF rotation does NOT reset the real rate limit budget."""
         import app as server_app
-        # Clear rate limit state
         server_app._honeypot_hits.clear()
-        # Patch time.sleep to avoid actual delays, but let _tarpit_delay run
-        # so _honeypot_rate_limited is exercised
-        with patch("time.sleep"):
-            # Hit 15 times with same XFF -> should trigger rate limit
-            # (first 10 get delay, rest skip via rate limit)
-            for i in range(15):
-                self.client.get("/wp-admin", headers={"X-Forwarded-For": "1.2.3.4"})
-            # Verify rate limit state: 1.2.3.4 should have 15 hits recorded
-            import hashlib, hmac
-            key = hmac.new(server_app.RATE_KEY, b"1.2.3.4", hashlib.sha256).hexdigest()[:12]
-            self.assertEqual(len(server_app._honeypot_hits.get(key, [])), 15)
-            
-            # Now bypass with different XFF - each gets fresh budget
-            server_app._honeypot_hits.clear()
-            for i in range(5):
-                self.client.get("/wp-admin", headers={"X-Forwarded-For": f"5.6.7.{i}"})
-            # Each XFF should have exactly 1 hit (separate buckets)
-            for i in range(5):
-                k = hmac.new(server_app.RATE_KEY, f"5.6.7.{i}".encode(), hashlib.sha256).hexdigest()[:12]
-                self.assertEqual(len(server_app._honeypot_hits.get(k, [])), 1)
+        for i in range(35):
+            self.client.get("/wp-admin", headers={"X-Forwarded-For": f"10.0.0.{i}"})
+        r = self.client.get("/wp-admin", headers={"X-Forwarded-For": "10.0.0.99"})
+        self.assertEqual(r.status_code, 404)
 
     def test_asn_lookup(self):
-        """ASN lookup returns correct data for known IPs."""
+        """ASN lookup returns None when IP logging is off."""
         import app as server_app
-        # Google DNS
         asn_num, asn_org = server_app._lookup_asn("8.8.8.8")
-        # Only works when IP_LOGGING is on and DB exists
-        # In test env, IP_LOGGING is off, so should return (None, None)
         self.assertIsNone(asn_num)
 
     def test_asn_lookup_with_logging_enabled(self):
         """ASN lookup works when IP logging is enabled."""
         import app as server_app
-        # Temporarily enable IP logging
         orig = server_app.IP_LOGGING
         server_app.IP_LOGGING = True
         try:
@@ -1796,6 +1801,7 @@ class TestHoneypotTarpit(ServerCase):
             self.assertIn("Google", asn_org)
         finally:
             server_app.IP_LOGGING = orig
+
 
 
 if __name__ == "__main__":

@@ -1,81 +1,81 @@
-# Honeypot Tarpit Design
+# Honeypot Deception Design
 
-## Purpose
+## Core principle: perceived vulnerability, not actual vulnerability
 
-Waste attacker time, increase detection probability, and gather threat
-intelligence. Every second an attacker spends in the tarpit is a second
-they're not spending on real targets.
+An attacker should believe they've discovered an exploitable mistake, but
+the apparent weakness must never compromise real assets, bypass real controls,
+or consume disproportionate resources.
+
+| Perceived (deception) | Actual (reality) |
+|---|---|
+| XFF rotation resets login attempt counter | Real rate limit uses trusted `remote_addr`, unaffected |
+| Fake backup export takes 5 minutes | Each poll is a cheap JSON response, no worker blocking |
+| `.env` contains production credentials | All credentials are inert, point to nothing |
+| WordPress 5.8.3 has known CVEs | Static HTML, no WordPress installed |
+| `robots.txt` reveals backup paths | All paths are dead ends |
 
 ## Architecture
 
-### Covered paths
+### Deception layer (cosmetic)
 
-| Path | Response | Purpose |
-|------|----------|---------|
-| `/wp-admin`, `/wp-login.php` | Fake WordPress login (200) | Credential stuffing target |
-| `/xmlrpc.php` | Fake XML-RPC response (200) | Pingback scanner engagement |
-| `/.env` | Fake secrets file (200) | Dead credential harvesting |
-| `/phpmyadmin` | Fake DB admin login (200) | High-value target lure |
-| `/.git/config` | Fake git config (200) | Recon dead end |
-| `/robots.txt` | Disallows interesting paths (200) | Directs scanners to dead ends |
-| `/backup.zip`, `/db_backup.sql` | Fake ZIP garbage (200) | Wastes download/analysis time |
-| `/admin`, `/api/admin`, `/server-status` | Delay then 404 | Generic tarpit |
+These change what the attacker SEES. They are entirely fictional:
 
-### Tarpit delays
+**Fake attempt counter** (`_deception_attempts_remaining`)
+- Based on `X-Forwarded-For` header (spoofable by design)
+- Attacker rotates XFF → counter resets → believes they bypassed a limit
+- The real rate limiter is independent and unaffected
 
-Each hit incurs a random 3-12 second delay using a cryptographically secure
-RNG (`secrets.randbelow`). The unpredictability prevents attackers from
-timing their requests around it.
+**Fake async backup** (`/backup/export` → `/backup/status`)
+- POST returns 202 with job ID immediately (no `time.sleep`)
+- Polling returns plausible progress percentages
+- Never completes (stuck at 99%)
+- Each request is cheap; the deception is interactive without blocking workers
 
-POST requests to login forms get an extra delay (simulates slow auth backend).
+**Fake credentials and misconfigurations**
+- HTML comments with test accounts, TODOs, debug paths
+- `.env` with commented-out old passwords, fake S3 buckets
+- `robots.txt` disallowing tempting paths
+- All lead nowhere
 
-### Bypassable rate limiting (intentional)
+### Control layer (real)
 
-The rate limiter trusts the `X-Forwarded-For` header for its throttle key.
-The real authentication (`_client_log_id`) uses `request.remote_addr` and
-ignores XFF.
+These protect actual resources and cannot be bypassed:
 
-This is deliberate tarpit design:
-- **Unsophisticated scanners** hit the 10 hits/minute limit and slow down or give up
-- **Mid-tier analysts** spot the XFF discrepancy, rotate headers, and bypass the limit
-- **Result:** skilled attackers invest MORE time in the tarpit, which is the goal
+**Rate limiter** (`_honeypot_rate_limited`)
+- Keyed by HMAC of `request.remote_addr` (trusted, not spoofable)
+- 30 hits/minute per client; over budget → minimal 404 responses
+- Independent of XFF, cookies, or any attacker-controlled header
 
-The longer they engage with fake content, the more we learn and the less
-time they spend on real targets.
+**Infrastructure caps**
+- `--max-instances 3` (deploy workflow)
+- `--concurrency 8` per instance
+- Worst case bounded regardless of attack volume
 
-### Artifacts of mistakes (intentional dead ends)
+**No password collection**
+- Fake login forms log that an attempt occurred
+- Submitted passwords are NEVER stored, logged, or transmitted
+- Audit events contain path and metadata only
 
-Real systems have mistakes. The tarpit includes convincing ones that all
-lead nowhere:
+**Cheap robots.txt**
+- No rate limit check, no delay
+- Legitimate crawlers unaffected
 
-**WordPress HTML comments:**
-```html
-<!-- TODO: disable WP_DEBUG before production push -->
-<!-- Test account: wp_admin / TempPass123! (remove before go-live) -->
-<!-- WordPress 5.8.3 | PHP 7.4.21 -->
-<!-- Debug: /wp-content/debug.log (rotated daily) -->
-```
+## Why this matters
 
-**`.env` file:**
-```
-# TODO: rotate all keys before Q4 audit
-# Old credentials (disabled 2024-03, kept for reference):
-# DB_PASSWORD_OLD=Summer2023!Vault
-# Backup bucket: s3://vault-backups-prod (migrating to Glacier)
-```
+The previous design trusted `X-Forwarded-For` for the real rate limit budget.
+This was an actual vulnerability: an attacker could reset the expensive delay
+budget by rotating headers. The deception (fake counter) and the control
+(real limit) were conflated.
 
-**`robots.txt`:**
-```
-Disallow: /admin/
-Disallow: /backup/
-Disallow: /old-site/
-# TODO: remove /backup-2024-01.zip before launch
-```
+The fix separates them:
+- Deception operates on attacker-controlled signals (XFF)
+- Controls operate on trusted signals (`remote_addr`)
+- The attacker cannot distinguish which is which from outside
 
-Every thread pulls into nothing. The more convincing the mistake, the deeper
-the attacker invests before realizing it's fake.
+This follows MITRE Engage principles: shape what the adversary sees, thinks,
+and does, without introducing real weaknesses.
 
-### ASN logging
+## ASN logging
 
 When `VAULT_IP_LOGGING=on`, honeypot hits log the attacker's ASN:
 
@@ -83,56 +83,29 @@ When `VAULT_IP_LOGGING=on`, honeypot hits log the attacker's ASN:
 event="honeypot_hit" path="/wp-login.php" asn="AS15169 Google LLC"
 ```
 
-This reveals whether the attacker is on:
-- VPS/cloud provider (likely attacker infrastructure)
-- VPN/proxy service
-- Tor exit node
-- Residential ISP (possibly compromised device)
-
 Uses bundled GeoLite2-ASN database (8.6MB, free). Local file lookups,
 zero per-query cost. See `geoip/ATTRIBUTION.md`.
 
-## Cost controls
-
-Three layers prevent the tarpit from becoming an economic DoS vector:
-
-### 1. Max instances: 3
-
-Deploy workflow sets `--max-instances 3`. Cloud Run never spins up more
-than 3 instances regardless of attack volume.
-
-Worst case: 3 × 1 vCPU × 24h = ~$2/day if fully saturated.
-Normal: scales to zero ($0).
-
-### 2. Per-IP rate limiting
-
-More than 10 honeypot hits in 60 seconds from one IP → skip the tarpit
-delay, return immediately. Flood attackers burn through their budget then
-get instant responses.
-
-### 3. Concurrency: 8
-
-Each instance handles max 8 concurrent requests. Absolute ceiling:
-24 concurrent tarpit delays across all instances.
-
 ## Monitoring
 
-**Log events to watch:**
-- `honeypot_hit` - normal tarpit engagement
-- `honeypot_credential_attempt` - attacker tried credentials on fake login
-- `honeypot_env_exfiltrated` - attacker downloaded fake .env
-- `honeypot_backup_download` - attacker downloaded fake backup
-- `honeypot_rate_limited` - flooding attempt (investigate)
+**Deception engagement metrics** (for future analysis):
+- Unique XFF values per session (measures perceived bypass attempts)
+- Backup job poll count (measures engagement depth)
+- Path progression: robots.txt → .env → wp-login → backup/export
+- Repeat visits with different XFF (sophisticated actor indicator)
 
-**Webhook alerts:** All `HONEYPOT_HIT` events fire webhook alerts if
-`VAULT_WEBHOOK_URL` is configured. Includes ASN when available.
+**Security signals:**
+- `honeypot_hit` with ASN (threat intel)
+- `honeypot_credential_attempt` (active exploitation attempt, no password stored)
+- `honeypot_rate_limited` (flooding, real limit engaged)
+- `honeypot_backup_job_started` (deep engagement)
 
 ## Testing
 
-`TestHoneypotTarpit` (10 tests) verifies:
+`TestHoneypotTarpit` (13 tests) verifies:
 - Fake content served correctly
-- Audit events created
-- Rate limiting works
-- XFF bypass works (intentional)
-- ASN lookup functions
-- Trap not revealed by error codes
+- XFF counter resets (deception works)
+- XFF rotation does NOT reset real limit (control works)
+- Passwords not logged
+- Backup export returns immediately (no sleep)
+- Rate limiting engages on trusted IP
