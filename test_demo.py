@@ -1666,5 +1666,68 @@ class TestPlaintextExposure(ServerCase):
             int(blind, 16)  # Must parse as hex
 
 
+class TestHoneypotTarpit(ServerCase):
+    """Honeypot tarpits: convincing fakes that waste attacker time.
+    
+    These tests verify the tarpit serves realistic content (not just 404)
+    and logs the hit. We mock the delay to keep tests fast.
+    """
+
+    def test_wordpress_honeypot_serves_fake_login(self):
+        """GET /wp-login.php returns convincing fake WordPress page."""
+        from unittest.mock import patch
+        with patch("app._tarpit_delay"):  # Skip delay in tests
+            response = self.client.get("/wp-login.php")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("WordPress", html)
+        self.assertIn('name="log"', html)
+        self.assertIn('name="pwd"', html)
+
+    def test_env_honeypot_serves_fake_secrets(self):
+        """GET /.env returns plausible but fake secrets."""
+        from unittest.mock import patch
+        with patch("app._tarpit_delay"):
+            response = self.client.get("/.env")
+        self.assertEqual(response.status_code, 200)
+        text = response.get_data(as_text=True)
+        self.assertIn("DB_PASSWORD", text)
+        # Must NOT contain real secrets
+        self.assertNotIn("vault_test_password", text)
+
+    def test_phpmyadmin_honeypot_serves_fake_login(self):
+        """GET /phpmyadmin returns fake database admin login."""
+        from unittest.mock import patch
+        with patch("app._tarpit_delay"):
+            response = self.client.get("/phpmyadmin")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("phpMyAdmin", html)
+
+    def test_honeypot_hit_is_audited(self):
+        """Honeypot hits create HONEYPOT_HIT audit events."""
+        from unittest.mock import patch
+        with patch("app._tarpit_delay"):
+            self.client.get("/wp-admin")
+        with server_app.app.app_context():
+            conn = server_app.db()
+            events = models.AuditEvent.__table__
+            hits = conn.execute(
+                events.select().where(events.c.event_type == "HONEYPOT_HIT")
+            ).fetchall()
+            self.assertGreaterEqual(len(hits), 1)
+            # Verify path was logged
+            paths = [h.detail.get("path") for h in hits if h.detail]
+            self.assertIn("/wp-admin", paths)
+
+    def test_honeypot_does_not_reveal_trap(self):
+        """Generic honeypot paths return 404 (not 403 or custom error)."""
+        from unittest.mock import patch
+        with patch("app._tarpit_delay"):
+            for path in ["/admin", "/api/admin", "/server-status"]:
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 404)
+
+
 if __name__ == "__main__":
     sys.exit(main())

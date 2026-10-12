@@ -651,15 +651,147 @@ HONEYPOT_PATHS = [
     "/api/v1/admin", "/phpmyadmin", "/server-status",
 ]
 
+# Tarpit configuration: slow down attackers, waste their time, increase
+# the chance they are detected. These delays only apply to honeypot paths
+# which legitimate users never visit.
+TARPIT_MIN_DELAY = 3   # seconds
+TARPIT_MAX_DELAY = 12  # seconds
+
+def _tarpit_delay():
+    """Random delay to waste attacker's time. Uses cryptographically secure RNG
+    so the delay is unpredictable."""
+    import secrets, time
+    delay = TARPIT_MIN_DELAY + secrets.randbelow(TARPIT_MAX_DELAY - TARPIT_MIN_DELAY + 1)
+    # Add fractional component for less predictable timing
+    delay += secrets.randbelow(1000) / 1000.0
+    time.sleep(delay)
+
+def _fake_wordpress_login():
+    """Convincing fake WordPress login page. Attackers will waste time
+    trying credentials against it."""
+    return """<!DOCTYPE html>
+<html lang="en-US">
+<head><meta charset="UTF-8"><title>Log In &lsaquo; WordPress</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f0f1;color:#3c434a} #login{width:320px;margin:auto;padding:8% 0 0} .button{background:#2271b1;color:#fff;border:1px solid #2271b1;padding:0 12px;height:32px;cursor:pointer} input{width:100%;padding:3px;margin:2px 6px 16px 0;border:1px solid #8c8f94}</style>
+</head><body>
+<div id="login"><h1>WordPress</h1>
+<form method="post" action="/wp-login.php">
+<p><label>Username or Email Address<br><input type="text" name="log"></label></p>
+<p><label>Password<br><input type="password" name="pwd"></label></p>
+<p><input type="submit" class="button" value="Log In"></p>
+</form></div>
+<!-- WordPress 6.4.2 -->
+</body></html>"""
+
+def _fake_env_file():
+    """Fake .env file with plausible but useless secrets. Attackers will
+    waste time trying these credentials."""
+    return """# Production environment
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=vault_production
+DB_USER=vault_app
+DB_PASSWORD=xK9#mP2$vL5@nQ8wE4rT6yU1iO3pA7sD
+SECRET_KEY=sk-live-7f3a9b2e4d1c8f6a5e3b9d2c4f6a8e1b3d
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+REDIS_URL=redis://:p@ssw0rd123@localhost:6379/0
+"""
+
+def _fake_phpmyadmin():
+    """Fake phpMyAdmin login. Attackers love database admin panels."""
+    return """<!DOCTYPE html>
+<html><head><title>phpMyAdmin</title>
+<style>body{font-family:sans-serif;background:#e9e9e9} .login{width:400px;margin:100px auto;background:#fff;padding:20px;border:1px solid #ccc} input{width:100%;padding:8px;margin:5px 0} .btn{background:#444;color:#fff;padding:10px;border:none;cursor:pointer;width:100%}</style>
+</head><body><div class="login">
+<h2>phpMyAdmin</h2><p>Welcome to phpMyAdmin</p>
+<form method="post">
+<p>Username:<br><input type="text" name="pma_username"></p>
+<p>Password:<br><input type="password" name="pma_password"></p>
+<p><input type="submit" class="btn" value="Go"></p>
+</form><p><small>phpMyAdmin 5.2.1</small></p>
+</div></body></html>"""
+
+def _fake_xmlrpc():
+    """Fake XML-RPC response. WordPress pingback scanners will engage."""
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<methodResponse><params><param><value><array><data>
+<value><string>pingback.ping</string></value>
+<value><string>demo.addPing</string></value>
+<value><string>demo.sayHello</string></value>
+</data></array></value></param></params></methodResponse>"""
+
+def _fake_git_config():
+    """Fake git config. May reveal (fake) remote URLs to waste time."""
+    return """[core]
+\trepositoryformatversion = 0
+\tfilemode = true
+[remote "origin"]
+\turl = https://github.com/example/vault-backup.git
+\tfetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+\tremote = origin
+\tmerge = refs/heads/main
+"""
+
 @app.route("/wp-admin", methods=["GET", "POST"])
 @app.route("/wp-login.php", methods=["GET", "POST"])
+def honeypot_wordpress():
+    """Tarpit: fake WordPress with delay. Attackers waste time on credential stuffing."""
+    _honeypot_log()
+    _tarpit_delay()
+    # If they POST credentials, log them and pretend to "process" slowly
+    if request.method == "POST":
+        _tarpit_delay()  # Extra delay for POST (simulates slow auth)
+        LOG.warning('event="honeypot_credential_attempt" path="%s" client="%s"',
+                    request.path, _client_log_id())
+    return _fake_wordpress_login(), 200, {"Content-Type": "text/html"}
+
 @app.route("/xmlrpc.php", methods=["GET", "POST"])
+def honeypot_xmlrpc():
+    """Tarpit: fake XML-RPC. Scanners will try pingback attacks."""
+    _honeypot_log()
+    _tarpit_delay()
+    return _fake_xmlrpc(), 200, {"Content-Type": "text/xml"}
+
+@app.route("/.env", methods=["GET"])
+def honeypot_env():
+    """Tarpit: fake secrets. Attackers will try these dead credentials."""
+    _honeypot_log()
+    _tarpit_delay()
+    LOG.warning('event="honeypot_env_exfiltrated" client="%s"', _client_log_id())
+    return _fake_env_file(), 200, {"Content-Type": "text/plain"}
+
+@app.route("/phpmyadmin", methods=["GET", "POST"])
+def honeypot_phpmyadmin():
+    """Tarpit: fake database admin. High-value target for attackers."""
+    _honeypot_log()
+    _tarpit_delay()
+    if request.method == "POST":
+        _tarpit_delay()
+        LOG.warning('event="honeypot_credential_attempt" path="%s" client="%s"',
+                    request.path, _client_log_id())
+    return _fake_phpmyadmin(), 200, {"Content-Type": "text/html"}
+
+@app.route("/.git/config", methods=["GET"])
+def honeypot_git():
+    """Tarpit: fake git config."""
+    _honeypot_log()
+    _tarpit_delay()
+    return _fake_git_config(), 200, {"Content-Type": "text/plain"}
+
 @app.route("/api/admin", methods=["GET", "POST"])
 @app.route("/admin", methods=["GET", "POST"])
-@app.route("/.env", methods=["GET"])
-@app.route("/phpmyadmin", methods=["GET", "POST"])
+@app.route("/api/v1/admin", methods=["GET", "POST"])
+@app.route("/server-status", methods=["GET"])
 def honeypot():
-    """Log and alert on honeypot hits. Returns 404 to not reveal the trap."""
+    """Generic tarpit: delay then 404. For paths without specific fake content."""
+    _honeypot_log()
+    _tarpit_delay()
+    return jsonify({"error": "Not found"}), 404
+
+def _honeypot_log():
+    """Common logging for all honeypot hits."""
     LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s"',
                 request.path, request.method, _client_log_id())
     try:
@@ -667,7 +799,11 @@ def honeypot():
         db().commit()
     except Exception:
         pass
-    return jsonify({"error": "Not found"}), 404
+    # Fire webhook alert (if configured)
+    try:
+        _send_security_webhook("HONEYPOT_HIT", {"path": request.path})
+    except Exception:
+        pass
 
 
 @app.get("/ready")
