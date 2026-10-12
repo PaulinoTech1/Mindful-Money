@@ -119,3 +119,28 @@ curl https://mindful-money-k23ukkh5cq-uc.a.run.app/ready
 - Alert if > 1% for 5 minutes
 
 These are targets, not guarantees. This is a personal project.
+
+## Lesson: Cloud Run env vars are not Vercel env vars (2026-10-12, Boss)
+
+**Mistake:** When setting `VAULT_BOOTSTRAP_TOKEN`, ran:
+
+```bash
+gcloud run services update mindful-money \
+  --set-env-vars="<token-value-only>"
+```
+
+This failed with `Bad syntax for dict arg`.
+
+**Root cause:** Mental model was Vercel, where you paste `KEY=value` into a
+dashboard field and the platform parses it. Cloud Run's gcloud CLI expects
+the full `KEY=value` pair inside the flag:
+
+```bash
+gcloud run services update mindful-money \
+  --set-env-vars="VAULT_BOOTSTRAP_TOKEN=<token-value>"
+```
+
+**Rule:** With gcloud, `--set-env-vars` takes `KEY=VALUE` pairs, not bare values.
+The flag name is not the variable name. This applies to `--update-env-vars`
+as well. Verify with:
+`gcloud run services describe mindful-money --format="value(spec.template.spec.containers[0].env)"`
