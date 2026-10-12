@@ -568,7 +568,18 @@ async function unlock() {
 }
 
 async function load(duringUnlock = false) {
-  const { records } = await api('/api/records');
+  // Fetch all records with pagination (server limits to 5000 per request)
+  let allRecords = [];
+  let offset = 0;
+  const limit = 5000;
+  while (true) {
+    const data = await api(`/api/records?limit=${limit}&offset=${offset}`);
+    const records = data.records || [];
+    allRecords = allRecords.concat(records);
+    if (records.length < limit || allRecords.length >= (data.total || 0)) break;
+    offset += limit;
+  }
+  const records = allRecords;
 
   if (!records.length) { if (!duringUnlock) $('empty').hidden = false; else $('empty').hidden = false; return; }
 
@@ -1576,9 +1587,17 @@ async function exportBackup() {
     return;
   }
   try {
-    // Fetch all encrypted records from server
-    const data = await api('/api/records');
-    const records = data.records || [];
+    // Fetch all encrypted records from server (paginated)
+    let records = [];
+    let offset = 0;
+    const limit = 5000;
+    while (true) {
+      const data = await api(`/api/records?limit=${limit}&offset=${offset}`);
+      const batch = data.records || [];
+      records = records.concat(batch);
+      if (batch.length < limit || records.length >= (data.total || 0)) break;
+      offset += limit;
+    }
 
     // Fetch KDF salts for disaster recovery
     const salts = await api('/api/kdf/salts');

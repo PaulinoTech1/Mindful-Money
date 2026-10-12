@@ -237,7 +237,7 @@ class AuditEvent(Base):
         index=True,
     )
     identity_id: Mapped[int | None] = mapped_column(
-        ForeignKey("vault_identity.id", ondelete="SET NULL")
+        ForeignKey("vault_identity.id", ondelete="SET NULL"), index=True
     )
     # Same HMAC-truncated scheme as app.py's _client_log_id(), not a raw
     # IP address -- matches the app's existing privacy convention for the

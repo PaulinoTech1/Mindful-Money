@@ -920,13 +920,25 @@ def create_manual_expense_zkp():
 def get_records():
     denied = require_access()
     if denied: return denied
+    # Pagination to prevent OOM with large datasets (max 100k records)
+    try:
+        limit = min(int(request.args.get("limit", "1000")), 5000)
+        offset = max(int(request.args.get("offset", "0")), 0)
+    except ValueError:
+        return api_error("Invalid pagination parameters", 400)
     table = models.Record.__table__
+    # Get total count for pagination metadata
+    total = db().execute(
+        select(func.count()).select_from(table).where(
+            table.c.identity_id == current_identity_id()
+        )
+    ).scalar() or 0
     rows = db().execute(select(
         table.c.id, table.c.blind_index, table.c.sealed,
         table.c.commitment, table.c.circuit_version,
     ).where(
         table.c.identity_id == current_identity_id()
-    ).order_by(table.c.id)).mappings().all()
+    ).order_by(table.c.id).limit(limit).offset(offset)).mappings().all()
     records = []
     for row in rows:
         record = {"id": row["id"], "blind_index": row["blind_index"], "sealed": row["sealed"]}
@@ -934,7 +946,7 @@ def get_records():
             record["commitment"] = row["commitment"]
             record["circuit_version"] = row["circuit_version"]
         records.append(record)
-    return jsonify({"records": records})
+    return jsonify({"records": records, "total": total, "limit": limit, "offset": offset})
 
 @app.get("/api/server-view")
 def server_view():
