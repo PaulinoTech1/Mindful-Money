@@ -13,8 +13,7 @@ WORKDIR /home/appuser/app
 
 # Install dependencies first (better layer caching)
 COPY requirements-hashed.txt .
-RUN pip install --no-cache-dir --require-hashes -r requirements-hashed.txt && \
-    pip install --no-cache-dir gunicorn
+RUN pip install --no-cache-dir --require-hashes -r requirements-hashed.txt
 
 # Copy application code
 COPY --chown=appuser:appuser app.py db.py models.py zkp_verifier.py alembic.ini ./
