@@ -481,3 +481,26 @@ gcloud run deploy ${{ env.SERVICE_NAME }} \
 **Lesson:** Never rely on gcloud's default project in CI. The credential
 file override (`gha-creds-*.json`) sets an unexpected default. Always
 pass `--project` explicitly in automation.
+
+## Service account cannot act as itself (iam.serviceAccounts.actAs)
+
+**Symptom:**
+```
+ERROR: (gcloud.run.deploy) PERMISSION_DENIED: The service account
+31393284277-compute@developer.gserviceaccount.com does not have
+iam.serviceAccounts.actAs permission on itself.
+```
+
+**Root cause:** Cloud Run deploy needs the deploying service account to
+impersonate the runtime service account (which is itself in this case).
+
+**Fix:** (run from Cloud Shell)
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  31393284277-compute@developer.gserviceaccount.com \
+  --member="serviceAccount:31393284277-compute@developer.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser" \
+  --project=project-c89a7f58-b865-4112-bf8
+```
+
+Wait 2-3 minutes for IAM propagation, then re-run the workflow.
