@@ -124,3 +124,27 @@ logged regardless of the IP logging setting.
 - Financial plaintext or decrypted records
 - WebAuthn challenges, session tokens, or private keys
 - SimpleFin credentials (handled entirely client-side)
+
+## Audit log retention
+
+**Policy:** Audit events are retained indefinitely by default.
+
+**Rationale:** Security events (auth failures, suspicious counters) are valuable
+for forensic analysis. The volume is low (tens of events per day, not thousands).
+
+**If retention becomes a concern:**
+```sql
+-- Delete events older than 1 year (example)
+DELETE FROM audit_events WHERE occurred_at < NOW() - INTERVAL '1 year';
+```
+
+**GDPR note:** Audit events contain `client_ref` (HMAC-truncated) and optionally
+`client_ip` (if opt-in enabled). These may be considered personal data. If a user
+requests erasure, delete their audit events:
+```sql
+DELETE FROM audit_events WHERE identity_id = <USER_ID>;
+```
+
+**Recommendation:** Keep security events (SUSPICIOUS_COUNTER_EVENT,
+PASSKEY_AUTH_FAILURE) for at least 1 year. Other events can be purged after
+90 days if storage becomes a concern.

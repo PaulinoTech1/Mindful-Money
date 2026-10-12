@@ -99,3 +99,27 @@ build is non-trivial.
 
 **Status:** Honest limitation, not a bug. The feature is documented as
 unavailable in production until the artifacts are properly packaged.
+
+## Dependency pinning (future)
+
+Current `requirements.txt` uses version ranges (e.g., `Flask>=3.1,<4`).
+For reproducible builds:
+
+```bash
+# Generate pinned requirements with hashes
+pip install pip-tools
+pip-compile --generate-hashes requirements.in -o requirements.txt
+```
+
+This creates a `requirements.txt` with exact versions and SHA256 hashes.
+Dependabot will still work (it updates the `.in` file).
+
+**Docker base image:** Currently `python:3.12-slim` (floating tag).
+For reproducibility, pin by digest:
+```dockerfile
+FROM python:3.12-slim@sha256:<DIGEST>
+```
+Get the digest from Docker Hub. Update quarterly.
+
+**Status:** Not yet implemented. Version ranges are acceptable for now
+given Dependabot is enabled and pip-audit runs in CI.

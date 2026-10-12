@@ -233,3 +233,130 @@ The log-based alerts above cover server-side events only. Browser detections
 are visible via the `/api/audit/events` API, not via Cloud Logging alerts
 (unless you specifically create an alert for the `unusual_activity_detected`
 log line, which is now emitted by `_log_detection()`).
+
+## Database backup and recovery (Neon)
+
+Neon provides automatic point-in-time recovery (PITR).
+
+**What's backed up:**
+- Full database, continuous WAL archiving
+- Retention: depends on Neon plan (check console for current setting)
+- RPO: seconds (WAL-based)
+- RTO: minutes (branch restore)
+
+**To verify backups are working:**
+1. In Neon console, check the "Branches" tab for restore points
+2. Create a test branch from a PITR timestamp (non-destructive)
+3. Verify data is present in the test branch
+4. Delete the test branch
+
+**To recover from data loss:**
+```bash
+# Via Neon console:
+# 1. Go to Branches → "Create branch from PITR"
+# 2. Select timestamp before the incident
+# 3. Once verified, promote the branch or copy the connection string
+# 4. Update VAULT_DATABASE_URL in Secret Manager
+# 5. Redeploy Cloud Run to pick up the new secret
+```
+
+**Important:** Test this procedure before you need it. A backup you've never
+restored is not a backup.
+
+## Uptime monitoring setup
+
+Create a Cloud Monitoring uptime check for the `/health` endpoint.
+
+```bash
+PROJECT="project-c89a7f58-b865-4112-bf8"
+
+# Create uptime check (via console: Monitoring → Uptime checks → Create)
+# - Resource type: URL
+# - Host: mindful-money-k23ukkh5cq-uc.a.run.app
+# - Path: /health
+# - Check interval: 5 minutes
+# - Timeout: 10 seconds
+
+# Create alert policy for downtime
+gcloud alpha monitoring policies create \
+  --project=$PROJECT \
+  --display-name="Mindful Money: Uptime check failed" \
+  --condition-display-name="Health check failing" \
+  --condition-filter='metric.type="monitoring.googleapis.com/uptime_check/check_passed" AND metric.label.check_id="<CHECK_ID>"' \
+  --condition-threshold-value=1 \
+  --condition-threshold-comparison="COMPARISON_LT" \
+  --condition-threshold-duration="600s" \
+  --notification-channels="<CHANNEL_ID>"
+```
+
+Replace `<CHECK_ID>` and `<CHANNEL_ID>` with values from the console.
+
+## Rate limits (current configuration)
+
+| Endpoint group | Limit | Window | Purpose |
+|---------------|-------|--------|---------|
+| general | 120 | 60s | Default API rate |
+| session | 60 | 60s | Session endpoints |
+| login_options | 20 | 5min | Passkey login initiation |
+| login_verify | 10 | 10min | Passkey verification (brute force protection) |
+| registration | 10 | 1hr | Passkey registration |
+| upload | 10 | 60s | Record uploads |
+| delete | 3 | 1hr | Destructive operations |
+| zkp_challenge | 20 | 5min | ZKP challenge generation |
+| zkp_verify | 10 | 5min | ZKP proof verification |
+| passkey_admin | 5 | 1hr | Passkey management |
+| logout | 30 | 60s | Logout |
+
+All limits are configurable via `VAULT_RATE_*` environment variables.
+Rate limit hits are logged as `event="rate_limited"` and can trigger alerts.
+
+## Secrets rotation procedures
+
+### Flask secret key (VAULT_SECRET_KEY)
+
+**Impact:** Invalidates all sessions. Users must re-authenticate.
+
+```bash
+# 1. Generate new secret (32+ random bytes, hex-encoded)
+NEW_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+
+# 2. Add new version to Secret Manager (do NOT destroy old versions yet)
+echo -n "$NEW_SECRET" | gcloud secrets versions add mindful-money-secret --data-file=-
+
+# 3. Redeploy Cloud Run (picks up :latest)
+gcloud run deploy mindful-money \
+  --region us-central1 \
+  --project project-c89a7f58-b865-4112-bf8 \
+  --image us-central1-docker.pkg.dev/project-c89a7f58-b865-4112-bf8/mindful-money/app:latest
+
+# 4. Verify app is working, then disable old versions (do not destroy for 7 days)
+```
+
+### Neon database URL (neon-db-url)
+
+**Impact:** Brief downtime during rotation.
+
+```bash
+# 1. In Neon console: reset database password
+# 2. Get new connection string
+# 3. Add to Secret Manager
+echo -n "NEW_URL" | gcloud secrets versions add neon-db-url --data-file=-
+
+# 4. Redeploy Cloud Run
+gcloud run deploy mindful-money \
+  --region us-central1 \
+  --project project-c89a7f58-b865-4112-bf8 \
+  --image us-central1-docker.pkg.dev/project-c89a7f58-b865-4112-bf8/mindful-money/app:latest
+
+# 5. Run migrations to verify connectivity
+# (from Cloud Shell with new URL)
+```
+
+### SimpleFin access URL
+
+**Impact:** None (client-side only).
+
+The SimpleFin access URL is never stored server-side. To rotate:
+1. Get a new access URL from https://beta-bridge.simplefin.org/
+2. Use it in the app (prompted on each connect, not stored)
+3. Revoke the old URL in SimpleFin bridge settings

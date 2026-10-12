@@ -105,3 +105,45 @@ You do NOT need to trust:
 4. Consider code signing or SRI for the served JavaScript.
 5. The per-browser salt storage (localStorage) means clearing browser data
    loses access to encrypted records. Document this for users.
+
+## Session security
+
+Session cookies use:
+- `HttpOnly`: True (not accessible via JavaScript)
+- `SameSite`: Strict (not sent on cross-site requests)
+- `Secure`: True in production (HTTPS only)
+- Custom server-side session storage (not Flask's default client-side sessions)
+- Session rotation on privilege changes
+
+Sessions are stored in the `server_sessions` table with:
+- Hashed session IDs (SHA-256, not reversible)
+- Idle timeout (30 minutes) and absolute timeout (8 hours)
+- Revocation support via `/api/session/revoke`
+
+**Note:** Cookie name is `vault_session` (not `__Host-` prefixed). The `__Host-`
+prefix would provide additional protection against cookie tossing, but was not
+used to avoid breaking existing sessions. Consider for a future migration.
+
+## Content Security Policy
+
+The app enforces a strict CSP:
+- `default-src 'none'` - deny by default
+- `script-src 'self' 'wasm-unsafe-eval'` - allows libsodium WASM, no inline scripts
+- `connect-src 'self' https:` - allows SimpleFin bridge fetches (client-side)
+- `style-src 'self'` - no inline styles
+- `img-src 'self' data:` - allows data URIs for images
+- `frame-ancestors 'none'` - no embedding
+- `form-action 'self'` - forms only to self
+
+The `wasm-unsafe-eval` is required for libsodium. There are no `unsafe-inline`
+or `unsafe-eval` directives. All JavaScript is served from `/static/`.
+
+## Frontend security
+
+**XSS protection:**
+- All user data rendered via `innerHTML` is escaped with `escapeHtml()`
+- The `escapeHtml` function handles `& < > " '`
+- No `eval()` usage
+- CSP blocks inline scripts (`script-src 'self'`)
+
+**Verified:** 2026-10-11 - `grep` for `eval(`, `innerHTML` shows proper escaping.
