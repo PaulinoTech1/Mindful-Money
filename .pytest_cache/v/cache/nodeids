@@ -33,6 +33,8 @@
   "test_demo.py::TestDestructiveRecordAuthorization::test_vault_unlocked_alone_cannot_authorize_delete",
   "test_demo.py::TestDestructiveRecordAuthorization::test_vault_unlocked_endpoint_cannot_authorize_delete_or_refresh_authentication",
   "test_demo.py::TestDestructiveRecordAuthorization::test_verified_login_is_the_path_that_sets_fresh_authentication",
+  "test_demo.py::TestHoneypotTarpit::test_asn_lookup",
+  "test_demo.py::TestHoneypotTarpit::test_asn_lookup_with_logging_enabled",
   "test_demo.py::TestHoneypotTarpit::test_env_honeypot_serves_fake_secrets",
   "test_demo.py::TestHoneypotTarpit::test_fake_backup_serves_garbage",
   "test_demo.py::TestHoneypotTarpit::test_honeypot_does_not_reveal_trap",

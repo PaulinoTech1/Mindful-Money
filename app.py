@@ -59,6 +59,39 @@ TRUST_PROXY = os.environ.get("VAULT_TRUST_PROXY", "0") == "1"
 # When "on", the full client IP is stored in audit_events.client_ip.
 # When "off" (default), only the HMAC-truncated client_ref is stored.
 IP_LOGGING = os.environ.get("VAULT_IP_LOGGING", "off").lower() == "on"
+
+# ASN lookup for honeypot hits. Uses bundled GeoLite2-ASN database (free, local file).
+# Zero per-query cost, microseconds per lookup. Only used when IP_LOGGING is on.
+_ASN_READER = None
+def _get_asn_reader():
+    """Lazy-load the GeoLite2-ASN database. Returns None if unavailable."""
+    global _ASN_READER
+    if _ASN_READER is None:
+        try:
+            import maxminddb
+            import os
+            db_path = os.path.join(os.path.dirname(__file__), "geoip", "GeoLite2-ASN.mmdb")
+            if os.path.exists(db_path):
+                _ASN_READER = maxminddb.open_database(db_path)
+        except Exception:
+            pass
+    return _ASN_READER
+
+def _lookup_asn(ip_address):
+    """Look up ASN for an IP. Returns (asn_number, asn_org) or (None, None).
+    Only call when IP_LOGGING is on."""
+    if not IP_LOGGING or not ip_address:
+        return None, None
+    try:
+        reader = _get_asn_reader()
+        if not reader:
+            return None, None
+        result = reader.get(ip_address)
+        if result:
+            return result.get("autonomous_system_number"), result.get("autonomous_system_organization")
+    except Exception:
+        pass
+    return None, None
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _LOWER_HEX = re.compile(r"[0-9a-f]+\Z")
 _B64URL = re.compile(r"[A-Za-z0-9_-]{2,1024}\Z")
@@ -840,19 +873,38 @@ def _honeypot_log():
     HONEYPOT_MAX_HITS_PER_MINUTE times in 60 seconds, subsequent hits skip the
     tarpit delay (return immediately). This prevents economic DoS where an
     attacker floods honeypots to run up Cloud Run costs.
+    
+    When VAULT_IP_LOGGING=on, also logs the ASN (autonomous system number)
+    and organization. This reveals whether the attacker is on a VPS provider,
+    VPN, Tor exit, or residential ISP - much better for triage than IP alone.
     """
     import time
     client_id = _client_log_id()
-    LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s"',
-                request.path, request.method, client_id)
+    # ASN lookup (only when IP logging is enabled)
+    asn_num, asn_org = None, None
+    if IP_LOGGING:
+        asn_num, asn_org = _lookup_asn(request.remote_addr)
+    if asn_num:
+        LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s" asn="AS%d %s"',
+                    request.path, request.method, client_id, asn_num, asn_org)
+    else:
+        LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s"',
+                    request.path, request.method, client_id)
     try:
-        _audit_event("HONEYPOT_HIT", detail={"path": request.path, "method": request.method})
+        detail = {"path": request.path, "method": request.method}
+        if asn_num:
+            detail["asn"] = asn_num
+            detail["asn_org"] = asn_org
+        _audit_event("HONEYPOT_HIT", detail=detail)
         db().commit()
     except Exception:
         pass
     # Fire webhook alert (if configured)
     try:
-        _send_security_webhook("HONEYPOT_HIT", {"path": request.path})
+        webhook_data = {"path": request.path}
+        if asn_num:
+            webhook_data["asn"] = f"AS{asn_num} {asn_org}"
+        _send_security_webhook("HONEYPOT_HIT", webhook_data)
     except Exception:
         pass
 

@@ -1775,6 +1775,28 @@ class TestHoneypotTarpit(ServerCase):
                 k = hmac.new(server_app.RATE_KEY, f"5.6.7.{i}".encode(), hashlib.sha256).hexdigest()[:12]
                 self.assertEqual(len(server_app._honeypot_hits.get(k, [])), 1)
 
+    def test_asn_lookup(self):
+        """ASN lookup returns correct data for known IPs."""
+        import app as server_app
+        # Google DNS
+        asn_num, asn_org = server_app._lookup_asn("8.8.8.8")
+        # Only works when IP_LOGGING is on and DB exists
+        # In test env, IP_LOGGING is off, so should return (None, None)
+        self.assertIsNone(asn_num)
+
+    def test_asn_lookup_with_logging_enabled(self):
+        """ASN lookup works when IP logging is enabled."""
+        import app as server_app
+        # Temporarily enable IP logging
+        orig = server_app.IP_LOGGING
+        server_app.IP_LOGGING = True
+        try:
+            asn_num, asn_org = server_app._lookup_asn("8.8.8.8")
+            self.assertEqual(asn_num, 15169)
+            self.assertIn("Google", asn_org)
+        finally:
+            server_app.IP_LOGGING = orig
+
 
 if __name__ == "__main__":
     sys.exit(main())
