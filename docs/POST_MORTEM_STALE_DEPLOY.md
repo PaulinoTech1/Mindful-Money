@@ -133,3 +133,34 @@ in casual inspection.
 
 5. **Name things clearly.** "Deploy to Cloud Run" vs "CodeQL" should be
    unmistakable at a glance.
+
+## Addendum: Boot sequence fragility (2026-10-11)
+
+**Finding:** The stale production site had a secondary bug: a single failed
+API call would abort the entire frontend boot sequence, leaving the UI
+partially dead.
+
+**Details:** The boot code was a single async IIFE:
+
+```js
+(async () => {
+  const sessionInfo = await api('/api/session');
+  const status = await api('/api/passkeys/status');
+  const sources = await api('/api/relay/sources');  // <-- 404, throws
+  await sodium.ready;
+  // ... event listeners attached here, never reached
+})();
+```
+
+When `/api/relay/sources` returned 404, the `await` threw, the IIFE aborted,
+and none of the event listeners (unlock button, passphrase entropy, etc.)
+were attached. The page looked loaded but was non-functional. The Shannon
+entropy meter stayed at 0.00 bits no matter what was typed.
+
+**Why it matters:** This is a robustness failure. A single backend endpoint
+being unavailable should not break the entire UI. Frontend boot sequences
+should be resilient to partial failures.
+
+**Fix:** Restructure boot to attach critical UI listeners first, then wrap
+each phase in try/catch. A failed API call logs to console but doesn't
+prevent the UI from working.

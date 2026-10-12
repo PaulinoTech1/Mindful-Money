@@ -386,32 +386,145 @@ async function initSessionContext() {
 const blindIndex = (id) =>
   S.to_hex(S.crypto_generichash(32, S.from_string(SESSION_CONTEXT + ":" + id), KEYS.indexKey));
 
-// Empirical Shannon entropy of the characters entered. This is a local
-// estimate, not a password-cracking guarantee; no passphrase data is stored or
-// transmitted by this measurement.
+// Passphrase strength estimator. Runs entirely in the browser; no passphrase
+// data is stored or transmitted. This is a heuristic, not a cryptographic
+// guarantee.
+//
+// Detects:
+// - Character frequency (Shannon entropy)
+// - Repeating patterns (abcabc, 123123)
+// - Sequential runs (abcdef, 123456, qwerty)
+// - Common passwords and dictionary words
 function updatePassphraseEntropy() {
-  const value = $('pass').value.trim();
+  const value = $('pass').value;  // Don't trim; spaces are valid
   const output = $('passEntropy');
   if (!value.length) {
     output.dataset.level = '';
     output.textContent = 'Shannon entropy: 0.00 bits — enter a passphrase.';
     return;
   }
-  const chars = [...value];
-  const counts = new Map();
-  for (const char of chars) counts.set(char, (counts.get(char) || 0) + 1);
-  const bitsPerCharacter = [...counts.values()].reduce((sum, count) => {
-    const probability = count / chars.length;
-    return sum - probability * Math.log2(probability);
-  }, 0);
-  const entropy = bitsPerCharacter * chars.length;
-  const [level, message] = chars.length <= 8
-    ? ['weak', 'Lost kid, get a better passphrase']
-    : chars.length <= 14
-      ? ['decent', 'Decent, Buddy']
-      : ['good', "Good, but you're still Cooked."];
+
+  const warnings = [];
+  let entropy = calcShannonEntropy(value);
+
+  // Penalize repeating patterns
+  const repeatPenalty = detectRepeatingPatterns(value);
+  if (repeatPenalty > 0) {
+    entropy *= (1 - repeatPenalty);
+    warnings.push('repeating pattern');
+  }
+
+  // Penalize sequential runs
+  const seqPenalty = detectSequentialRuns(value);
+  if (seqPenalty > 0) {
+    entropy *= (1 - seqPenalty);
+    warnings.push('sequential characters');
+  }
+
+  // Check against common passwords
+  if (isCommonPassword(value)) {
+    entropy = Math.min(entropy, 10);
+    warnings.push('common password');
+  }
+
+  // Character set bonus (informational, not added to entropy)
+  const charsets = countCharsets(value);
+
+  const [level, message] = entropy < 30
+    ? ['weak', 'Weak' + (warnings.length ? ` (${warnings.join(', ')})` : '')]
+    : entropy < 50
+      ? ['decent', 'Decent' + (warnings.length ? ` (${warnings.join(', ')})` : '')]
+      : entropy < 80
+        ? ['good', 'Strong' + (warnings.length ? ` (${warnings.join(', ')})` : '')]
+        : ['excellent', 'Excellent'];
+
+  const charsetInfo = ` [${charsets}]`;
   output.dataset.level = level;
-  output.textContent = `Shannon entropy: ${entropy.toFixed(2)} bits — ${message}`;
+  output.textContent = `~${entropy.toFixed(0)} bits — ${message}${charsetInfo}`;
+}
+
+function calcShannonEntropy(s) {
+  const chars = [...s];
+  const counts = new Map();
+  for (const c of chars) counts.set(c, (counts.get(c) || 0) + 1);
+  const bitsPerChar = [...counts.values()].reduce((sum, count) => {
+    const p = count / chars.length;
+    return sum - p * Math.log2(p);
+  }, 0);
+  return bitsPerChar * chars.length;
+}
+
+function detectRepeatingPatterns(s) {
+  // Check for repeated substrings of length 2-6
+  const lower = s.toLowerCase();
+  let maxPenalty = 0;
+  for (let len = 2; len <= 6 && len <= s.length / 2; len++) {
+    for (let i = 0; i <= s.length - len * 2; i++) {
+      const pattern = lower.slice(i, i + len);
+      let repeats = 1;
+      let j = i + len;
+      while (lower.slice(j, j + len) === pattern) {
+        repeats++;
+        j += len;
+      }
+      if (repeats >= 2) {
+        // Penalty scales with how much of the string is repeated
+        const coverage = (repeats * len) / s.length;
+        maxPenalty = Math.max(maxPenalty, coverage * 0.7);
+      }
+    }
+  }
+  return Math.min(maxPenalty, 0.8);
+}
+
+function detectSequentialRuns(s) {
+  const lower = s.toLowerCase();
+  const sequences = [
+    'abcdefghijklmnopqrstuvwxyz',
+    'qwertyuiopasdfghjklzxcvbnm',
+    '0123456789',
+  ];
+  let maxRun = 0;
+  for (const seq of sequences) {
+    for (let i = 0; i < lower.length - 2; i++) {
+      const substr = lower.slice(i, i + 3);
+      if (seq.includes(substr) || seq.split('').reverse().join('').includes(substr)) {
+        let runLen = 3;
+        while (i + runLen < lower.length) {
+          const next = lower.slice(i, i + runLen + 1);
+          const extended = next.slice(-4);
+          if (seq.includes(extended) || seq.split('').reverse().join('').includes(extended)) {
+            runLen++;
+          } else break;
+        }
+        maxRun = Math.max(maxRun, runLen);
+      }
+    }
+  }
+  if (maxRun >= 3) {
+    return Math.min((maxRun / s.length) * 0.6, 0.7);
+  }
+  return 0;
+}
+
+function isCommonPassword(s) {
+  const common = [
+    'password', '123456', '123456789', 'qwerty', 'abc123',
+    'password1', '12345678', '111111', '123123', 'admin',
+    'letmein', 'welcome', 'monkey', 'dragon', 'master',
+    'passw0rd', 'p@ssword', 'p@ssw0rd',
+  ];
+  const lower = s.toLowerCase();
+  return common.some(c => lower === c || lower.includes(c));
+}
+
+function countCharsets(s) {
+  const sets = [];
+  if (/[a-z]/.test(s)) sets.push('lower');
+  if (/[A-Z]/.test(s)) sets.push('upper');
+  if (/[0-9]/.test(s)) sets.push('digit');
+  if (/[^a-zA-Z0-9]/.test(s)) sets.push('symbol');
+  return sets.join('+') || 'none';
 }
 
 /* ---------- formatting ---------- */
@@ -1619,6 +1732,19 @@ async function disablePasskeys() {
     $('pass').addEventListener('input', updatePassphraseEntropy);
     $('pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
     $('username').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+    $('togglePass').addEventListener('click', () => {
+      const input = $('pass');
+      const btn = $('togglePass');
+      if (input.type === 'password') {
+        input.type = 'text';
+        btn.textContent = '🙈';
+        btn.setAttribute('aria-label', 'Hide passphrase');
+      } else {
+        input.type = 'password';
+        btn.textContent = '👁';
+        btn.setAttribute('aria-label', 'Show passphrase');
+      }
+    });
   } catch (e) {
     console.error('Failed to attach UI listeners:', e);
   }
