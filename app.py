@@ -197,6 +197,35 @@ def _audit_event(event_type, credential_id=None, detail=None, identity_id=None):
         event_type=event_type, identity_id=identity_id or current_identity_id(), client_ref=_client_log_id(),
         credential_id=credential_id, detail=detail, client_ip=client_ip,
     ))
+    # Webhook alerting for critical security events (fire-and-forget)
+    if event_type in ("HONEYPOT_HIT", "ACCOUNT_LOCKED", "SUSPICIOUS_COUNTER_EVENT"):
+        _send_security_webhook(event_type, detail)
+
+
+def _send_security_webhook(event_type, detail=None):
+    """Send a webhook alert for critical security events.
+    Configured via VAULT_SECURITY_WEBHOOK_URL env var.
+    Failures are logged but don't block the request."""
+    webhook_url = os.environ.get("VAULT_SECURITY_WEBHOOK_URL")
+    if not webhook_url:
+        return
+    try:
+        import urllib.request, json
+        payload = json.dumps({
+            "event": event_type,
+            "timestamp": time.time(),
+            "detail": detail,
+            "client_ref": _client_log_id(),
+        }).encode()
+        req = urllib.request.Request(
+            webhook_url, data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # Short timeout; don't block the request on webhook
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        LOG.warning('event="webhook_failed" error="%s"', str(e)[:100])
 
 
 def _log_detection(detection_type, detail=None):
