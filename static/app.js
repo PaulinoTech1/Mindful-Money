@@ -559,6 +559,8 @@ async function unlock() {
   $('syncSimplefinBtn').hidden = !SIMPLEFIN_AVAILABLE;
   $('addExpenseBtn').hidden = false;
   $('resetBtn').hidden = false;
+  $('exportBtn').hidden = false;
+  $('importBtn').hidden = false;
   $('gate').hidden = true;
   $('security').hidden = false;
   await refreshSecurity();
@@ -1566,6 +1568,121 @@ async function reset() {
   }
 }
 
+/* ---------- encrypted backup export/import ---------- */
+
+async function exportBackup() {
+  if (!KEYS) {
+    alert('Unlock the vault first.');
+    return;
+  }
+  try {
+    // Fetch all encrypted records from server
+    const data = await api('/api/records');
+    const records = data.records || [];
+
+    // Fetch KDF salts for disaster recovery
+    const salts = await api('/api/kdf/salts');
+
+    // Create canary: sealed box proving we can decrypt
+    const canaryObj = { _backup_canary: true, exported_at: new Date().toISOString() };
+    const canary = seal(canaryObj);
+
+    // Build backup file
+    const backup = {
+      format: 'mindful-money-backup',
+      version: 1,
+      exported_at: new Date().toISOString(),
+      record_count: records.length,
+      kdf: {
+        salt_enc: salts.salt_enc,
+        salt_idx: salts.salt_idx,
+        kdf_version: salts.kdf_version || 1,
+      },
+      canary: canary,
+      records: records.map(r => ({
+        blind_index: r.blind_index,
+        sealed: r.sealed,
+        ...(r.commitment ? { commitment: r.commitment, circuit_version: r.circuit_version } : {}),
+      })),
+    };
+
+    // Compute integrity hash over canonical records array
+    const canonical = JSON.stringify(backup.records);
+    const hash = S.crypto_hash_sha256(S.from_string(canonical));
+    backup.integrity = S.to_hex(hash);
+
+    // Download
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const timestamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+    a.href = url;
+    a.download = `mindful-money-backup-${timestamp}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Backup failed: ' + e.message);
+    console.error('Backup export failed:', e);
+  }
+}
+
+async function importBackup(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  event.target.value = '';
+
+  if (!KEYS) {
+    alert('Unlock the vault first.');
+    return;
+  }
+
+  try {
+    const text = await file.text();
+    const backup = JSON.parse(text);
+
+    // Validate format
+    if (backup.format !== 'mindful-money-backup') throw new Error('Not a Mindful Money backup file');
+    if (backup.version !== 1) throw new Error('Unsupported backup version: ' + backup.version);
+    if (backup.record_count !== backup.records.length) throw new Error('Record count mismatch (file may be truncated)');
+    if (!backup.kdf || !backup.kdf.salt_enc || !backup.kdf.salt_idx) throw new Error('Missing KDF salts');
+
+    // Verify integrity
+    const canonical = JSON.stringify(backup.records);
+    const hash = S.to_hex(S.crypto_hash_sha256(S.from_string(canonical)));
+    if (hash !== backup.integrity) throw new Error('Integrity check failed (file corrupted)');
+
+    // Verify canary decrypts (proves passphrase+salts are correct)
+    try {
+      const canaryObj = open(backup.canary);
+      if (!canaryObj._backup_canary) throw new Error('Invalid canary');
+    } catch (e) {
+      throw new Error('Cannot decrypt backup: wrong passphrase or salts. ' + e.message);
+    }
+
+    // Upload records in batches
+    const batchSize = 100;
+    let uploaded = 0;
+    for (let i = 0; i < backup.records.length; i += batchSize) {
+      const batch = backup.records.slice(i, i + batchSize).map(r => ({
+        blind_index: r.blind_index,
+        sealed: r.sealed,
+      }));
+      await api('/api/records', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ records: batch }),
+      });
+      uploaded += batch.length;
+    }
+
+    alert(`Restored ${uploaded} records from backup.`);
+    await load();
+  } catch (e) {
+    alert('Restore failed: ' + e.message);
+    console.error('Backup import failed:', e);
+  }
+}
+
 async function resetPassphrase() {
   if (!confirm('Resetting the vault passphrase permanently erases all encrypted financial records because the old key cannot be recovered. Continue?')) return;
   const note = $('gateNote');
@@ -1762,6 +1879,9 @@ async function disablePasskeys() {
   $('csvFile').addEventListener('change', handleCSVUpload);
   $('viewToggle').addEventListener('click', toggleView);
   $('resetBtn').addEventListener('click', reset);
+  $('exportBtn').addEventListener('click', exportBackup);
+  $('importBtn').addEventListener('click', () => $('importFile').click());
+  $('importFile').addEventListener('change', importBackup);
   $('resetPassphraseBtn').addEventListener('click', resetPassphrase);
   $('passkeyLoginBtn').addEventListener('click', loginPasskey);
   $('enablePasskeyBtn').addEventListener('click', registerPasskey);
