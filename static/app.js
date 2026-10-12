@@ -390,6 +390,16 @@ async function deriveKeys(passphrase) {
   return { publicKey: kp.publicKey, privateKey: kp.privateKey, indexKey };
 }
 
+// Domain-separated backup authentication key.
+// Derived from indexKey via BLAKE2b with personalization. This gives the backup
+// manifest its own key without requiring additional server-side salts.
+// The separation ensures a backup HMAC key compromise doesn't affect record
+// encryption or blind indexing.
+function backupAuthKey() {
+  if (!KEYS || !KEYS.indexKey) throw new Error("Vault not unlocked");
+  return S.crypto_generichash(32, S.from_string("mindful-money-backup-auth-v1"), KEYS.indexKey);
+}
+
 const seal = (obj) =>
   S.to_hex(S.crypto_box_seal(S.from_string(JSON.stringify(obj)), KEYS.publicKey));
 
@@ -564,6 +574,11 @@ async function unlock() {
 
   try {
     KEYS = await deriveKeys(pass);
+    // Clear passphrase from DOM immediately after derivation.
+    // Reduces exposure window; JS cannot guarantee memory erasure but
+    // removing the DOM value eliminates the most accessible copy.
+    $('pass').value = '';
+    updatePassphraseEntropy();
     await load(true);
     await api('/api/vault/unlocked', { method: 'POST' });
   } catch (_error) {
@@ -1662,7 +1677,7 @@ async function exportBackup() {
       kdf: backup.kdf,
       record_count: backup.record_count,
     });
-    const hmacKey = KEYS.enc; // 32-byte encryption key
+    const hmacKey = backupAuthKey();
     const hmac = S.crypto_auth_hmacsha256(S.from_string(canonical), hmacKey);
     backup.integrity = S.to_hex(hmac);
     backup.integrity_alg = "hmac-sha256";
@@ -1702,39 +1717,77 @@ async function importBackup(event) {
     if (backup.record_count !== backup.records.length) throw new Error('Record count mismatch (file may be truncated)');
     if (!backup.kdf || !backup.kdf.salt_enc || !backup.kdf.salt_idx) throw new Error('Missing KDF salts');
 
-    // Apply backup salts if vault has none set (fresh vault restore)
-    // This must happen before deriving keys, so we check via API
+    // TRANSACTIONAL RESTORE: validate everything with candidate keys BEFORE
+    // touching server state. A malformed backup must not change vault salts.
+    //
+    // Step 1: Derive candidate keys from backup's salts (no server mutation)
+    // The passphrase field is cleared after unlock for security, so prompt if needed.
+    let pass = $('pass').value;
+    if (!pass) {
+      pass = prompt('Enter your vault passphrase to verify the backup:');
+      if (!pass) throw new Error('Passphrase required to restore backup.');
+    }
+    const candidateSalts = {
+      enc: Uint8Array.from(backup.kdf.salt_enc.match(/../g).map(h => parseInt(h, 16))),
+      idx: Uint8Array.from(backup.kdf.salt_idx.match(/../g).map(h => parseInt(h, 16))),
+    };
+    // Temporarily override salt cache to derive candidate keys
+    const savedSalts = CACHED_SALTS;
+    CACHED_SALTS = candidateSalts;
+    let candidateKeys;
+    try {
+      candidateKeys = await deriveKeys(pass);
+    } finally {
+      CACHED_SALTS = savedSalts;
+    }
+    const candidateBackupKey = S.crypto_generichash(32,
+      S.from_string("mindful-money-backup-auth-v1"), candidateKeys.indexKey);
+
+    // Step 2: Verify HMAC with candidate keys
+    const verifyCanonical = JSON.stringify({
+      records: backup.records,
+      kdf: backup.kdf,
+      record_count: backup.record_count,
+    });
+    if (backup.integrity_alg !== "hmac-sha256") {
+      throw new Error('Unsupported integrity algorithm.');
+    }
+    const expectedHmac = S.crypto_auth_hmacsha256(
+      S.from_string(verifyCanonical), candidateBackupKey);
+    if (S.crypto_verify_32(S.from_hex(S.to_hex(expectedHmac)),
+                            S.from_hex(backup.integrity)) !== 0) {
+      throw new Error('Integrity check failed (file corrupted or tampered)');
+    }
+
+    // Step 3: Verify canary decrypts with candidate keys
+    const candidateOpen = (hex) =>
+      JSON.parse(S.to_string(
+        S.crypto_box_seal_open(S.from_hex(hex), candidateKeys.publicKey, candidateKeys.privateKey)));
+    try {
+      const canaryObj = candidateOpen(backup.canary);
+      if (!canaryObj._backup_canary) throw new Error('Invalid canary');
+    } catch (e) {
+      throw new Error('Cannot decrypt backup: wrong passphrase. ' + e.message);
+    }
+
+    // Step 4: ONLY NOW apply salts to server (backup is fully validated)
     try {
       const saltResp = await api('/api/kdf/salts');
-      // Salts are set - verify they match, or if they were auto-generated
-      // during unlock (fresh vault), overwrite with backup's salts
       if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
-        // Try force-overwrite (only works if no records exist)
-        try {
-          await api('/api/kdf/salts/migrate', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              salt_enc: backup.kdf.salt_enc,
-              salt_idx: backup.kdf.salt_idx,
-              force: true,
-            }),
-          });
-          // Clear cached salts and re-derive
-          CACHED_SALTS = null;
-          const pass = $('pass').value;
-          if (!pass) throw new Error('Enter your passphrase to restore backup.');
-          KEYS = await deriveKeys(pass);
-        } catch (forceErr) {
-          throw new Error('Backup salts do not match vault salts. Use the same vault or migrate first.');
-        }
+        await api('/api/kdf/salts/migrate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            salt_enc: backup.kdf.salt_enc,
+            salt_idx: backup.kdf.salt_idx,
+            force: true,
+          }),
+        });
+        CACHED_SALTS = null;
+        KEYS = await deriveKeys(pass);
       }
     } catch (e) {
-      if (e.status === 409 && e.message.includes('Salt migration required')) {
-        // Vault has records but no salts - shouldn't happen on restore to fresh vault
-        throw new Error('Vault already has records with different salts.');
-      } else if (e.status === 404 || e.message.includes('not found')) {
-        // No salts set - apply backup salts via migrate endpoint
+      if (e.status === 404 || (e.message && e.message.includes('not found'))) {
         await api('/api/kdf/salts/migrate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1743,46 +1796,11 @@ async function importBackup(event) {
             salt_idx: backup.kdf.salt_idx,
           }),
         });
-        // Re-derive keys with the new salts
-        const pass = $('pass').value;
-        if (!pass) throw new Error('Enter your passphrase to restore backup.');
+        CACHED_SALTS = null;
         KEYS = await deriveKeys(pass);
       } else {
         throw e;
       }
-    }
-
-    // Verify keyed integrity (HMAC-SHA256). Must match the algorithm used at export.
-    // Supports legacy unkeyed SHA-256 for backups created before this change.
-    const verifyCanonical = JSON.stringify({
-      records: backup.records,
-      kdf: backup.kdf,
-      record_count: backup.record_count,
-    });
-    let integrityOk = false;
-    if (backup.integrity_alg === "hmac-sha256") {
-      const expected = S.to_hex(S.crypto_auth_hmacsha256(
-        S.from_string(verifyCanonical), KEYS.enc
-      ));
-      integrityOk = S.to_hex(S.from_string(expected)) === S.to_hex(S.from_string(backup.integrity));
-      // Constant-time comparison via libsodium
-      integrityOk = S.crypto_verify_32(
-        S.from_hex(expected), S.from_hex(backup.integrity)
-      ) === 0;
-    } else {
-      // Legacy: unkeyed SHA-256 over records array only
-      const legacyCanonical = JSON.stringify(backup.records);
-      const hash = S.to_hex(S.crypto_hash_sha256(S.from_string(legacyCanonical)));
-      integrityOk = hash === backup.integrity;
-    }
-    if (!integrityOk) throw new Error('Integrity check failed (file corrupted or tampered)');
-
-    // Verify canary decrypts (proves passphrase+salts are correct)
-    try {
-      const canaryObj = open(backup.canary);
-      if (!canaryObj._backup_canary) throw new Error('Invalid canary');
-    } catch (e) {
-      throw new Error('Cannot decrypt backup: wrong passphrase or salts. ' + e.message);
     }
 
     // Upload records in batches

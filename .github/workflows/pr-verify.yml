@@ -123,9 +123,11 @@ jobs:
           pip install playwright
           python -m playwright install chromium --with-deps
 
-      - name: Run browser E2E test
+      - name: Run browser E2E tests
         run: |
-          python test_browser.py --headless 2>&1 | head -50
+          set -euo pipefail
+          python test_browser.py --headless
+          python test_playwright_recovery.py
         env:
           VAULT_ENV: test
           VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_test

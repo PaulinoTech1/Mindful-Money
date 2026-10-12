@@ -805,8 +805,7 @@ def honeypot_wordpress():
     
     Does NOT log submitted passwords. Only logs that an attempt occurred.
     """
-    _honeypot_log()
-    if _honeypot_rate_limited():
+    if _honeypot_log():
         # Over budget: minimal response, no deception frills
         return jsonify({"error": "Not found"}), 404
     if request.method == "POST":
@@ -828,16 +827,14 @@ def honeypot_wordpress():
 @app.route("/xmlrpc.php", methods=["GET", "POST"])
 def honeypot_xmlrpc():
     """Deception: fake XML-RPC. Scanners will try pingback attacks."""
-    _honeypot_log()
-    if _honeypot_rate_limited():
+    if _honeypot_log():
         return jsonify({"error": "Not found"}), 404
     return _fake_xmlrpc(), 200, {"Content-Type": "text/xml"}
 
 @app.route("/.env", methods=["GET"])
 def honeypot_env():
     """Deception: fake secrets. Attackers will try these dead credentials."""
-    _honeypot_log()
-    if _honeypot_rate_limited():
+    if _honeypot_log():
         return jsonify({"error": "Not found"}), 404
     LOG.warning('event="honeypot_env_exfiltrated" client="%s"', _client_log_id())
     return _fake_env_file(), 200, {"Content-Type": "text/plain"}
@@ -845,8 +842,7 @@ def honeypot_env():
 @app.route("/phpmyadmin", methods=["GET", "POST"])
 def honeypot_phpmyadmin():
     """Deception: fake database admin. Does NOT log submitted passwords."""
-    _honeypot_log()
-    if _honeypot_rate_limited():
+    if _honeypot_log():
         return jsonify({"error": "Not found"}), 404
     if request.method == "POST":
         LOG.warning('event="honeypot_credential_attempt" path="%s" client="%s"',
@@ -857,8 +853,7 @@ def honeypot_phpmyadmin():
 @app.route("/.git/config", methods=["GET"])
 def honeypot_git():
     """Deception: fake git config."""
-    _honeypot_log()
-    if _honeypot_rate_limited():
+    if _honeypot_log():
         return jsonify({"error": "Not found"}), 404
     return _fake_git_config(), 200, {"Content-Type": "text/plain"}
 
@@ -887,8 +882,7 @@ def honeypot_backup_start():
     a job ID. The attacker polls /backup/status for progress. Each poll
     is cheap. The deception stays interactive without blocking workers.
     """
-    _honeypot_log()
-    if _honeypot_rate_limited():
+    if _honeypot_log():
         return jsonify({"error": "Not found"}), 404
     job_id = _deception_start_backup_job()
     return jsonify({
@@ -901,8 +895,7 @@ def honeypot_backup_start():
 @app.route("/backup/status", methods=["GET"])
 def honeypot_backup_status():
     """Deception: fake backup job progress. Cheap per-poll, never completes."""
-    _honeypot_log()
-    if _honeypot_rate_limited():
+    if _honeypot_log():
         return jsonify({"error": "Not found"}), 404
     job_id = request.args.get("job_id", "")
     status = _deception_backup_status(job_id)
@@ -916,8 +909,7 @@ def honeypot_backup_status():
 def honeypot_backup():
     """Deception: redirect to async export. The old direct download is gone;
     the attacker must use the job API, which keeps them engaged longer."""
-    _honeypot_log()
-    if _honeypot_rate_limited():
+    if _honeypot_log():
         return jsonify({"error": "Not found"}), 404
     return jsonify({
         "error": "Direct download disabled",
@@ -933,30 +925,36 @@ def honeypot():
     _honeypot_log()
     return jsonify({"error": "Not found"}), 404
 
-def _honeypot_log():
+def _honeypot_log(sample_rate=1.0):
     """Common logging for all honeypot hits.
     
-    Includes per-IP rate limiting: if a single client hits honeypots more than
-    HONEYPOT_MAX_HITS_PER_MINUTE times in 60 seconds, subsequent hits skip the
-    tarpit delay (return immediately). This prevents economic DoS where an
-    attacker floods honeypots to run up Cloud Run costs.
+    Rate limiting is checked FIRST (before DB writes) to bound resource usage.
+    When rate-limited, only the log line is emitted; DB and webhook are skipped.
     
-    When VAULT_IP_LOGGING=on, also logs the ASN (autonomous system number)
-    and organization. This reveals whether the attacker is on a VPS provider,
-    VPN, Tor exit, or residential ISP - much better for triage than IP alone.
+    Telemetry sampling: when sample_rate < 1.0, only that fraction of hits
+    write to the database. This bounds DB load during floods while preserving
+    a representative sample.
+    
+    Note: _audit_event already fires the webhook for HONEYPOT_HIT, so we do
+    NOT call _send_security_webhook separately (avoids double webhook).
     """
-    import time
+    import time, secrets
     client_id = _client_log_id()
-    # ASN lookup (only when IP logging is enabled)
+    # Check rate limit BEFORE expensive operations
+    rate_limited = _honeypot_rate_limited()
+    # ASN lookup (only when IP logging is enabled, cheap local file read)
     asn_num, asn_org = None, None
     if IP_LOGGING:
         asn_num, asn_org = _lookup_asn(request.remote_addr)
-    if asn_num:
-        LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s" asn="AS%d %s"',
-                    request.path, request.method, client_id, asn_num, asn_org)
-    else:
-        LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s"',
-                    request.path, request.method, client_id)
+    asn_str = f' asn="AS{asn_num} {asn_org}"' if asn_num else ""
+    LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s"%s%s',
+                request.path, request.method, client_id, asn_str,
+                ' rate_limited="true"' if rate_limited else "")
+    if rate_limited:
+        return True  # Signal to caller: minimal response
+    # Sampling: skip DB write for (1 - sample_rate) of hits
+    if sample_rate < 1.0 and secrets.randbelow(1000) >= int(sample_rate * 1000):
+        return
     try:
         detail = {"path": request.path, "method": request.method}
         if asn_num:
@@ -964,20 +962,42 @@ def _honeypot_log():
             detail["asn_org"] = asn_org
         _audit_event("HONEYPOT_HIT", detail=detail)
         db().commit()
+        # Webhook is fired by _audit_event for HONEYPOT_HIT - do not call again
     except Exception:
         pass
-    # Fire webhook alert (if configured)
-    try:
-        webhook_data = {"path": request.path}
-        if asn_num:
-            webhook_data["asn"] = f"AS{asn_num} {asn_org}"
-        _send_security_webhook("HONEYPOT_HIT", webhook_data)
-    except Exception:
-        pass
+    return False
 
-# In-memory per-client honeypot hit tracking (resets on instance restart).
+# In-memory per-client honeypot hit tracking.
 # Keyed by HMAC of request.remote_addr (trusted, not spoofable).
 # This is the REAL resource budget. It cannot be bypassed by header spoofing.
+#
+# MEMORY BOUNDS: All deception dicts have max entries and TTL eviction.
+# _evict_deception_state() is called periodically from _honeypot_rate_limited().
+_DECEPTION_MAX_ENTRIES = 10000
+_DECEPTION_TTL_SECONDS = 3600  # 1 hour
+
+def _evict_deception_state():
+    """Remove stale entries from deception dicts. Called on each rate limit check."""
+    import time
+    now = time.time()
+    # Evict _honeypot_hits entries older than 60s (they're pruned per-client anyway)
+    # Just cap total size
+    if len(_honeypot_hits) > _DECEPTION_MAX_ENTRIES:
+        # Remove oldest by arbitrary order (dicts preserve insertion order)
+        for k in list(_honeypot_hits.keys())[:len(_honeypot_hits) - _DECEPTION_MAX_ENTRIES]:
+            del _honeypot_hits[k]
+    # Evict old backup jobs
+    stale_jobs = [jid for jid, job in _deception_backup_jobs.items()
+                  if now - job.get("started", 0) > _DECEPTION_TTL_SECONDS]
+    for jid in stale_jobs:
+        del _deception_backup_jobs[jid]
+    if len(_deception_backup_jobs) > _DECEPTION_MAX_ENTRIES:
+        for jid in list(_deception_backup_jobs.keys())[:len(_deception_backup_jobs) - _DECEPTION_MAX_ENTRIES]:
+            del _deception_backup_jobs[jid]
+    # Evict old attempt counters (no timestamp, just cap size)
+    if len(_deception_attempt_counters) > _DECEPTION_MAX_ENTRIES:
+        for k in list(_deception_attempt_counters.keys())[:len(_deception_attempt_counters) - _DECEPTION_MAX_ENTRIES]:
+            del _deception_attempt_counters[k]
 _honeypot_hits = {}
 HONEYPOT_MAX_HITS_PER_MINUTE = 30
 
@@ -997,6 +1017,8 @@ def _honeypot_rate_limited():
     if len(_honeypot_hits[client_id]) > HONEYPOT_MAX_HITS_PER_MINUTE:
         LOG.warning('event="honeypot_rate_limited" client="%s"', client_id)
         return True
+    # Periodic eviction (amortized: runs on every check, cheap)
+    _evict_deception_state()
     return False
 
 # --- Deception layer ---

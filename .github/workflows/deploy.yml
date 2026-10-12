@@ -194,7 +194,7 @@ jobs:
             --update-env-vars "VAULT_ENV=production,VAULT_AUTH_POLICY=required,VAULT_RP_ID=mindful-money-k23ukkh5cq-uc.a.run.app,VAULT_ORIGIN=https://mindful-money-k23ukkh5cq-uc.a.run.app,VAULT_TRUST_PROXY=1,VAULT_CSP_MODE=enforce" \
             --max-instances 3 \
             --concurrency 8 \
-            --set-secrets "VAULT_SECRET_KEY=mindful-money-secret:latest,VAULT_DATABASE_URL=neon-db-url:latest" \
+            --update-secrets "VAULT_SECRET_KEY=mindful-money-secret:latest,VAULT_DATABASE_URL=neon-db-url:latest" \
             --quiet
 
       - name: Post-deploy smoke tests
