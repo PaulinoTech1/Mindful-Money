@@ -1655,6 +1655,50 @@ async function exportBackup() {
   }
 }
 
+async function adoptBackupSalts(backup) {
+  // Store the backup's salts as this vault's canonical salts, then re-derive
+  // keys from them. CACHED_SALTS must be cleared first: getSalts() caches per
+  // page-load, and without this deriveKeys() would reuse the stale salts.
+  await api('/api/kdf/salts/migrate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      salt_enc: backup.kdf.salt_enc,
+      salt_idx: backup.kdf.salt_idx,
+    }),
+  });
+  CACHED_SALTS = null;
+  const pass = $('pass').value;
+  if (!pass) throw new Error('Enter your passphrase to restore backup.');
+  KEYS = await deriveKeys(pass);
+}
+
+async function ensureBackupSalts(backup) {
+  // Make the vault's KDF salts match the backup's, adopting them via
+  // /api/kdf/salts/migrate when the vault is empty. Throws when the vault
+  // already holds records encrypted under different salts.
+  let saltResp = null;
+  try {
+    saltResp = await api('/api/kdf/salts');
+  } catch (e) {
+    if (e.status === 409 && e.message.includes('Salt migration required')) {
+      throw new Error('Vault already has records with different salts.');
+    }
+    if (e.status === 404 || e.message.includes('not found')) {
+      await adoptBackupSalts(backup);  // no salts set yet
+      return;
+    }
+    throw e;
+  }
+  if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
+    const probe = await api('/api/records?limit=1&offset=0');
+    if ((probe.total || 0) > 0) {
+      throw new Error('Backup salts do not match vault salts. Use the same vault or migrate first.');
+    }
+    await adoptBackupSalts(backup);  // empty vault: safe to adopt
+  }
+}
+
 async function importBackup(event) {
   const file = event.target.files[0];
   if (!file) return;
@@ -1675,36 +1719,11 @@ async function importBackup(event) {
     if (backup.record_count !== backup.records.length) throw new Error('Record count mismatch (file may be truncated)');
     if (!backup.kdf || !backup.kdf.salt_enc || !backup.kdf.salt_idx) throw new Error('Missing KDF salts');
 
-    // Apply backup salts if vault has none set (fresh vault restore)
-    // This must happen before deriving keys, so we check via API
-    try {
-      const saltResp = await api('/api/kdf/salts');
-      // If we get here without 409, salts are already set - verify they match
-      if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
-        throw new Error('Backup salts do not match vault salts. Use the same vault or migrate first.');
-      }
-    } catch (e) {
-      if (e.status === 409 && e.message.includes('Salt migration required')) {
-        // Vault has records but no salts - shouldn't happen on restore to fresh vault
-        throw new Error('Vault already has records with different salts.');
-      } else if (e.status === 404 || e.message.includes('not found')) {
-        // No salts set - apply backup salts via migrate endpoint
-        await api('/api/kdf/salts/migrate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            salt_enc: backup.kdf.salt_enc,
-            salt_idx: backup.kdf.salt_idx,
-          }),
-        });
-        // Re-derive keys with the new salts
-        const pass = $('pass').value;
-        if (!pass) throw new Error('Enter your passphrase to restore backup.');
-        KEYS = await deriveKeys(pass);
-      } else {
-        throw e;
-      }
-    }
+    // Adopt the backup's KDF salts, then re-derive keys from them.
+    // GET /api/kdf/salts never auto-generates (404 when unset); generation is
+    // explicit via POST /api/kdf/salts/generate, and overwrite via
+    // POST /api/kdf/salts/migrate is only allowed on an empty vault.
+    await ensureBackupSalts(backup);
 
     // Verify integrity
     const canonical = JSON.stringify(backup.records);
@@ -1840,7 +1859,7 @@ async function bootstrapPasskey() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bootstrap_token: token }),
     });
-    const credential = await navigator.credentials.create({ publicKey: options });
+    const credential = await navigator.credentials.create({ publicKey: publicKeyOptions(options) });
     const result = await api('/api/passkeys/bootstrap/verify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ credential: credentialJSON(credential), label: 'Primary passkey', bootstrap_token: token }),

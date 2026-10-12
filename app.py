@@ -1103,7 +1103,7 @@ def bootstrap_verify():
         conn.rollback()
         LOG.warning('event="authentication_failure" category="bootstrap_verification" client="%s"', _client_log_id())
         return api_error("Passkey registration could not be verified", 400)
-    _rotate_session(identity_id=owner_id, vault_unlocked=True)
+    _rotate_session(identity_id=owner_id, authenticated_at=time.time(), vault_unlocked=True)
     LOG.info('event="passkey_registered" category="bootstrap" client="%s"', _client_log_id())
     return jsonify({"verified": True, "csrf_token": session["csrf_token"]})
 
@@ -1219,8 +1219,10 @@ def login_verify():
     # Clear any lockout by logging a success (resets the failure window)
     conn.commit()
     # Preserve only the browser's non-authoritative UI hint across rotation.
-    # Successful verify_authentication_response() above is the sole
-    # application path that establishes a fresh authenticated_at timestamp.
+    # Successful verify_authentication_response() above, or a successful
+    # bootstrap registration ceremony (which also proves authenticator
+    # possession with user verification), establishes a fresh
+    # authenticated_at timestamp.
     client_vault_open = bool(session.get("vault_unlocked"))
     _rotate_session(identity_id=row["identity_id"],authenticated_at=time.time(),vault_unlocked=client_vault_open)
     LOG.info('event="authentication_success" client="%s"', _client_log_id())
@@ -1486,7 +1488,18 @@ def migrate_kdf_salts():
     if not row:
         return api_error("Identity not found", 404)
     if row.kdf_salt_enc is not None:
-        return api_error("Salts already migrated", 409)
+        # Salts already set. Overwriting is only safe when no records exist
+        # (nothing was encrypted with the old salts) -- this is the
+        # backup-restore-to-empty-vault case.
+        record_table = models.Record.__table__
+        record_count = conn.execute(
+            select(func.count()).select_from(record_table).where(
+                record_table.c.identity_id == identity_id
+            )
+        ).scalar() or 0
+        if record_count > 0:
+            return api_error("Salts already set and records exist. Cannot migrate.", 409)
+        LOG.info('event="kdf_salts_overwritten_empty_vault" client="%s"', _client_log_id())
     
     conn.execute(
         update(table)
