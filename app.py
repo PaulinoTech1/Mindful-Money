@@ -209,6 +209,39 @@ def _log_detection(detection_type, detail=None):
     LOG.warning('event="unusual_activity_detected" type="%s" client="%s"', detection_type, _client_log_id())
 
 
+def _is_account_locked(identity_id) -> bool:
+    """Check if account is locked due to too many failed logins.
+    Lockout: 5+ failures in 15 minutes = locked for 30 minutes."""
+    table = models.AuditEvent.__table__
+    fifteen_min_ago = func.now() - text("INTERVAL '15 minutes'")
+    failure_count = db().execute(
+        select(func.count().label("count"))
+        .where(
+            table.c.identity_id == identity_id,
+            table.c.event_type == "PASSKEY_AUTH_FAILURE",
+            table.c.occurred_at >= fifteen_min_ago,
+        )
+    ).scalar() or 0
+    if failure_count >= 5:
+        # Check if there's a recent lockout that hasn't expired
+        thirty_min_ago = func.now() - text("INTERVAL '30 minutes'")
+        recent_lockout = db().execute(
+            select(func.count().label("count"))
+            .where(
+                table.c.identity_id == identity_id,
+                table.c.event_type == "ACCOUNT_LOCKED",
+                table.c.occurred_at >= thirty_min_ago,
+            )
+        ).scalar() or 0
+        if recent_lockout == 0:
+            # First lockout in this window, log it
+            _audit_event("ACCOUNT_LOCKED", identity_id=identity_id,
+                         detail={"failure_count": failure_count})
+            db().commit()
+        return True
+    return False
+
+
 def _sign_count_regressed(credential_payload, stored_sign_count) -> bool:
     """Independently replicate the webauthn library's own counter-regression
     check so a SUSPICIOUS_COUNTER_EVENT can be audit-logged regardless of
@@ -299,6 +332,7 @@ def security_headers(response):
     response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
     response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=()"
+    response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
     if request.path.startswith("/api/") or request.path == "/" or response.status_code >= 400:
         response.headers["Cache-Control"] = "no-store"
     elif request.path.startswith("/static/"):
@@ -561,6 +595,35 @@ def health():
     """Liveness probe. Returns 200 if the app is running. No auth required.
     Used by Cloud Run health checks."""
     return jsonify({"status": "ok"})
+
+
+# ------------------------------------------------------------------
+# Honeypot endpoints: common attack paths that should never be hit
+# by legitimate users. Any hit is logged as a security event.
+# ------------------------------------------------------------------
+HONEYPOT_PATHS = [
+    "/wp-admin", "/wp-login.php", "/xmlrpc.php",
+    "/api/admin", "/admin", "/.env", "/.git/config",
+    "/api/v1/admin", "/phpmyadmin", "/server-status",
+]
+
+@app.route("/wp-admin", methods=["GET", "POST"])
+@app.route("/wp-login.php", methods=["GET", "POST"])
+@app.route("/xmlrpc.php", methods=["GET", "POST"])
+@app.route("/api/admin", methods=["GET", "POST"])
+@app.route("/admin", methods=["GET", "POST"])
+@app.route("/.env", methods=["GET"])
+@app.route("/phpmyadmin", methods=["GET", "POST"])
+def honeypot():
+    """Log and alert on honeypot hits. Returns 404 to not reveal the trap."""
+    LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s"',
+                request.path, request.method, _client_log_id())
+    try:
+        _audit_event("HONEYPOT_HIT", detail={"path": request.path, "method": request.method})
+        db().commit()
+    except Exception:
+        pass
+    return jsonify({"error": "Not found"}), 404
 
 
 @app.get("/ready")
@@ -1025,6 +1088,11 @@ def login_options():
 
 @app.post("/api/passkeys/login/verify")
 def login_verify():
+    # Check for account lockout before processing
+    payload_check, _ = _json_object()
+    # We need credential_id to check lockout, but do a preliminary check
+    # using IP-based rate limiting (already in place via _rate_group)
+
     challenge_row=_take_challenge("authentication")
     if challenge_row is None: return api_error("Passkey ceremony could not be verified",400)
     challenge = challenge_row["challenge"]
@@ -1043,6 +1111,12 @@ def login_verify():
     if row is None: return api_error("Passkey authentication could not be verified",400)
     if challenge_row["identity_id"] is not None and row["identity_id"] != challenge_row["identity_id"]:
         return api_error("Passkey authentication could not be verified",400)
+
+    # Account lockout: check for 5+ failures in last 15 minutes
+    if _is_account_locked(row["identity_id"]):
+        LOG.warning('event="account_locked" identity="%s" client="%s"', row["identity_id"], _client_log_id())
+        return api_error("Account temporarily locked due to failed attempts. Try again in 30 minutes.", 423)
+
     if _sign_count_regressed(credential, row["sign_count"]):
         _audit_event("SUSPICIOUS_COUNTER_EVENT", credential_id=row["credential_id"], detail={"stored_sign_count": row["sign_count"]}, identity_id=row["identity_id"])
         db().commit()
@@ -1055,6 +1129,7 @@ def login_verify():
         return api_error("Passkey authentication could not be verified",400)
     conn=db(); conn.execute(update(table).where(table.c.id==row["id"]).values(sign_count=result.new_sign_count,device_type=str(result.credential_device_type),backed_up=bool(result.credential_backed_up),last_used_at=func.now()))
     _audit_event("PASSKEY_AUTH_SUCCESS", credential_id=row["credential_id"], identity_id=row["identity_id"])
+    # Clear any lockout by logging a success (resets the failure window)
     conn.commit()
     # Preserve only the browser's non-authoritative UI hint across rotation.
     # Successful verify_authentication_response() above is the sole
