@@ -1728,6 +1728,53 @@ class TestHoneypotTarpit(ServerCase):
                 response = self.client.get(path)
                 self.assertEqual(response.status_code, 404)
 
+    def test_robots_txt_disallows_fake_paths(self):
+        """/robots.txt lists tempting dead-end paths."""
+        from unittest.mock import patch
+        with patch("app._tarpit_delay"):
+            response = self.client.get("/robots.txt")
+        self.assertEqual(response.status_code, 200)
+        text = response.get_data(as_text=True)
+        self.assertIn("Disallow: /backup/", text)
+        self.assertIn("Disallow: /admin/", text)
+
+    def test_fake_backup_serves_garbage(self):
+        """Fake backup endpoints serve ZIP-looking garbage."""
+        from unittest.mock import patch
+        with patch("app._tarpit_delay"):
+            response = self.client.get("/backup.zip")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_data()
+        self.assertTrue(data.startswith(b"PK\x03\x04"))  # ZIP magic
+
+    def test_rate_limit_bypass_via_xff(self):
+        """Rate limiter trusts X-Forwarded-For (intentional weakness).
+        A mid-tier analyst can bypass by rotating XFF values."""
+        from unittest.mock import patch
+        import app as server_app
+        # Clear rate limit state
+        server_app._honeypot_hits.clear()
+        # Patch time.sleep to avoid actual delays, but let _tarpit_delay run
+        # so _honeypot_rate_limited is exercised
+        with patch("time.sleep"):
+            # Hit 15 times with same XFF -> should trigger rate limit
+            # (first 10 get delay, rest skip via rate limit)
+            for i in range(15):
+                self.client.get("/wp-admin", headers={"X-Forwarded-For": "1.2.3.4"})
+            # Verify rate limit state: 1.2.3.4 should have 15 hits recorded
+            import hashlib, hmac
+            key = hmac.new(server_app.RATE_KEY, b"1.2.3.4", hashlib.sha256).hexdigest()[:12]
+            self.assertEqual(len(server_app._honeypot_hits.get(key, [])), 15)
+            
+            # Now bypass with different XFF - each gets fresh budget
+            server_app._honeypot_hits.clear()
+            for i in range(5):
+                self.client.get("/wp-admin", headers={"X-Forwarded-For": f"5.6.7.{i}"})
+            # Each XFF should have exactly 1 hit (separate buckets)
+            for i in range(5):
+                k = hmac.new(server_app.RATE_KEY, f"5.6.7.{i}".encode(), hashlib.sha256).hexdigest()[:12]
+                self.assertEqual(len(server_app._honeypot_hits.get(k, [])), 1)
+
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -662,34 +662,50 @@ TARPIT_MAX_DELAY = 12  # seconds
 
 def _fake_wordpress_login():
     """Convincing fake WordPress login page. Attackers will waste time
-    trying credentials against it."""
+    trying credentials against it.
+    
+    Contains intentional 'mistakes': HTML comments suggesting debug mode,
+    a fake version number with known CVEs, and a commented-out test credential.
+    All lead nowhere.
+    """
     return """<!DOCTYPE html>
 <html lang="en-US">
 <head><meta charset="UTF-8"><title>Log In &lsaquo; WordPress</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f0f1;color:#3c434a} #login{width:320px;margin:auto;padding:8% 0 0} .button{background:#2271b1;color:#fff;border:1px solid #2271b1;padding:0 12px;height:32px;cursor:pointer} input{width:100%;padding:3px;margin:2px 6px 16px 0;border:1px solid #8c8f94}</style>
 </head><body>
+<!-- TODO: disable WP_DEBUG before production push - exposes paths in errors -->
+<!-- Test account: wp_admin / TempPass123! (remove before go-live) -->
 <div id="login"><h1>WordPress</h1>
 <form method="post" action="/wp-login.php">
 <p><label>Username or Email Address<br><input type="text" name="log"></label></p>
 <p><label>Password<br><input type="password" name="pwd"></label></p>
 <p><input type="submit" class="button" value="Log In"></p>
 </form></div>
-<!-- WordPress 6.4.2 -->
+<!-- WordPress 5.8.3 | PHP 7.4.21 -->
+<!-- Debug: /wp-content/debug.log (rotated daily) -->
 </body></html>"""
 
 def _fake_env_file():
     """Fake .env file with plausible but useless secrets. Attackers will
-    waste time trying these credentials."""
-    return """# Production environment
+    waste time trying these credentials.
+    
+    Contains intentional 'mistakes': commented-out production credentials,
+    a TODO about rotating keys, and an AWS key that looks real but is fake.
+    """
+    return """# Production environment - DO NOT COMMIT
+# TODO: rotate all keys before Q4 audit
 DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=vault_production
 DB_USER=vault_app
 DB_PASSWORD=xK9#mP2$vL5@nQ8wE4rT6yU1iO3pA7sD
+# Old credentials (disabled 2024-03, kept for reference):
+# DB_PASSWORD_OLD=Summer2023!Vault
 SECRET_KEY=sk-live-7f3a9b2e4d1c8f6a5e3b9d2c4f6a8e1b3d
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 REDIS_URL=redis://:p@ssw0rd123@localhost:6379/0
+# Backup bucket: s3://vault-backups-prod (migrating to Glacier)
 """
 
 def _fake_phpmyadmin():
@@ -774,6 +790,39 @@ def honeypot_git():
     _tarpit_delay()
     return _fake_git_config(), 200, {"Content-Type": "text/plain"}
 
+@app.route("/robots.txt", methods=["GET"])
+def honeypot_robots():
+    """Tarpit: robots.txt that disallows 'interesting' paths.
+    Attackers love robots.txt - it tells them where to look.
+    Every disallowed path is a dead end."""
+    _honeypot_log()
+    _tarpit_delay()
+    return """User-agent: *
+Disallow: /admin/
+Disallow: /backup/
+Disallow: /old-site/
+Disallow: /test/
+Disallow: /dev/
+Disallow: /staging/
+# TODO: remove /backup-2024-01.zip before launch
+""", 200, {"Content-Type": "text/plain"}
+
+@app.route("/backup.zip", methods=["GET"])
+@app.route("/backup-2024-01.zip", methods=["GET"])
+@app.route("/db_backup.sql", methods=["GET"])
+def honeypot_backup():
+    """Tarpit: fake backup file. Serves garbage that looks like a zip header.
+    Attackers will waste time downloading and analyzing it."""
+    _honeypot_log()
+    _tarpit_delay()
+    LOG.warning('event="honeypot_backup_download" client="%s"', _client_log_id())
+    # Fake ZIP header followed by garbage - looks real, contains nothing
+    fake_zip = b"PK\x03\x04" + b"\x00" * 100 + b"fake backup data - " * 1000
+    return fake_zip, 200, {
+        "Content-Type": "application/zip",
+        "Content-Disposition": "attachment; filename=backup.zip",
+    }
+
 @app.route("/api/admin", methods=["GET", "POST"])
 @app.route("/admin", methods=["GET", "POST"])
 @app.route("/api/v1/admin", methods=["GET", "POST"])
@@ -813,17 +862,43 @@ def _honeypot_log():
 _honeypot_hits = {}
 HONEYPOT_MAX_HITS_PER_MINUTE = 10
 
+def _honeypot_rate_limit_key():
+    """Get the rate limit key for honeypot throttling.
+    
+    INTENTIONAL WEAKNESS (tarpit design): This trusts the X-Forwarded-For header,
+    which an attacker can spoof. The real authentication (_client_log_id) uses
+    request.remote_addr and ignores XFF. A mid-tier analyst who compares the two
+    will spot the discrepancy and bypass the rate limit by rotating XFF values.
+    
+    This is deliberate: unsophisticated scanners hit the limit and give up or
+    slow down. Skilled analysts bypass it and invest more time in the tarpit,
+    which is exactly what we want - the longer they engage with fake content,
+    the more we learn and the less time they spend on real targets.
+    """
+    # Trust XFF if present (spoofable) - intentional for tarpit design
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        # Take the first IP (client's claimed address)
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
 def _honeypot_rate_limited():
     """Check if this client has exceeded the honeypot rate limit.
     Returns True if they should skip the tarpit delay (fail fast)."""
     import time
-    client_id = _client_log_id()
+    # Use the spoofable key (intentional - see above)
+    key = _honeypot_rate_limit_key()
+    # Hash it for the log (don't store raw IPs in memory longer than needed)
+    import hashlib, hmac
+    client_id = hmac.new(RATE_KEY, key.encode(), hashlib.sha256).hexdigest()[:12]
     now = time.time()
-    # Clean old entries and count recent hits
     cutoff = now - 60
     _honeypot_hits[client_id] = [t for t in _honeypot_hits.get(client_id, []) if t > cutoff]
     _honeypot_hits[client_id].append(now)
-    return len(_honeypot_hits[client_id]) > HONEYPOT_MAX_HITS_PER_MINUTE
+    if len(_honeypot_hits[client_id]) > HONEYPOT_MAX_HITS_PER_MINUTE:
+        LOG.warning('event="honeypot_rate_limited" client="%s"', _client_log_id())
+        return True
+    return False
 
 def _tarpit_delay():
     """Random delay to waste attacker's time. Skipped if rate-limited."""
