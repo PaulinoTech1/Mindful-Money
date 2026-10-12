@@ -121,16 +121,39 @@ Actions deploy had ever succeeded. 14 workflow runs failed silently.
 - Strict bootstrap tests (was accepting 200/400/403)
 - `GET /api/kdf/salts` returns 404 (not auto-generate); new `/generate` endpoint
 
+## Phase 8: Honeypot tarpits and threat intelligence
+
+| Commit | Change |
+|---|---|
+| `caa1ddb0` | Convincing fake content + 3-12s delays on honeypot paths |
+| `c2abc78a` | Cost caps: max-instances 3, per-IP rate limiting |
+| `928c8ec0` | Bypassable rate limit (XFF), dead-end mistake artifacts |
+| `0f46a7dd` | ASN logging via bundled GeoLite2 database |
+
+**Tarpit design:**
+- Fake WordPress, phpMyAdmin, XML-RPC, .env, git config, robots.txt
+- Random 3-12s delays waste attacker time
+- Intentional "mistakes" (fake creds in HTML comments, TODOs, old versions)
+- Rate limiter trusts X-Forwarded-For (bypassable by mid-tier analysts by design)
+- ASN logging reveals attacker infrastructure (VPS, VPN, Tor, residential)
+
+**Cost controls:**
+- Max 3 Cloud Run instances (~$2/day worst case, $0 normal)
+- Per-IP rate limit: 10 hits/min then skip delays
+- ASN database: 8.6MB bundled file, $0 ongoing cost
+
 ## By the numbers
 
 | Metric | Start | End |
 |---|---|---|
-| Tests passing | 6/88 (6.8%) | 100/100 |
+| Tests passing | 6/88 (6.8%) | 110/110 |
 | CI deploy success | 0/14 runs | Blocked on IAM (code ready) |
-| Security tests | 0 | 15 (recovery, authz, exposure) |
-| Docs | 7/12 with issues | Audited, critical fixed |
-| Backup/restore | None | Encrypted, tested |
+| Security tests | 0 | 25+ (recovery, authz, exposure, honeypot) |
+| Browser tests | 0 | 20 (Playwright real-browser) |
+| Docs | 7/12 with issues | 13 files, audited |
+| Backup/restore | None | Encrypted, HMAC integrity, browser-tested |
 | Bootstrap protection | None | Token-required, fail-closed |
+| Honeypot | Basic 404 | Full tarpit with ASN intel |
 
 ## What remains
 
