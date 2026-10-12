@@ -642,15 +642,8 @@ def ready():
 
 @app.get("/api/session")
 def session_status():
-    # Per-session encryption context: random value unique to this session.
-    # The client uses it to derive session-specific blind indexes, so indexes
-    # can't be correlated across sessions even if the underlying record IDs
-    # are the same. Stored in the server session, not in the database.
-    if "enc_context" not in session:
-        session["enc_context"] = secrets.token_hex(16)
     return jsonify({"authenticated": authenticated(), "vault_unlocked": bool(session.get("vault_unlocked")),
-                    "csrf_token": session["csrf_token"], "expires_in": SESSION_TTL, "idle_expires_in": SESSION_IDLE_TTL,
-                    "enc_context": session["enc_context"]})
+                    "csrf_token": session["csrf_token"], "expires_in": SESSION_TTL, "idle_expires_in": SESSION_IDLE_TTL})
 
 @app.post("/api/vault/unlocked")
 def mark_unlocked():

@@ -369,22 +369,8 @@ const open = (hex) =>
   JSON.parse(S.to_string(
     S.crypto_box_seal_open(S.from_hex(hex), KEYS.publicKey, KEYS.privateKey)));
 
-let SESSION_CONTEXT = "";
-
-// Fetch session context for per-session blind index derivation.
-// This ensures blind indexes can't be correlated across sessions.
-async function initSessionContext() {
-  try {
-    const sess = await api('/api/session');
-    SESSION_CONTEXT = sess.enc_context || "";
-  } catch (e) {
-    console.warn('Could not fetch session context, using empty');
-    SESSION_CONTEXT = "";
-  }
-}
-
 const blindIndex = (id) =>
-  S.to_hex(S.crypto_generichash(32, S.from_string(SESSION_CONTEXT + ":" + id), KEYS.indexKey));
+  S.to_hex(S.crypto_generichash(32, S.from_string(id), KEYS.indexKey));
 
 // Passphrase strength estimator. Runs entirely in the browser; no passphrase
 // data is stored or transmitted. This is a heuristic, not a cryptographic
@@ -550,7 +536,6 @@ async function unlock() {
 
   try {
     KEYS = await deriveKeys(pass);
-    await initSessionContext();
     await load(true);
     await api('/api/vault/unlocked', { method: 'POST' });
   } catch (_error) {
