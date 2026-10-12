@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "generated_by": "scripts/generate_integrity.py",
+  "files": {
+    "vendor/libsodium-sumo.js": {
+      "sri": "sha384-kYotthKuvJt+n3lBEglaZ0p/sISW8Quni3QLWH1RLOVhB5is3z/zSXKbAc8o6NFz",
+      "sha256": "d2f4ae352b56b8b55d38e200478bb90bdb07d4035bd5a98cdc9c8cceaf688f19"
+    },
+    "vendor/libsodium-wrappers.js": {
+      "sri": "sha384-yJ6IcndOlizL/8XUe1+ali2AzCeUM7D/7u0vsSnN8l7iILCYNDJfPYdf6M0aJVHz",
+      "sha256": "b7105ad0513c847eb19aa3b38dde1a2034cfbe689986195d5669dcabe24c8723"
+    },
+    "vendor/chart.umd.min.js": {
+      "sri": "sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC",
+      "sha256": "206b6e8bb00fc7bba2c7ee80ca41db3e9e05ba7be0aa35abeba9cfd5357f5d0e"
+    },
+    "simplefin-client.js": {
+      "sri": "sha384-+aPKToQ2QdiXnvnDkuBK0s8z6o9n2y+fP470/Q9TDybaLrxvquVa3OLsK57aEW+6",
+      "sha256": "14b70ee08c73113902a31df1a86a1c4caa90dae239266b0dea4ca864c8e3896f"
+    },
+    "recovery-words.js": {
+      "sri": "sha384-if7vpoSqNmmVR3eVBOOfBboAo7y8K0acMtTnZvlqeUDcGXn/WtzzPJXjgs6JNmk+",
+      "sha256": "12980a3f75d14eea4f88b4f69bfa58b9289ce9f687e8a7b14c90a4bc0205dfdc"
+    },
+    "app.js": {
+      "sri": "sha384-HUftqKXLrUuxKkNrUYJB8xXKmq1+b+d05kgFqPxoZIj3QNJ5r6BcT0jg/fc24Ppc",
+      "sha256": "3aca8e04c0271a7b9b78ed4e80a4ae57ad6d7e725a84f16b134740fd5a4bc864"
+    }
+  }
+}

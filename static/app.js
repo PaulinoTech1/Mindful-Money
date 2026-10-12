@@ -79,6 +79,7 @@ async function getSalts() {
     CACHED_SALTS = {
       enc: Uint8Array.from(data.salt_enc.match(/../g).map(h => parseInt(h, 16))),
       idx: Uint8Array.from(data.salt_idx.match(/../g).map(h => parseInt(h, 16))),
+      kdf_version: data.kdf_version || 1,
     };
     return CACHED_SALTS;
   } catch (e) {
@@ -89,6 +90,8 @@ async function getSalts() {
       CACHED_SALTS = {
         enc: Uint8Array.from(data.salt_enc.match(/../g).map(h => parseInt(h, 16))),
         idx: Uint8Array.from(data.salt_idx.match(/../g).map(h => parseInt(h, 16))),
+        kdf_version: data.kdf_version || 2,
+        isNewVault: true,
       };
       return CACHED_SALTS;
     }
@@ -371,10 +374,72 @@ async function submitManualTransaction(event) {
 
 /* ---------- crypto ---------- */
 
-async function deriveKeys(passphrase) {
+// KDF parameters by version.
+// v1: libsodium INTERACTIVE (ops=2, mem=64MB) - legacy, weaker
+// v2: libsodium MODERATE (ops=3, mem=256MB) - current default
+// The version is stored server-side per identity. Existing vaults keep
+// their version until the user explicitly upgrades (to avoid lockout).
+function kdfParams(version) {
+  if (version >= 2) {
+    return {
+      ops: S.crypto_pwhash_OPSLIMIT_MODERATE,
+      mem: S.crypto_pwhash_MEMLIMIT_MODERATE,
+      version: 2,
+    };
+  }
+  return {
+    ops: S.crypto_pwhash_OPSLIMIT_INTERACTIVE,
+    mem: S.crypto_pwhash_MEMLIMIT_INTERACTIVE,
+    version: 1,
+  };
+}
+
+// Estimate passphrase entropy in bits using a conservative model.
+// Counts character classes present and length. This is a lower bound;
+// actual entropy may be higher for random passphrases, lower for
+// dictionary words or patterns. We enforce a minimum to raise the
+// cost of offline brute-force attacks.
+function estimateEntropy(passphrase) {
+  let classes = 0;
+  if (/[a-z]/.test(passphrase)) classes += 26;
+  if (/[A-Z]/.test(passphrase)) classes += 26;
+  if (/[0-9]/.test(passphrase)) classes += 10;
+  if (/[^a-zA-Z0-9]/.test(passphrase)) classes += 32;
+  if (classes === 0) return 0;
+  // Conservative: assume attacker knows the character set.
+  // Deduct for common patterns (repeated chars, sequences).
+  let bits = Math.log2(classes) * passphrase.length;
+  if (/(.)\1{2,}/.test(passphrase)) bits -= 10;  // repeated characters
+  if (/123|abc|qwe|password|admin/i.test(passphrase)) bits -= 20;  // common patterns
+  return Math.max(0, bits);
+}
+
+// Minimum entropy for new vaults: 60 bits.
+// At 60 bits, an attacker with 10,000 high-end GPUs (each doing ~100k
+// Argon2id-MODERATE hashes/sec) would need ~1800 years on average.
+// See docs/OFFLINE_ATTACK_COST.md for the full analysis.
+const MIN_PASSPHRASE_ENTROPY = 60;
+
+function checkPassphraseStrength(passphrase) {
+  const entropy = estimateEntropy(passphrase);
+  if (passphrase.length < 12) {
+    return { ok: false, entropy, reason: "Passphrase must be at least 12 characters." };
+  }
+  if (entropy < MIN_PASSPHRASE_ENTROPY) {
+    return {
+      ok: false,
+      entropy,
+      reason: `Passphrase too weak (estimated ${Math.round(entropy)} bits, need ${MIN_PASSPHRASE_ENTROPY}). Use a longer passphrase with mixed character types, or a multi-word diceware phrase.`,
+    };
+  }
+  return { ok: true, entropy };
+}
+
+async function deriveKeys(passphrase, kdfVersion) {
   const A = S.crypto_pwhash_ALG_ARGON2ID13;
-  const ops = S.crypto_pwhash_OPSLIMIT_INTERACTIVE;
-  const mem = S.crypto_pwhash_MEMLIMIT_INTERACTIVE;
+  const params = kdfParams(kdfVersion || 1);
+  const ops = params.ops;
+  const mem = params.mem;
 
   // Per-identity salts from the server (not secret, just unique).
   // Falls back to localStorage for legacy vaults.
@@ -387,7 +452,75 @@ async function deriveKeys(passphrase) {
   const kp = S.crypto_box_seed_keypair(seed);
   const indexKey = S.crypto_pwhash(32, passphrase, saltIdx, ops, mem, A);
 
-  return { publicKey: kp.publicKey, privateKey: kp.privateKey, indexKey };
+  return { publicKey: kp.publicKey, privateKey: kp.privateKey, indexKey, kdfVersion: params.version, seed };
+}
+
+/* ---------- recovery key ---------- */
+// The recovery key is a 256-bit random value that encrypts the vault seed.
+// It is independent of the passphrase: a strong recovery key does not
+// excuse a weak passphrase, and vice versa.
+
+async function setupRecoveryKey() {
+  if (!KEYS || !KEYS.seed) throw new Error('Vault must be unlocked first');
+  
+  // Generate 256-bit recovery key
+  const recoveryKey = S.randombytes_buf(32);
+  const mnemonic = encodeRecoveryKey(recoveryKey);
+  
+  // Encrypt the vault seed with the recovery key
+  // Use XSalsa20-Poly1305 with a random nonce
+  const nonce = S.randombytes_buf(S.crypto_secretbox_NONCEBYTES);
+  const encryptedSeed = S.crypto_secretbox_easy(KEYS.seed, nonce, recoveryKey);
+  
+  // Pack nonce + ciphertext for storage
+  const blob = new Uint8Array(nonce.length + encryptedSeed.length);
+  blob.set(nonce);
+  blob.set(encryptedSeed, nonce.length);
+  
+  // Send to server (server never sees the recovery key)
+  await api('/api/recovery/setup', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ recovery_blob: S.to_hex(blob) }),
+  });
+  
+  // Clear the raw key from memory; return mnemonic for one-time display
+  recoveryKey.fill(0);
+  return mnemonic;
+}
+
+async function recoverWithKey(mnemonic, newPassphrase) {
+  // Decode the mnemonic
+  const recoveryKey = decodeRecoveryKey(mnemonic);
+  
+  try {
+    // Fetch the encrypted blob (requires passkey auth)
+    const data = await api('/api/recovery/blob');
+    const blob = S.from_hex(data.recovery_blob);
+    
+    // Split nonce and ciphertext
+    const nonce = blob.slice(0, S.crypto_secretbox_NONCEBYTES);
+    const ciphertext = blob.slice(S.crypto_secretbox_NONCEBYTES);
+    
+    // Decrypt the seed
+    const seed = S.crypto_secretbox_open_easy(ciphertext, nonce, recoveryKey);
+    if (!seed) throw new Error('Invalid recovery key or corrupted data');
+    
+    // Validate new passphrase strength (don't allow weak passphrases
+    // just because recovery is available)
+    const strength = checkPassphraseStrength(newPassphrase);
+    if (!strength.ok) {
+      throw new Error('New passphrase too weak: ' + strength.reason);
+    }
+    
+    // Generate new salts and derive keys with new passphrase
+    // (This will create a new vault; the old records are re-encrypted
+    //  using the recovered seed to derive the old keys)
+    // For now: return the seed so the caller can complete recovery
+    return seed;
+  } finally {
+    recoveryKey.fill(0);
+  }
 }
 
 // Domain-separated backup authentication key.
@@ -400,12 +533,55 @@ function backupAuthKey() {
   return S.crypto_generichash(32, S.from_string("mindful-money-backup-auth-v1"), KEYS.indexKey);
 }
 
-const seal = (obj) =>
-  S.to_hex(S.crypto_box_seal(S.from_string(JSON.stringify(obj)), KEYS.publicKey));
+// Padding buckets for sealed records (in bytes, before encryption).
+// All plaintexts are padded to the next bucket size to prevent length
+// side-channels from revealing record contents. The buckets are sized
+// to cover typical transaction records while limiting overhead.
+const PAD_BUCKETS = [512, 1024, 2048, 4096, 8192];
+const PAD_MAX = 8192;  // 8KB max plaintext
 
-const open = (hex) =>
-  JSON.parse(S.to_string(
-    S.crypto_box_seal_open(S.from_hex(hex), KEYS.publicKey, KEYS.privateKey)));
+function padPlaintext(data) {
+  if (data.length > PAD_MAX) {
+    throw new Error(`Record too large: ${data.length} bytes (max ${PAD_MAX})`);
+  }
+  // Find the smallest bucket that fits
+  let bucket = PAD_BUCKETS[PAD_BUCKETS.length - 1];
+  for (const b of PAD_BUCKETS) {
+    if (data.length <= b) { bucket = b; break; }
+  }
+  // PKCS#7-style padding: pad with bytes indicating pad length
+  const padLen = bucket - data.length;
+  const padded = new Uint8Array(bucket);
+  padded.set(data);
+  padded.fill(padLen, data.length);
+  return padded;
+}
+
+function unpadPlaintext(padded) {
+  if (padded.length === 0) throw new Error('Empty padded data');
+  const padLen = padded[padded.length - 1];
+  if (padLen === 0 || padLen > padded.length) {
+    throw new Error('Invalid padding');
+  }
+  // Verify all padding bytes match
+  for (let i = padded.length - padLen; i < padded.length; i++) {
+    if (padded[i] !== padLen) throw new Error('Invalid padding bytes');
+  }
+  return padded.slice(0, padded.length - padLen);
+}
+
+const seal = (obj) => {
+  const plaintext = S.from_string(JSON.stringify(obj));
+  const padded = padPlaintext(plaintext);
+  return S.to_hex(S.crypto_box_seal(padded, KEYS.publicKey));
+};
+
+const open = (hex) => {
+  const padded = S.crypto_box_seal_open(S.from_hex(hex), KEYS.publicKey, KEYS.privateKey);
+  if (!padded) throw new Error('Decryption failed');
+  const plaintext = unpadPlaintext(padded);
+  return JSON.parse(S.to_string(plaintext));
+};
 
 const blindIndex = (id) =>
   S.to_hex(S.crypto_generichash(32, S.from_string(id), KEYS.indexKey));
@@ -573,7 +749,20 @@ async function unlock() {
   await new Promise((r) => setTimeout(r, 30));   // let the label paint
 
   try {
-    KEYS = await deriveKeys(pass);
+    const saltsForKdf = await getSalts();
+    const strength = checkPassphraseStrength(pass);
+    // New vaults: enforce minimum entropy (block weak passphrases).
+    // Existing vaults: warn only (blocking would lock out users).
+    if (saltsForKdf.isNewVault && !strength.ok) {
+      $('gateNote').textContent = 'Passphrase too weak: ' + strength.reason;
+      $('unlockBtn').disabled = false;
+      return;
+    }
+    if (!strength.ok) {
+      console.warn('Weak passphrase detected:', strength.reason);
+      $('gateNote').textContent = 'Warning: ' + strength.reason;
+    }
+    KEYS = await deriveKeys(pass, saltsForKdf.kdf_version || 1);
     // Clear passphrase from DOM immediately after derivation.
     // Reduces exposure window; JS cannot guarantee memory erasure but
     // removing the DOM value eliminates the most accessible copy.
@@ -1758,7 +1947,7 @@ async function importBackup(event) {
     CACHED_SALTS = candidateSalts;
     let candidateKeys;
     try {
-      candidateKeys = await deriveKeys(pass);
+      candidateKeys = await deriveKeys(pass, candidateSalts.kdf_version || 1);
     } finally {
       CACHED_SALTS = savedSalts;
     }
@@ -1806,7 +1995,7 @@ async function importBackup(event) {
           }),
         });
         CACHED_SALTS = null;
-        KEYS = await deriveKeys(pass);
+        KEYS = await deriveKeys(pass, backup.kdf.kdf_version || 1);
       }
     } catch (e) {
       if (e.status === 404 || (e.message && e.message.includes('not found'))) {
@@ -1819,7 +2008,7 @@ async function importBackup(event) {
           }),
         });
         CACHED_SALTS = null;
-        KEYS = await deriveKeys(pass);
+        KEYS = await deriveKeys(pass, backup.kdf.kdf_version || 1);
       } else {
         throw e;
       }
@@ -2071,8 +2260,110 @@ async function disablePasskeys() {
   $('addExpenseBtn').addEventListener('click', openAddTransactionDialog);
   $('addExpenseForm').addEventListener('submit', submitManualTransaction);
   document.querySelectorAll('input[name="addExpenseType"]').forEach((radio) => radio.addEventListener('change', updateManualCategoryOptions));
+/* ---------- recovery UI handlers ---------- */
+
+async function handleSetupRecovery() {
+  const note = $('recoveryNote');
+  try {
+    if (!KEYS) { note.textContent = 'Unlock your vault first.'; return; }
+    if (!confirm('Generate a recovery key? You will need to write down 32 words on paper.')) return;
+    
+    note.textContent = 'Generating recovery key...';
+    const mnemonic = await setupRecoveryKey();
+    
+    // Display the mnemonic ONE TIME
+    $('recoveryWords').textContent = mnemonic;
+    $('recoveryDisplay').hidden = false;
+    $('recoverForm').hidden = true;
+    note.textContent = '';
+    
+    // Clear mnemonic from JS memory after display (user must have written it down)
+    // Note: the DOM still contains it until they click Done
+  } catch (e) {
+    note.textContent = 'Error: ' + (e.message || 'Failed to generate recovery key');
+  }
+}
+
+async function handleRecoverVault() {
+  const note = $('recoverNote');
+  const mnemonic = $('recoverMnemonic').value.trim();
+  const newPass = $('recoverNewPass').value;
+  
+  if (!mnemonic || !newPass) {
+    note.textContent = 'Enter both the recovery key and a new passphrase.';
+    return;
+  }
+  
+  try {
+    note.textContent = 'Recovering...';
+    const seed = await recoverWithKey(mnemonic, newPass);
+    
+    // Clear sensitive inputs
+    $('recoverMnemonic').value = '';
+    $('recoverNewPass').value = '';
+    
+    note.textContent = 'Seed recovered. You must now create a new vault with the new passphrase. ' +
+      'Your old records are encrypted with the old key; export them first if needed.';
+    // TODO: Complete the re-encryption flow (decrypt old records with recovered
+    // seed, re-encrypt with new passphrase-derived keys)
+    
+    // Clear seed from memory
+    seed.fill(0);
+  } catch (e) {
+    note.textContent = 'Recovery failed: ' + (e.message || 'Unknown error');
+  }
+}
+
+async function handleDeleteRecovery() {
+  if (!confirm('Delete the recovery key? You will lose the ability to recover with the existing key.')) return;
+  try {
+    await api('/api/recovery/delete', { method: 'POST' });
+    $('recoveryNote').textContent = 'Recovery key deleted.';
+    refreshRecoveryState();
+  } catch (e) {
+    $('recoveryNote').textContent = 'Error: ' + (e.message || 'Failed to delete');
+  }
+}
+
+async function refreshRecoveryState() {
+  try {
+    await api('/api/recovery/blob');
+    $('recoveryState').textContent = 'Set up';
+    $('setupRecoveryBtn').hidden = true;
+    $('deleteRecoveryBtn').hidden = false;
+  } catch (e) {
+    $('recoveryState').textContent = 'Not set up';
+    $('setupRecoveryBtn').hidden = false;
+    $('deleteRecoveryBtn').hidden = true;
+  }
+}
+
   $('addExpenseCancel').addEventListener('click', () => $('addExpenseDialog').close());
   $('addExpenseCancelX').addEventListener('click', () => $('addExpenseDialog').close());
+  // Recovery key UI
+  $('setupRecoveryBtn').addEventListener('click', handleSetupRecovery);
+  $('recoverVaultBtn').addEventListener('click', () => {
+    $('recoverForm').hidden = false;
+    $('recoveryDisplay').hidden = true;
+  });
+  $('cancelRecoverBtn').addEventListener('click', () => {
+    $('recoverForm').hidden = true;
+    $('recoverMnemonic').value = '';
+    $('recoverNewPass').value = '';
+  });
+  $('doRecoverBtn').addEventListener('click', handleRecoverVault);
+  $('deleteRecoveryBtn').addEventListener('click', handleDeleteRecovery);
+  $('recoveryConfirm').addEventListener('change', (e) => {
+    $('recoveryDoneBtn').disabled = !e.target.checked;
+  });
+  $('recoveryDoneBtn').addEventListener('click', () => {
+    $('recoveryDisplay').hidden = true;
+    $('recoveryWords').textContent = '';
+    $('recoveryConfirm').checked = false;
+    $('recoveryDoneBtn').disabled = true;
+    $('recoveryNote').textContent = 'Recovery key saved. Store the paper copy safely.';
+    refreshRecoveryState();
+  });
   initChat();
   if (BOOTSTRAP_NEEDED) {
     // First-time setup: no passkeys exist. Show bootstrap enrollment.

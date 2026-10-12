@@ -52,6 +52,10 @@ class VaultIdentity(Base):
     # KDF version for future algorithm upgrades. Version 1 = Argon2id with
     # OPSLIMIT_INTERACTIVE, MEMLIMIT_INTERACTIVE (current).
     kdf_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Encrypted recovery blob: vault seed encrypted with the recovery key.
+    # The server never sees the recovery key. Null if recovery not set up.
+    recovery_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    recovery_created_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at: Mapped[dt.datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 

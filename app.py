@@ -53,7 +53,6 @@ MAX_JSON_OBJECT_BYTES = int(os.environ.get("VAULT_MAX_JSON_OBJECT_BYTES", str(8 
 MAX_LABEL_LENGTH = 80
 VAULT_STEPUP_WINDOW_SECONDS = int(os.environ.get("VAULT_STEPUP_WINDOW_SECONDS", "300"))
 DEFAULT_IDENTITY_ID = 1
-COOKIE_NAME = "vault_session"
 TRUST_PROXY = os.environ.get("VAULT_TRUST_PROXY", "0") == "1"
 # Opt-in IP address logging. Default off for privacy.
 # When "on", the full client IP is stored in audit_events.client_ip.
@@ -142,6 +141,11 @@ def _parse_origin(value: str):
 
 
 SECRET, RP_ID, ORIGIN, RP_NAME, PRODUCTION, AUTH_POLICY, CSP_MODE = _configuration()
+
+# __Host- prefix in production (requires Secure + Path=/ + no Domain).
+# In development (HTTP), __Host- cookies are rejected by browsers,
+# so we use the plain name there.
+COOKIE_NAME = "__Host-vault_session" if PRODUCTION else "vault_session"
 EXPECTED_ORIGIN = _parse_origin(ORIGIN)
 # Browsers commonly open the development server through either loopback name.
 # Treat only localhost and 127.0.0.1 as equivalent in development; deployed
@@ -1873,13 +1877,14 @@ def generate_kdf_salts():
     conn.execute(
         update(table)
         .where(table.c.id == identity_id)
-        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, updated_at=func.now())
+        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, kdf_version=2, updated_at=func.now())
     )
     conn.commit()
-    LOG.info('event="kdf_salts_generated" client="%s"', _client_log_id())
+    LOG.info('event="kdf_salts_generated" kdf_version=2 client="%s"', _client_log_id())
     return jsonify({
         "salt_enc": salt_enc.hex(),
         "salt_idx": salt_idx.hex(),
+        "kdf_version": 2,
         "generated": True,
     })
 
@@ -2025,3 +2030,106 @@ if __name__ == "__main__":
     if AUTH_POLICY=="optional" and host not in {"127.0.0.1","::1","localhost"}: raise RuntimeError("Optional authentication may bind only to loopback")
     print(f"vault demo  ->  {ORIGIN}")
     app.run(host=host,port=int(os.environ.get("VAULT_PORT","5000")),debug=False)
+
+
+# ------------------------------------------------------------------
+# Recovery key mechanism
+# ------------------------------------------------------------------
+
+@app.post("/api/recovery/setup")
+def recovery_setup():
+    """Store an encrypted recovery blob.
+    
+    The client generates a random 256-bit recovery key, encrypts the vault
+    seed with it, and sends only the ciphertext (blob) to the server.
+    The server never sees the recovery key or the plaintext seed.
+    
+    The client displays the recovery key to the user ONCE as a mnemonic.
+    If the user loses their passphrase, they can enter the recovery key
+    to decrypt the seed and set a new passphrase.
+    """
+    denied = require_access()
+    if denied: return denied
+    identity_id = current_identity_id()
+    if not identity_id:
+        return api_error("No identity", 403)
+    
+    data = request.get_json(force=True, silent=True) or {}
+    blob_hex = data.get("recovery_blob")
+    if not blob_hex or not isinstance(blob_hex, str):
+        return api_error("Missing recovery_blob", 400)
+    try:
+        blob = bytes.fromhex(blob_hex)
+    except ValueError:
+        return api_error("Invalid recovery_blob format", 400)
+    if len(blob) < 32 or len(blob) > 1024:
+        return api_error("Invalid recovery_blob length", 400)
+    
+    table = models.VaultIdentity.__table__
+    conn = db()
+    # Only allow setup if not already set (prevent overwrite without explicit delete)
+    row = conn.execute(
+        select(table.c.recovery_blob).where(table.c.id == identity_id)
+    ).first()
+    if row and row.recovery_blob is not None:
+        return api_error("Recovery already set up. Delete existing recovery first.", 409)
+    
+    conn.execute(
+        update(table)
+        .where(table.c.id == identity_id)
+        .values(recovery_blob=blob, recovery_created_at=func.now(), updated_at=func.now())
+    )
+    conn.commit()
+    LOG.info('event="recovery_setup" client="%s"', _client_log_id())
+    return jsonify({"ok": True})
+
+
+@app.get("/api/recovery/blob")
+def recovery_get_blob():
+    """Retrieve the encrypted recovery blob.
+    
+    Requires passkey authentication (not just session). The blob is useless
+    without the recovery key, which the server never sees.
+    """
+    denied = require_access()
+    if denied: return denied
+    # Require fresh passkey auth for recovery blob access
+    if not session.get("passkey_authenticated"):
+        return api_error("Passkey authentication required", 403)
+    identity_id = current_identity_id()
+    if not identity_id:
+        return api_error("No identity", 403)
+    
+    table = models.VaultIdentity.__table__
+    conn = db()
+    row = conn.execute(
+        select(table.c.recovery_blob).where(table.c.id == identity_id)
+    ).first()
+    if not row or row.recovery_blob is None:
+        return api_error("No recovery blob set up", 404)
+    
+    LOG.info('event="recovery_blob_accessed" client="%s"', _client_log_id())
+    return jsonify({"recovery_blob": row.recovery_blob.hex()})
+
+
+@app.post("/api/recovery/delete")
+def recovery_delete():
+    """Delete the recovery blob. Requires passkey authentication."""
+    denied = require_access()
+    if denied: return denied
+    if not session.get("passkey_authenticated"):
+        return api_error("Passkey authentication required", 403)
+    identity_id = current_identity_id()
+    if not identity_id:
+        return api_error("No identity", 403)
+    
+    table = models.VaultIdentity.__table__
+    conn = db()
+    conn.execute(
+        update(table)
+        .where(table.c.id == identity_id)
+        .values(recovery_blob=None, recovery_created_at=None, updated_at=func.now())
+    )
+    conn.commit()
+    LOG.info('event="recovery_deleted" client="%s"', _client_log_id())
+    return jsonify({"ok": True})

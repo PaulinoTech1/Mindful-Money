@@ -51,6 +51,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CIRCUIT_VERSION = "manual-transaction-v2"
+# v3 circuit with encryption binding (see docs/ZKP_BINDING.md)
+# The v3 verification key must be generated from the compiled v3 circuit
+# and configured via ZKP_VK_PATH_V3 environment variable.
+CIRCUIT_VERSION_V3 = "manual-transaction-v3"
 SCHEMA_VERSION = 2
 
 # Must stay in exact sync with the CATEGORY_COUNT ordering in

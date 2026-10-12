@@ -1,0 +1,7 @@
+[package]
+name = "manual_expense_sealed"
+type = "bin"
+authors = [""]
+
+[dependencies]
+poseidon = { path = "../vendor/poseidon-v0.2.6-beta26" }

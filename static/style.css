@@ -333,3 +333,47 @@ td.num { color: #233d54; text-align: right; }
 .ml-1 { margin-left: 4px; }
 .mt-4 { margin-top: 1em; }
 .inline-block-btn { cursor: pointer; display: inline-block; }
+
+/* Research prototype warning banner */
+.prototypeBanner {
+  background: #7c2d12;
+  color: #fed7aa;
+  padding: 8px 16px;
+  text-align: center;
+  font-size: 14px;
+  border-bottom: 2px solid #c2410c;
+}
+.prototypeBanner a {
+  color: #fdba74;
+  text-decoration: underline;
+}
+.prototypeBanner strong {
+  color: #fff7ed;
+}
+
+/* Recovery key UI */
+.recoveryWords {
+  background: #1a1a2e;
+  border: 1px solid #444;
+  border-radius: 8px;
+  padding: 16px;
+  font-family: monospace;
+  font-size: 15px;
+  line-height: 1.8;
+  margin: 12px 0;
+  user-select: all;
+}
+.recoveryDisplay label {
+  display: block;
+  margin: 12px 0;
+}
+.recoverForm textarea {
+  width: 100%;
+  padding: 8px;
+  margin: 8px 0;
+  border: 1px solid #444;
+  border-radius: 4px;
+  background: #1a1a2e;
+  color: #eee;
+  font-family: monospace;
+}
