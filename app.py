@@ -1000,12 +1000,21 @@ def bootstrap_options():
     """First-time passkey enrollment. Only allowed when no passkeys exist
     for the current identity. This is the bootstrap flow for new deployments.
 
-    SECURITY: Requires VAULT_BOOTSTRAP_TOKEN to prevent unauthorized
-    enrollment if the vault is publicly reachable before the owner sets it up.
+    SECURITY: Requires VAULT_BOOTSTRAP_TOKEN. In production (VAULT_ENV=production),
+    the token is MANDATORY - bootstrap is refused entirely if not configured.
+    This prevents unauthorized first-enrollment on uninitialized vaults.
     The token must be provided in the request body as {"bootstrap_token": "..."}.
     """
     # Verify bootstrap token (prevents unauthorized first-enrollment)
     bootstrap_token = os.environ.get("VAULT_BOOTSTRAP_TOKEN")
+    is_production = os.environ.get("VAULT_ENV") == "production"
+    if is_production and not bootstrap_token:
+        # Fail closed in production: no token configured = no bootstrap allowed
+        LOG.error('event="bootstrap_refused_no_token_configured" client="%s"', _client_log_id())
+        return api_error(
+            "Bootstrap not configured. Set VAULT_BOOTSTRAP_TOKEN (or VAULT_BOOTSTRAP_TOKEN_SECRET) "
+            "to enable first-passkey enrollment.", 503
+        )
     if bootstrap_token:
         payload, error = _json_object()
         if error: return error
@@ -1038,9 +1047,14 @@ def bootstrap_options():
 def bootstrap_verify():
     """Verify bootstrap registration. Only allowed when no passkeys exist.
     Does not require prior authentication (this IS the first authentication).
-    Requires VAULT_BOOTSTRAP_TOKEN if set."""
+    Requires VAULT_BOOTSTRAP_TOKEN. In production, bootstrap is refused
+    entirely if the token is not configured."""
     # Verify bootstrap token (same as bootstrap_options)
     bootstrap_token = os.environ.get("VAULT_BOOTSTRAP_TOKEN")
+    is_production = os.environ.get("VAULT_ENV") == "production"
+    if is_production and not bootstrap_token:
+        LOG.error('event="bootstrap_refused_no_token_configured" client="%s"', _client_log_id())
+        return api_error("Bootstrap not configured.", 503)
     payload, error = _json_object()
     if error: return error
     if bootstrap_token:
