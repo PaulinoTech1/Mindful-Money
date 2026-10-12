@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_from_directory, session
 from flask.sessions import SessionInterface, SessionMixin
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -553,6 +553,27 @@ def index(): return send_from_directory(STATIC, "index.html")
 
 @app.get("/static/<path:name>")
 def static_file(name): return send_from_directory(STATIC, name)
+
+@app.get("/health")
+def health():
+    """Liveness probe. Returns 200 if the app is running. No auth required.
+    Used by Cloud Run health checks."""
+    return jsonify({"status": "ok"})
+
+
+@app.get("/ready")
+def ready():
+    """Readiness probe. Returns 200 if the app can serve traffic (DB reachable).
+    No auth required. Used by Cloud Run health checks."""
+    try:
+        # Check database connectivity
+        conn = db()
+        conn.execute(text("SELECT 1"))
+        return jsonify({"status": "ready", "database": "ok"})
+    except Exception as e:
+        LOG.warning('event="readiness_failed" error="%s"', str(e)[:100])
+        return jsonify({"status": "not_ready", "database": "error"}), 503
+
 
 @app.get("/api/session")
 def session_status():

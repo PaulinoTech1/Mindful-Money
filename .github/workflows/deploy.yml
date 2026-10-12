@@ -53,7 +53,12 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest pip-audit
+
+      - name: Security audit dependencies
+        run: |
+          echo "=== Running pip-audit ==="
+          pip-audit --desc 2>&1 || echo "pip-audit found issues (see above)"
 
       - name: Wait for PostgreSQL
         run: |
