@@ -144,3 +144,40 @@ gcloud run services update mindful-money \
 The flag name is not the variable name. This applies to `--update-env-vars`
 as well. Verify with:
 `gcloud run services describe mindful-money --format="value(spec.template.spec.containers[0].env)"`
+
+## Cost caps for honeypot tarpits (2026-10-12)
+
+The honeypot tarpits add 3-12s delays to waste attacker time. Three layers
+prevent this from becoming an economic DoS vector:
+
+### 1. Max instances (infrastructure)
+
+The deploy workflow sets `--max-instances 3`. Cloud Run will never spin up
+more than 3 instances, bounding total compute cost regardless of attack volume.
+
+Worst case: 3 instances × 1 vCPU × 24h = ~$2/day if fully saturated.
+Normal operation: 0-1 instances (scales to zero).
+
+### 2. Per-IP rate limiting (application)
+
+`_honeypot_rate_limited()` tracks hits per client IP in memory. More than
+10 honeypot hits in 60 seconds → skip the tarpit delay, return immediately.
+
+This means:
+- Normal scanners (a few hits): get the full tarpit experience
+- Flood attackers (100s of hits): get instant responses after the 10th hit
+
+The in-memory store resets on instance restart, which is fine for abuse
+mitigation. Persistent attackers get a fresh budget per instance, but the
+max-instances cap bounds total cost.
+
+### 3. Concurrency limit
+
+`--concurrency 8` means each instance handles max 8 concurrent requests.
+Combined with max-instances 3, the absolute ceiling is 24 concurrent
+tarpit delays.
+
+### Monitoring
+
+Watch for `honeypot_rate_limited` events in logs. Frequent triggers indicate
+an active flooding attempt. The webhook alert for `HONEYPOT_HIT` will also fire.

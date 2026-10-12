@@ -657,14 +657,8 @@ HONEYPOT_PATHS = [
 TARPIT_MIN_DELAY = 3   # seconds
 TARPIT_MAX_DELAY = 12  # seconds
 
-def _tarpit_delay():
-    """Random delay to waste attacker's time. Uses cryptographically secure RNG
-    so the delay is unpredictable."""
-    import secrets, time
-    delay = TARPIT_MIN_DELAY + secrets.randbelow(TARPIT_MAX_DELAY - TARPIT_MIN_DELAY + 1)
-    # Add fractional component for less predictable timing
-    delay += secrets.randbelow(1000) / 1000.0
-    time.sleep(delay)
+# Note: _tarpit_delay() is defined below with rate limiting.
+# See _honeypot_log() section for the full implementation.
 
 def _fake_wordpress_login():
     """Convincing fake WordPress login page. Attackers will waste time
@@ -791,9 +785,17 @@ def honeypot():
     return jsonify({"error": "Not found"}), 404
 
 def _honeypot_log():
-    """Common logging for all honeypot hits."""
+    """Common logging for all honeypot hits.
+    
+    Includes per-IP rate limiting: if a single client hits honeypots more than
+    HONEYPOT_MAX_HITS_PER_MINUTE times in 60 seconds, subsequent hits skip the
+    tarpit delay (return immediately). This prevents economic DoS where an
+    attacker floods honeypots to run up Cloud Run costs.
+    """
+    import time
+    client_id = _client_log_id()
     LOG.warning('event="honeypot_hit" path="%s" method="%s" client="%s"',
-                request.path, request.method, _client_log_id())
+                request.path, request.method, client_id)
     try:
         _audit_event("HONEYPOT_HIT", detail={"path": request.path, "method": request.method})
         db().commit()
@@ -804,6 +806,35 @@ def _honeypot_log():
         _send_security_webhook("HONEYPOT_HIT", {"path": request.path})
     except Exception:
         pass
+
+# In-memory per-IP honeypot hit tracking (resets on instance restart, which is fine
+# for abuse mitigation - persistent attackers get a fresh budget per instance, but
+# the max-instances cap bounds total cost)
+_honeypot_hits = {}
+HONEYPOT_MAX_HITS_PER_MINUTE = 10
+
+def _honeypot_rate_limited():
+    """Check if this client has exceeded the honeypot rate limit.
+    Returns True if they should skip the tarpit delay (fail fast)."""
+    import time
+    client_id = _client_log_id()
+    now = time.time()
+    # Clean old entries and count recent hits
+    cutoff = now - 60
+    _honeypot_hits[client_id] = [t for t in _honeypot_hits.get(client_id, []) if t > cutoff]
+    _honeypot_hits[client_id].append(now)
+    return len(_honeypot_hits[client_id]) > HONEYPOT_MAX_HITS_PER_MINUTE
+
+def _tarpit_delay():
+    """Random delay to waste attacker's time. Skipped if rate-limited."""
+    if _honeypot_rate_limited():
+        # Abuser is flooding: skip delay, return immediately to save our costs
+        LOG.warning('event="honeypot_rate_limited" client="%s"', _client_log_id())
+        return
+    import secrets, time
+    delay = TARPIT_MIN_DELAY + secrets.randbelow(TARPIT_MAX_DELAY - TARPIT_MIN_DELAY + 1)
+    delay += secrets.randbelow(1000) / 1000.0
+    time.sleep(delay)
 
 
 @app.get("/ready")
