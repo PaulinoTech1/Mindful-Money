@@ -75,6 +75,16 @@ async function getSalts() {
     };
     return CACHED_SALTS;
   } catch (e) {
+    // 404: no salts set yet. Generate them (new vault) via explicit endpoint.
+    if (e.status === 404) {
+      console.log('No server salts yet, generating...');
+      const data = await api('/api/kdf/salts/generate', { method: 'POST' });
+      CACHED_SALTS = {
+        enc: Uint8Array.from(data.salt_enc.match(/../g).map(h => parseInt(h, 16))),
+        idx: Uint8Array.from(data.salt_idx.match(/../g).map(h => parseInt(h, 16))),
+      };
+      return CACHED_SALTS;
+    }
     // Fallback: localStorage salts for legacy vaults
     console.warn('Server salts unavailable, using localStorage fallback');
     return {

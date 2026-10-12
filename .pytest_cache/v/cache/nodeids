@@ -6,6 +6,7 @@
   "test_demo.py::TestAuditLog::test_passkey_removal_is_audited",
   "test_demo.py::TestAuditLog::test_session_revoked_is_audited",
   "test_demo.py::TestAuditLog::test_suspicious_counter_event_is_audited_even_when_verification_fails",
+  "test_demo.py::TestAuthorizationBoundary::test_bootstrap_refused_in_production_without_token",
   "test_demo.py::TestAuthorizationBoundary::test_bootstrap_rejected_when_passkeys_exist",
   "test_demo.py::TestAuthorizationBoundary::test_bootstrap_requires_token_when_configured",
   "test_demo.py::TestAuthorizationBoundary::test_cross_user_delete_rejected",

@@ -1471,16 +1471,41 @@ class TestAuthorizationBoundary(ServerCase):
     """
 
     def test_bootstrap_requires_token_when_configured(self):
-        """Bootstrap without token must fail when VAULT_BOOTSTRAP_TOKEN is set."""
-        # This test verifies the token requirement exists
-        # (Actual token value is env-dependent; we test the 403 path)
+        """Bootstrap without valid token must be rejected (403) when token is configured."""
+        import os
+        from unittest.mock import patch
         self.deauthenticate()
-        # Without token in body, should get 403 if token is configured
-        # If not configured, bootstrap may proceed (dev mode)
-        # We just verify the endpoint exists and handles missing token gracefully
-        response = self.client.post("/api/passkeys/bootstrap/options", json={})
-        # Should be 400 (missing token field handled), 403 (invalid token), or 200 (no token configured)
-        self.assertIn(response.status_code, [200, 400, 403])
+        # Configure a token, then verify bootstrap requires it
+        with patch.dict(os.environ, {"VAULT_BOOTSTRAP_TOKEN": "test-secret-token-123"}):
+            # No token provided -> 403
+            response = self.unsafe("post", "/api/passkeys/bootstrap/options", json={})
+            self.assertEqual(response.status_code, 403)
+            self.assertIn("Invalid bootstrap token", response.get_json()["error"])
+            # Wrong token -> 403
+            response = self.unsafe(
+                "post", "/api/passkeys/bootstrap/options",
+                json={"bootstrap_token": "wrong-token"}
+            )
+            self.assertEqual(response.status_code, 403)
+            # Correct token -> 200 (no passkeys exist yet)
+            response = self.unsafe(
+                "post", "/api/passkeys/bootstrap/options",
+                json={"bootstrap_token": "test-secret-token-123"}
+            )
+            self.assertEqual(response.status_code, 200)
+
+    def test_bootstrap_refused_in_production_without_token(self):
+        """In production, bootstrap is refused (503) if no token is configured."""
+        import os
+        from unittest.mock import patch
+        self.deauthenticate()
+        # Ensure no token is set, but VAULT_ENV=production
+        with patch.dict(os.environ, {"VAULT_ENV": "production"}, clear=False):
+            # Remove token if present
+            os.environ.pop("VAULT_BOOTSTRAP_TOKEN", None)
+            response = self.unsafe("post", "/api/passkeys/bootstrap/options", json={})
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("not configured", response.get_json()["error"])
 
     def test_bootstrap_rejected_when_passkeys_exist(self):
         """Bootstrap must fail with 403 if passkeys already enrolled."""
@@ -1532,7 +1557,7 @@ class TestAuthorizationBoundary(ServerCase):
         self.assertEqual(len(data["records"]), 0)
 
     def test_cross_user_delete_rejected(self):
-        """User A cannot delete User B's records."""
+        """User B's delete operation must not remove User A's records."""
         with server_app.app.app_context():
             conn = server_app.db()
             identities = models.VaultIdentity.__table__
@@ -1540,23 +1565,38 @@ class TestAuthorizationBoundary(ServerCase):
                 id=2, user_handle=b"user-two", passkey_required=False
             ))
             conn.commit()
-        
+
         # Alice (identity 1, authenticated by setUp) stores a record via API
         sim = BrowserSim("alice passphrase")
         txns = [{"id": "alice-txn", "amount": -100, "description": "Alice", "posted": "2026-10-01"}]
         self.unsafe("post", "/api/records", json={"records": sim.encrypt_all(txns)})
-        
-        # Verify Alice has 1 record
-        with server_app.app.app_context():
-            conn = server_app.db()
-            records = models.Record.__table__
-            count = len(conn.execute(
-                records.select().where(records.c.identity_id == 1)
-            ).fetchall())
-            self.assertEqual(count, 1)
-        
-        # Bob (identity 2) tries to delete - should only affect his own (none)
-        # Alice's record should still exist (tenant isolation on delete)
+
+        def alice_record_count():
+            with server_app.app.app_context():
+                conn = server_app.db()
+                records = models.Record.__table__
+                return len(conn.execute(
+                    records.select().where(records.c.identity_id == 1)
+                ).fetchall())
+
+        # Verify Alice has 1 record before Bob's delete
+        self.assertEqual(alice_record_count(), 1)
+
+        # Bob (identity 2) performs a delete-all operation
+        bob_client = server_app.app.test_client()
+        with bob_client.session_transaction() as sess:
+            sess["identity_id"] = 2
+            sess["authenticated_at"] = __import__("time").time()
+            sess["vault_unlocked"] = True
+        # Bob needs CSRF token for his session
+        csrf = bob_client.get("/api/session").get_json()["csrf_token"]
+        bob_client.delete("/api/records", headers={
+            "Origin": server_app.ORIGIN, "X-CSRF-Token": csrf,
+        })
+
+        # Alice's record must still exist after Bob's delete
+        self.assertEqual(alice_record_count(), 1,
+            "Bob's delete removed Alice's record - tenant isolation violated!")
 
 
 class TestPlaintextExposure(ServerCase):

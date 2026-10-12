@@ -1363,9 +1363,13 @@ def security_dashboard():
 
 @app.get("/api/kdf/salts")
 def get_kdf_salts():
-    """Get the KDF salts for the current identity. If not set, generates random
-    salts, stores them, and returns them. Salts are not secret, just unique per
-    identity. The client uses these to derive encryption keys from the passphrase."""
+    """Get the KDF salts for the current identity.
+    
+    Returns 404 if no salts are set. The client must explicitly generate
+    (POST /api/kdf/salts/generate) or migrate (POST /api/kdf/salts/migrate)
+    salts. This prevents accidental salt generation during backup restore,
+    which would cause salt mismatch.
+    """
     denied = require_access()
     if denied: return denied
     identity_id = current_identity_id()
@@ -1379,42 +1383,70 @@ def get_kdf_salts():
     ).first()
     if not row:
         return api_error("Identity not found", 404)
-    # Generate salts if not set (first use)
     if row.kdf_salt_enc is None or row.kdf_salt_idx is None:
-        # CRITICAL: Check if records exist. If so, the client was using
-        # browser-local salts. Generating new server salts now would make
-        # existing records unreadable. The client must migrate first.
-        record_table = models.Record.__table__
-        record_count = conn.execute(
-            select(func.count()).select_from(record_table).where(
-                record_table.c.identity_id == identity_id
-            )
-        ).scalar() or 0
-        if record_count > 0:
-            LOG.warning('event="salt_migration_required" identity="%s" records="%d"',
-                        identity_id, record_count)
-            return api_error(
-                "Salt migration required: existing records use browser-local salts. "
-                "Use POST /api/kdf/salts/migrate with your current salts to migrate.",
-                409
-            )
-        import secrets
-        salt_enc = secrets.token_bytes(16)
-        salt_idx = secrets.token_bytes(16)
-        conn.execute(
-            update(table)
-            .where(table.c.id == identity_id)
-            .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, updated_at=func.now())
+        return api_error(
+            "No salts configured. Use POST /api/kdf/salts/generate for new vault, "
+            "or POST /api/kdf/salts/migrate to set specific salts (e.g., from backup).",
+            404
         )
-        conn.commit()
-        LOG.info('event="kdf_salts_generated" client="%s"', _client_log_id())
-    else:
-        salt_enc = bytes(row.kdf_salt_enc)
-        salt_idx = bytes(row.kdf_salt_idx)
+    salt_enc = bytes(row.kdf_salt_enc)
+    salt_idx = bytes(row.kdf_salt_idx)
     return jsonify({
         "salt_enc": salt_enc.hex(),
         "salt_idx": salt_idx.hex(),
         "kdf_version": row.kdf_version,
+    })
+
+
+@app.post("/api/kdf/salts/generate")
+def generate_kdf_salts():
+    """Generate new random KDF salts for the current identity.
+    
+    Only allowed when no salts are set AND no records exist. If records exist
+    but no salts, use POST /api/kdf/salts/migrate instead to preserve
+    readability of existing records.
+    """
+    denied = require_access()
+    if denied: return denied
+    identity_id = current_identity_id()
+    if not identity_id:
+        return api_error("No identity", 403)
+    table = models.VaultIdentity.__table__
+    conn = db()
+    row = conn.execute(
+        select(table.c.kdf_salt_enc, table.c.kdf_salt_idx)
+        .where(table.c.id == identity_id)
+    ).first()
+    if not row:
+        return api_error("Identity not found", 404)
+    if row.kdf_salt_enc is not None:
+        return api_error("Salts already set. Use /migrate to change.", 409)
+    # Check for existing records (would become unreadable)
+    record_table = models.Record.__table__
+    record_count = conn.execute(
+        select(func.count()).select_from(record_table).where(
+            record_table.c.identity_id == identity_id
+        )
+    ).scalar() or 0
+    if record_count > 0:
+        return api_error(
+            "Records exist but no salts set. Use POST /api/kdf/salts/migrate "
+            "with your current salts to preserve readability.", 409
+        )
+    import secrets
+    salt_enc = secrets.token_bytes(16)
+    salt_idx = secrets.token_bytes(16)
+    conn.execute(
+        update(table)
+        .where(table.c.id == identity_id)
+        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, updated_at=func.now())
+    )
+    conn.commit()
+    LOG.info('event="kdf_salts_generated" client="%s"', _client_log_id())
+    return jsonify({
+        "salt_enc": salt_enc.hex(),
+        "salt_idx": salt_idx.hex(),
+        "generated": True,
     })
 
 
