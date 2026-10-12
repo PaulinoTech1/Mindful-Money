@@ -52,16 +52,42 @@ The wordlist is in `static/recovery-words.js`.
 - `GET /api/recovery/blob` - Retrieve blob (requires passkey auth)
 - `POST /api/recovery/delete` - Delete blob (requires passkey auth)
 
+## Exact recovery steps (as of 2026-10-12)
+
+If you forget your passphrase but have the 32-word recovery key:
+
+1. Go to the Security section, click "Recover vault with key"
+2. Enter all 32 recovery words (in order, separated by spaces)
+3. Enter a NEW passphrase (must meet 60-bit entropy minimum)
+4. Confirm the re-encryption prompt
+5. The app will:
+   a. Decode the mnemonic to the 256-bit recovery key
+   b. Fetch the encrypted blob from `/api/recovery/blob` (requires passkey auth)
+   c. Decrypt the blob to recover the OLD vault seed
+   d. Reconstruct the OLD keypair from the seed
+   e. Download all encrypted records
+   f. Decrypt each record with the OLD private key
+   g. Generate NEW salts (new vault identity)
+   h. Derive NEW keys from the new passphrase (Argon2id v3)
+   i. Re-encrypt each record with the NEW public key (with bucket padding)
+   j. Upload re-encrypted records (upsert by blind_index replaces old ciphertext)
+   k. Clear all old key material from memory
+6. Your vault is now accessible with the new passphrase. All records are preserved.
+
+**What happens to the old data:**
+- Old ciphertext is replaced on the server (upsert by blind_index)
+- The old seed is wiped from browser memory
+- You should generate a NEW recovery key after recovery (the old one still
+  decrypts the old seed, which is now useless, but good hygiene)
+
 ## Limitations and future work
 
-- **Re-encryption flow incomplete:** Currently, recovery decrypts the seed
-  but does not automatically re-encrypt existing records with a new
-  passphrase. The user must manually export/import. A full implementation
-  would: decrypt all records with old seed-derived keys, generate new
-  salts, derive new keys from new passphrase, re-encrypt all records.
 - **No threshold scheme:** A single recovery key is a single point of
   failure (if lost) and a single point of compromise (if found). Future
   work could implement Shamir's Secret Sharing (e.g., 2-of-3).
 - **No hardware binding:** The recovery key is not bound to a hardware
   token. A future enhancement could require both the mnemonic AND a
   passkey to complete recovery.
+- **Recovery requires passkey auth:** Fetching the encrypted blob requires
+  fresh WebAuthn authentication. If you lose both your passphrase AND
+  your passkey, recovery is impossible. Store them separately.

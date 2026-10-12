@@ -33,6 +33,14 @@ gcloud run services update-traffic mindful-money \
   --to-revisions <REVISION_NAME>=100
 ```
 
+**JS integrity note:** Rolling back to an older revision serves older JavaScript.
+The CI integrity smoke test compares served JS to the manifest from the
+*deployed git commit*. After a manual rollback, the served JS will NOT match
+the latest commit's manifest. This is expected. To verify a rollback:
+1. Identify the git commit corresponding to the revision
+2. Compare served JS hashes to THAT commit's `integrity-manifest.json`
+3. Do not treat a mismatch against `main` as tampering after a deliberate rollback
+
 ## Database migrations
 
 ```bash

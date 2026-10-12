@@ -2342,23 +2342,113 @@ async function handleRecoverVault() {
     return;
   }
   
+  // Validate new passphrase strength BEFORE starting (don't leave vault
+  // in a half-migrated state due to a weak passphrase)
+  const strength = checkPassphraseStrength(newPass);
+  if (!strength.ok) {
+    note.textContent = 'New passphrase too weak: ' + strength.reason;
+    return;
+  }
+  
+  if (!confirm('This will re-encrypt all your records with the new passphrase. Continue?')) {
+    return;
+  }
+  
   try {
-    note.textContent = 'Recovering...';
-    const seed = await recoverWithKey(mnemonic, newPass);
+    note.textContent = 'Recovering seed...';
+    const oldSeed = await recoverWithKey(mnemonic, newPass);
     
-    // Clear sensitive inputs
+    // Clear sensitive inputs immediately
     $('recoverMnemonic').value = '';
     $('recoverNewPass').value = '';
     
-    note.textContent = 'Seed recovered. You must now create a new vault with the new passphrase. ' +
-      'Your old records are encrypted with the old key; export them first if needed.';
-    // TODO: Complete the re-encryption flow (decrypt old records with recovered
-    // seed, re-encrypt with new passphrase-derived keys)
+    // Reconstruct old keys from recovered seed
+    const oldKp = S.crypto_box_seed_keypair(oldSeed);
     
-    // Clear seed from memory
-    seed.fill(0);
+    // Fetch all encrypted records
+    note.textContent = 'Fetching encrypted records...';
+    const recordsData = await api('/api/records');
+    const records = recordsData.records || [];
+    
+    if (records.length === 0) {
+      note.textContent = 'No records to re-encrypt. Vault is empty.';
+      oldSeed.fill(0);
+      return;
+    }
+    
+    // Decrypt each record with old key
+    note.textContent = `Decrypting ${records.length} records...`;
+    const decrypted = [];
+    for (const r of records) {
+      try {
+        const padded = S.crypto_box_seal_open(
+          S.from_hex(r.sealed), oldKp.publicKey, oldKp.privateKey
+        );
+        if (!padded) throw new Error('Decryption failed');
+        const plaintext = unpadPlaintext(padded);
+        const obj = JSON.parse(S.to_string(plaintext));
+        decrypted.push({ blind_index: r.blind_index, data: obj });
+      } catch (e) {
+        throw new Error(`Failed to decrypt record ${r.blind_index.slice(0, 8)}...: ${e.message}`);
+      }
+    }
+    
+    // Clear old seed from memory
+    oldSeed.fill(0);
+    oldKp.privateKey.fill(0);
+    
+    // Generate new salts (this creates a new vault identity for the new passphrase)
+    note.textContent = 'Generating new vault...';
+    CACHED_SALTS = null;  // Force regeneration
+    const newSalts = await getSalts();
+    if (!newSalts.isNewVault) {
+      throw new Error('Expected new salts for re-encryption, got existing');
+    }
+    
+    // Derive new keys
+    note.textContent = 'Deriving new keys (this takes a while)...';
+    const newKeys = await deriveKeys(newPass, newSalts.kdf_version || 3);
+    
+    // Re-encrypt each record with new key (with padding)
+    note.textContent = `Re-encrypting ${decrypted.length} records...`;
+    const reencrypted = decrypted.map(({ blind_index, data }) => {
+      // Temporarily swap KEYS for seal()
+      const savedKeys = KEYS;
+      KEYS = newKeys;
+      try {
+        return { blind_index, sealed: seal(data) };
+      } finally {
+        KEYS = savedKeys;
+      }
+    });
+    
+    // Upload re-encrypted records (upsert by blind_index replaces old ciphertext)
+    note.textContent = `Uploading ${reencrypted.length} re-encrypted records...`;
+    const BATCH = 50;
+    for (let i = 0; i < reencrypted.length; i += BATCH) {
+      const batch = reencrypted.slice(i, i + BATCH);
+      await api('/api/records', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ records: batch }),
+      });
+      note.textContent = `Uploading... ${Math.min(i + BATCH, reencrypted.length)}/${reencrypted.length}`;
+    }
+    
+    // Update KEYS to new keys and reload
+    KEYS = newKeys;
+    $('recoverForm').hidden = true;
+    note.textContent = `Recovery complete. ${reencrypted.length} records re-encrypted with new passphrase.`;
+    
+    // Clear new keys from temp variable (KEYS now holds them)
+    newKeys.seed?.fill(0);
+    
+    // Refresh the UI
+    await load(true);
+    
   } catch (e) {
     note.textContent = 'Recovery failed: ' + (e.message || 'Unknown error');
+    console.error('Recovery failed:', e);
   }
 }
 

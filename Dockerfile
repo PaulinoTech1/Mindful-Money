@@ -12,8 +12,8 @@ RUN useradd --create-home --shell /bin/bash appuser
 WORKDIR /home/appuser/app
 
 # Install dependencies first (better layer caching)
-COPY requirements-locked.txt .
-RUN pip install --no-cache-dir -r requirements-locked.txt && \
+COPY requirements-hashed.txt .
+RUN pip install --no-cache-dir --require-hashes -r requirements-hashed.txt && \
     pip install --no-cache-dir gunicorn
 
 # Copy application code

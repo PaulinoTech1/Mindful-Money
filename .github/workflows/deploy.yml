@@ -232,5 +232,41 @@ jobs:
             exit 1
           fi
           echo "API status check passed"
+
+          echo "=== Verifying JS integrity ==="
+          # Fetch the integrity manifest and verify served JS matches.
+          # This detects stale deployments or tampered JavaScript.
+          # Fails the deploy on mismatch.
+          MANIFEST_URL="$BASE_URL/static/integrity-manifest.json"
+          MANIFEST=$(curl -s -f "$MANIFEST_URL") || {
+            echo "FAILED: Could not fetch integrity manifest from $MANIFEST_URL"
+            exit 1
+          }
+          for JS_FILE in "app.js" "simplefin-client.js" "recovery-words.js"; do
+            EXPECTED=$(echo "$MANIFEST" | python3 -c "
+import sys, json
+try:
+    print(json.load(sys.stdin)['files']['$JS_FILE']['sha256'])
+except KeyError:
+    print('MISSING')
+")
+            if [ "$EXPECTED" = "MISSING" ]; then
+              echo "WARNING: $JS_FILE not in manifest, skipping"
+              continue
+            fi
+            ACTUAL=$(curl -s -f "$BASE_URL/static/$JS_FILE" | sha256sum | cut -d' ' -f1) || {
+              echo "FAILED: Could not fetch $JS_FILE"
+              exit 1
+            }
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "FAILED: $JS_FILE hash mismatch (served JS differs from committed manifest)"
+              echo "  expected: $EXPECTED"
+              echo "  actual:   $ACTUAL"
+              echo "  This may indicate a stale deployment or tampered JavaScript."
+              exit 1
+            fi
+            echo "  $JS_FILE: hash verified"
+          done
+          echo "JS integrity check passed"
           
           echo "=== All smoke tests passed ==="

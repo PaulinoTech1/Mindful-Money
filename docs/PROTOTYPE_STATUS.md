@@ -25,15 +25,20 @@ Mindful Money is an experimental privacy-focused finance tracker. Hardening land
 
 ## Completed hardening (2026-10-12)
 
-- [x] Argon2id parameters raised for new vaults (see `docs/OFFLINE_ATTACK_COST.md`)
+- [x] Argon2id v3 (5 ops, 256MB) for new vaults (see `docs/OFFLINE_ATTACK_COST.md`)
 - [x] 60-bit minimum passphrase entropy enforced for new vaults
 - [x] Sealed record padding to bucketed lengths
 - [x] `__Host-` cookie prefix in production
 - [x] ZKP v3 circuit that binds validated plaintext to stored ciphertext
-- [x] Encrypted recovery key mechanism (with documented limitations)
-- [x] JS integrity: SRI + manifest + CI smoke-test verification
+- [x] Encrypted recovery key with automatic re-encryption
+- [x] JS integrity: SRI + manifest + CI smoke-test verification (fails deploy on mismatch)
 - [x] Session revocation race condition fixed
 - [x] Anonymous rate limiting by IP
+- [x] Hashed dependencies (`requirements-hashed.txt`, `--require-hashes` in Docker)
+- [x] CI fails on HIGH/CRITICAL vulnerabilities
+- [x] Health/ready endpoints documented (`docs/HEALTH_CHECKS.md`)
+- [x] Neon backup restore procedure documented (`docs/BACKUP_RESTORE.md`)
+- [x] Uptime monitoring setup documented (`docs/UPTIME_MONITORING.md`)
 
 ## What IS safe to do now
 
@@ -49,5 +54,9 @@ Mindful Money is an experimental privacy-focused finance tracker. Hardening land
 - Treating the recovery key as a complete solution (re-encryption flow is incomplete)
 
 ---
+
+## Explicit operator acceptance
+
+If you store real data before an independent review, you accept that **a fully compromised origin or deploy pipeline can replace the served JavaScript and exfiltrate your passphrase or plaintext.** This is the dominant residual risk and is not mitigated by any control listed above.
 
 *This document is updated as the status changes. When an independent review is complete and the remaining operational items are closed, the status will be revised.*
