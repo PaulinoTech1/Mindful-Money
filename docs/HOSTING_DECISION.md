@@ -6,7 +6,9 @@
 
 ## Context
 
-Mindful Money is a zero-knowledge personal finance tracker (Flask + Postgres).
+Mindful Money is a privacy-focused personal finance tracker (Flask + Postgres).
+See docs/TRUST_BOUNDARIES.md for the qualified trust model; do not use
+unqualified "zero-knowledge" claims.
 The server never sees plaintext; all encryption happens client-side.
 We needed a hosting platform that runs the full Flask stack reliably.
 

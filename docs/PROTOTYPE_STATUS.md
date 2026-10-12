@@ -51,7 +51,7 @@ Mindful Money is an experimental privacy-focused finance tracker. Hardening land
 
 - Storing real bank account data or transaction history as a primary record
 - Relying on the privacy guarantees against a sophisticated attacker who can influence the served JavaScript
-- Treating the recovery key as a complete solution (re-encryption flow is incomplete)
+- Treating the recovery key as a complete solution (single key = single point of failure; no threshold scheme; see docs/RECOVERY.md)
 
 ---
 

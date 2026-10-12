@@ -2,7 +2,9 @@
 
 ## Starting point
 
-A zero-knowledge personal finance app with passkey authentication, client-side
+A privacy-focused personal finance app with passkey authentication, client-side
+encryption (see docs/TRUST_BOUNDARIES.md for qualified claims; do not describe as
+"zero-knowledge" without the qualifiers therein)
 encryption, and a Flask backend. Production was **30 commits stale**. No GitHub
 Actions deploy had ever succeeded. 14 workflow runs failed silently.
 
