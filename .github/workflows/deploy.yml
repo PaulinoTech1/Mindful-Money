@@ -55,9 +55,26 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
+      - name: Wait for PostgreSQL
+        run: |
+          python3 -c "
+          import time, socket
+          for i in range(30):
+              try:
+                  s = socket.create_connection(('localhost', 5432), timeout=2)
+                  s.close()
+                  print('PostgreSQL is ready')
+                  break
+              except:
+                  print(f'Waiting for PostgreSQL... {i+1}')
+                  time.sleep(2)
+          else:
+              raise Exception('PostgreSQL not ready')
+          "
+
       - name: Run tests
         run: |
-          python -m pytest test_demo.py -x -q
+          python -m pytest test_demo.py -x -q -v 2>&1 | head -100
         env:
           VAULT_ENV: test
           VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_test
