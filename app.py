@@ -40,8 +40,10 @@ import zkp_verifier
 STATIC = Path(__file__).parent / "static"
 CHALLENGE_TTL = int(os.environ.get("VAULT_CHALLENGE_TTL", "300"))
 ZKP_CHALLENGE_TTL = int(os.environ.get("VAULT_ZKP_CHALLENGE_TTL", "300"))
-SESSION_TTL = int(os.environ.get("VAULT_SESSION_TTL", str(8 * 60 * 60)))
-SESSION_IDLE_TTL = int(os.environ.get("VAULT_SESSION_IDLE_TTL", "1800"))
+SESSION_TTL = int(os.environ.get("VAULT_SESSION_TTL", str(4 * 60 * 60)))
+# Strict: 4 hour absolute max (was 8h). Prevents long-lived session takeover.
+SESSION_IDLE_TTL = int(os.environ.get("VAULT_SESSION_IDLE_TTL", "900"))
+# Strict: 15 minute idle timeout (was 30min). Reduces window for session hijacking.
 MAX_REQUEST_BYTES = int(os.environ.get("VAULT_MAX_REQUEST_BYTES", str(8 * 1024 * 1024)))
 MAX_RECORDS_PER_BATCH = int(os.environ.get("VAULT_MAX_RECORDS_PER_BATCH", "1000"))
 MAX_TOTAL_RECORDS = int(os.environ.get("VAULT_MAX_TOTAL_RECORDS", "100000"))
@@ -577,8 +579,15 @@ def ready():
 
 @app.get("/api/session")
 def session_status():
+    # Per-session encryption context: random value unique to this session.
+    # The client uses it to derive session-specific blind indexes, so indexes
+    # can't be correlated across sessions even if the underlying record IDs
+    # are the same. Stored in the server session, not in the database.
+    if "enc_context" not in session:
+        session["enc_context"] = secrets.token_hex(16)
     return jsonify({"authenticated": authenticated(), "vault_unlocked": bool(session.get("vault_unlocked")),
-                    "csrf_token": session["csrf_token"], "expires_in": SESSION_TTL, "idle_expires_in": SESSION_IDLE_TTL})
+                    "csrf_token": session["csrf_token"], "expires_in": SESSION_TTL, "idle_expires_in": SESSION_IDLE_TTL,
+                    "enc_context": session["enc_context"]})
 
 @app.post("/api/vault/unlocked")
 def mark_unlocked():
@@ -1048,6 +1057,72 @@ def disable_passkeys():
 # ---------- Incident response ----------
 
 # ---------- KDF salt management ----------
+
+@app.get("/api/security/dashboard")
+def security_dashboard():
+    """Security dashboard: recent events, failed logins, active sessions.
+    Requires authentication."""
+    denied = require_access()
+    if denied: return denied
+    identity_id = current_identity_id()
+    if not identity_id:
+        return api_error("No identity", 403)
+    conn = db()
+    table = models.AuditEvent.__table__
+
+    # Recent security events (last 24h)
+    since = func.now() - text("INTERVAL '24 hours'")
+    recent = conn.execute(
+        select(table.c.event_type, func.count().label("count"))
+        .where(table.c.identity_id == identity_id, table.c.occurred_at >= since)
+        .group_by(table.c.event_type)
+    ).all()
+
+    # Failed logins (last 7d)
+    week_ago = func.now() - text("INTERVAL '7 days'")
+    failed = conn.execute(
+        select(func.count().label("count"))
+        .where(
+            table.c.identity_id == identity_id,
+            table.c.event_type == "PASSKEY_AUTH_FAILURE",
+            table.c.occurred_at >= week_ago,
+        )
+    ).scalar() or 0
+
+    # Unacknowledged suspicious events
+    suspicious = conn.execute(
+        select(table.c.id, table.c.event_type, table.c.occurred_at, table.c.detail)
+        .where(
+            table.c.identity_id == identity_id,
+            table.c.event_type.in_(["SUSPICIOUS_COUNTER_EVENT", "UNUSUAL_ACTIVITY_DETECTED"]),
+            table.c.acknowledged_at.is_(None),
+        )
+        .order_by(table.c.occurred_at.desc())
+        .limit(10)
+    ).mappings().all()
+
+    # Active sessions count
+    sess_table = models.ServerSession.__table__
+    active_sessions = conn.execute(
+        select(func.count().label("count"))
+        .where(sess_table.c.identity_id == identity_id)
+    ).scalar() or 0
+
+    return jsonify({
+        "recent_events_24h": [{"type": r.event_type, "count": r.count} for r in recent],
+        "failed_logins_7d": failed,
+        "unacknowledged_suspicious": [
+            {
+                "id": s["id"],
+                "type": s["event_type"],
+                "at": s["occurred_at"].isoformat() if s["occurred_at"] else None,
+                "detail": s["detail"],
+            }
+            for s in suspicious
+        ],
+        "active_sessions": active_sessions,
+    })
+
 
 @app.get("/api/kdf/salts")
 def get_kdf_salts():

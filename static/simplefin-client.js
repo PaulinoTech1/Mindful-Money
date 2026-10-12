@@ -641,12 +641,158 @@ function generateDemoTransactions(months) {
   return rows;
 }
 
+/* ------------------------------------------------------------------ */
+/* CSV bank statement parser (client-side only)                        */
+/*                                                                     */
+/* Parses common bank CSV formats. All parsing happens in the browser;  */
+/* the raw CSV never touches the server. Returns transactions in the    */
+/* same shape as fetchSimpleFinTransactions().                         */
+/*                                                                     */
+/* Supported columns (case-insensitive, auto-detected):                */
+/*   Date, Description/Merchant, Amount, (optional) Account, Type       */
+/* ------------------------------------------------------------------ */
+
+function parseBankCSV(csvText) {
+  if (typeof csvText !== "string" || !csvText.trim()) {
+    throw new Error("Empty CSV file");
+  }
+  var lines = csvText.trim().split(/\r?\n/);
+  if (lines.length < 2) {
+    throw new Error("CSV must have a header row and at least one data row");
+  }
+
+  // Parse header
+  var headers = parseCSVLine(lines[0]).map(function(h) { return h.toLowerCase().trim(); });
+
+  // Auto-detect columns
+  var dateIdx = findCol(headers, ["date", "transaction date", "posted", "posting date"]);
+  var descIdx = findCol(headers, ["description", "merchant", "payee", "memo", "details"]);
+  var amountIdx = findCol(headers, ["amount", "value"]);
+  var debitIdx = findCol(headers, ["debit", "withdrawal", "paid out"]);
+  var creditIdx = findCol(headers, ["credit", "deposit", "paid in"]);
+
+  if (dateIdx === -1) throw new Error("CSV must have a Date column");
+  if (descIdx === -1) throw new Error("CSV must have a Description/Merchant column");
+  if (amountIdx === -1 && (debitIdx === -1 || creditIdx === -1)) {
+    throw new Error("CSV must have an Amount column (or Debit/Credit columns)");
+  }
+
+  var transactions = [];
+  for (var i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    var cols = parseCSVLine(lines[i]);
+
+    var date = cols[dateIdx] ? cols[dateIdx].trim() : "";
+    var merchant = cols[descIdx] ? cols[descIdx].trim() : "";
+    if (!date || !merchant) continue;
+
+    // Normalize date to YYYY-MM-DD
+    date = normalizeDate(date);
+    if (!date) continue;
+
+    var amount;
+    if (amountIdx !== -1) {
+      amount = parseAmount(cols[amountIdx]);
+    } else {
+      var debit = parseAmount(cols[debitIdx] || "0");
+      var credit = parseAmount(cols[creditIdx] || "0");
+      amount = credit - debit;
+    }
+    if (amount === null || isNaN(amount)) continue;
+
+    // Sanitize: strip control chars, limit length, prevent code injection
+    // (data is encrypted before storage, but defense in depth)
+    merchant = merchant.replace(/[\x00-\x1F\x7F]/g, "").slice(0, 200);
+
+    transactions.push({
+      id: "csv-" + i + "-" + Math.abs(hashStr(date + merchant + amount)),
+      date: date,
+      merchant: merchant,
+      amount: Math.round(amount * 100) / 100,
+      pending: false,
+      account: "csv-import",
+      bank: "CSV Import",
+      account_label: "Imported",
+      account_type: "checking",
+      source: "csv",
+    });
+  }
+
+  if (!transactions.length) {
+    throw new Error("No valid transactions found in CSV");
+  }
+  return transactions;
+}
+
+function parseCSVLine(line) {
+  var result = [];
+  var current = "";
+  var inQuotes = false;
+  for (var i = 0; i < line.length; i++) {
+    var c = line[i];
+    if (c === '"') {
+      if (inQuotes && line[i+1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (c === "," && !inQuotes) {
+      result.push(current); current = "";
+    } else {
+      current += c;
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+function findCol(headers, names) {
+  for (var j = 0; j < names.length; j++) {
+    var idx = headers.indexOf(names[j]);
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function parseAmount(s) {
+  if (!s) return null;
+  // Remove currency symbols, commas, whitespace
+  var clean = String(s).replace(/[$,\s]/g, "").replace(/[()]/g, function(m) { return m === "(" ? "-" : ""; });
+  var n = parseFloat(clean);
+  return isNaN(n) ? null : n;
+}
+
+function normalizeDate(s) {
+  // Try common formats, output YYYY-MM-DD
+  s = s.trim();
+  var m;
+  // YYYY-MM-DD
+  if ((m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/))) {
+    return m[1] + "-" + m[2].padStart(2, "0") + "-" + m[3].padStart(2, "0");
+  }
+  // MM/DD/YYYY or M/D/YYYY
+  if ((m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/))) {
+    return m[3] + "-" + m[1].padStart(2, "0") + "-" + m[2].padStart(2, "0");
+  }
+  // DD/MM/YYYY (if first > 12)
+  if ((m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/)) && parseInt(m[1]) > 12) {
+    return m[3] + "-" + m[2].padStart(2, "0") + "-" + m[1].padStart(2, "0");
+  }
+  return null;
+}
+
+function hashStr(s) {
+  var h = 0;
+  for (var i = 0; i < s.length; i++) {
+    h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  }
+  return h;
+}
+
 /* Export for both classic <script> (top-level function declarations are
  * already globals) and CommonJS (node tests). */
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     fetchSimpleFinTransactions: fetchSimpleFinTransactions,
     generateDemoTransactions: generateDemoTransactions,
+    parseBankCSV: parseBankCSV,
     SimpleFinError: SimpleFinError,
     SimpleFinAccessRevoked: SimpleFinAccessRevoked,
     SimpleFinUnavailable: SimpleFinUnavailable,

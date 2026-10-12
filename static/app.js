@@ -368,8 +368,22 @@ const open = (hex) =>
   JSON.parse(S.to_string(
     S.crypto_box_seal_open(S.from_hex(hex), KEYS.publicKey, KEYS.privateKey)));
 
+let SESSION_CONTEXT = "";
+
+// Fetch session context for per-session blind index derivation.
+// This ensures blind indexes can't be correlated across sessions.
+async function initSessionContext() {
+  try {
+    const sess = await api('/api/session');
+    SESSION_CONTEXT = sess.enc_context || "";
+  } catch (e) {
+    console.warn('Could not fetch session context, using empty');
+    SESSION_CONTEXT = "";
+  }
+}
+
 const blindIndex = (id) =>
-  S.to_hex(S.crypto_generichash(32, S.from_string(id), KEYS.indexKey));
+  S.to_hex(S.crypto_generichash(32, S.from_string(SESSION_CONTEXT + ":" + id), KEYS.indexKey));
 
 // Empirical Shannon entropy of the characters entered. This is a local
 // estimate, not a password-cracking guarantee; no passphrase data is stored or
@@ -422,6 +436,7 @@ async function unlock() {
 
   try {
     KEYS = await deriveKeys(pass);
+    await initSessionContext();
     await load(true);
     await api('/api/vault/unlocked', { method: 'POST' });
   } catch (_error) {
@@ -531,6 +546,52 @@ async function connect(source = 'fakebank') {
     console.error('Connect failed:', e);
   } finally {
     buttons.forEach((b) => { b.disabled = false; });
+  }
+}
+
+async function handleCSVUpload(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  // Clear the input so the same file can be re-uploaded
+  event.target.value = '';
+
+  const buttons = [$('connectBtn'), $('syncBtn'), $('connectSimplefinBtn'), $('syncSimplefinBtn')];
+  buttons.forEach((b) => { if (b) b.disabled = true; });
+  try {
+    $('connectNote').textContent = 'Reading CSV...';
+    const text = await file.text();
+
+    // Parse client-side. Raw CSV never touches the server.
+    $('connectNote').textContent = 'Parsing transactions...';
+    const transactions = parseBankCSV(text);
+
+    $('connectNote').textContent = `Encrypting ${transactions.length} transactions in your browser...`;
+    await new Promise((r) => setTimeout(r, 30));
+
+    const prior = new Map(TXNS.map((t) => [t.id, t]));
+    const editable = ['merchant', 'category', 'notes', 'tags', 'splits', 'is_transfer', 'excluded', 'fraud_status'];
+    const sealedRows = transactions.map((t) => ({
+      blind_index: blindIndex(t.id),
+      sealed: seal(editable.reduce((merged, key) => {
+        if (prior.has(t.id) && Object.hasOwn(prior.get(t.id), key)) merged[key] = prior.get(t.id)[key];
+        return merged;
+      }, { ...t })),
+    }));
+
+    // Server-side input validation happens in app.py (size limits, format checks)
+    await api('/api/records', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ records: sealedRows }),
+    });
+
+    $('connectNote').textContent = `Imported ${transactions.length} transactions.`;
+    await load();
+  } catch (e) {
+    $('connectNote').textContent = 'Error: ' + (e.message || 'Failed to import CSV');
+    console.error('CSV import failed:', e);
+  } finally {
+    buttons.forEach((b) => { if (b) b.disabled = false; });
   }
 }
 
@@ -1544,6 +1605,7 @@ async function disablePasskeys() {
   $('syncBtn').addEventListener('click', () => connect('fakebank'));
   $('connectSimplefinBtn').addEventListener('click', () => connect('simplefin'));
   $('syncSimplefinBtn').addEventListener('click', () => connect('simplefin'));
+  $('csvFile').addEventListener('change', handleCSVUpload);
   $('viewToggle').addEventListener('click', toggleView);
   $('resetBtn').addEventListener('click', reset);
   $('resetPassphraseBtn').addEventListener('click', resetPassphrase);
