@@ -75,7 +75,7 @@ def _seed_identity(session: Session) -> None:
     """
     stmt = (
         pg_insert(models.VaultIdentity.__table__)
-        .values(id=1, user_handle=secrets.token_bytes(32))
+        .values(id=1, user_handle=secrets.token_bytes(32), passkey_required=False)
         .on_conflict_do_nothing(index_elements=["id"])
     )
     session.execute(stmt)
