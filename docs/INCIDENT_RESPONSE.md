@@ -24,25 +24,25 @@ SERVICE="mindful-money"
 gcloud logging metrics create mm_suspicious_counter_event \
   --project=$PROJECT \
   --description="WebAuthn sign count regression - possible cloned authenticator" \
-  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"suspicious_counter_event\""
+  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND textPayload:\"event=\\\"suspicious_counter_event\\\"\""
 
 # 2. Passkey auth failures (brute force indicator)
 gcloud logging metrics create mm_authentication_failures \
   --project=$PROJECT \
   --description="Passkey authentication failures" \
-  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"authentication_failure\""
+  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND textPayload:\"event=\\\"authentication_failure\\\"\""
 
 # 3. Unusual activity detections
 gcloud logging metrics create mm_unusual_activity \
   --project=$PROJECT \
   --description="Browser-side unusual activity detector triggered" \
-  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"unusual_activity_detected\""
+  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND textPayload:\"event=\\\"unusual_activity_detected\\\"\""
 
 # 4. Rate limiting (potential abuse)
 gcloud logging metrics create mm_rate_limited \
   --project=$PROJECT \
   --description="Rate limit hits" \
-  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND jsonPayload.event=\"rate_limited\""
+  --log-filter="resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$SERVICE\" AND textPayload:\"event=\\\"rate_limited\\\"\""
 
 # 5. Application errors
 gcloud logging metrics create mm_app_errors \
@@ -101,7 +101,7 @@ gcloud alpha monitoring channels create \
 ```bash
 # Recent suspicious events
 gcloud logging read \
-  "resource.type=cloud_run_revision AND resource.labels.service_name=\"mindful-money\" AND (jsonPayload.event=\"suspicious_counter_event\" OR jsonPayload.event=\"authentication_failure\")" \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=\"mindful-money\" AND (textPayload=~"event=\"suspicious_counter_event\" OR textPayload=~"event=\"authentication_failure\")" \
   --limit 20 --format json --freshness 1h
 ```
 
@@ -211,3 +211,25 @@ All of the above uses:
 - **Forensic disk images:** Cloud Run is stateless; no disks to image.
   Postgres audit trail is the forensic record.
 - **Threat intel feeds:** Not integrated. Manual correlation only.
+
+## Browser vs server monitoring
+
+**Important distinction:**
+
+- **Server-side security events** (in Cloud Logging): authentication failures,
+  suspicious WebAuthn counters, rate limiting, errors. These indicate attacks
+  against the server.
+
+- **Browser-side unusual activity** (in audit_events table): The
+  `_log_detection()` helper logs client-detected anomalies (e.g., rapid
+  requests, unusual patterns). These are **not** server-observed security
+  events. They indicate potential client-side issues or user behavior anomalies,
+  not server attacks.
+
+Do not treat `UNUSUAL_ACTIVITY_DETECTED` audit events as evidence of a server
+security incident. They are informational for the user, not for SOC triage.
+
+The log-based alerts above cover server-side events only. Browser detections
+are visible via the `/api/audit/events` API, not via Cloud Logging alerts
+(unless you specifically create an alert for the `unusual_activity_detected`
+log line, which is now emitted by `_log_detection()`).

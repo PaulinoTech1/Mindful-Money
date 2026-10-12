@@ -43,6 +43,15 @@ class VaultIdentity(Base):
     # decoded back to bytes for WebAuthn's user_id parameter.
     user_handle: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, unique=True)
     passkey_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # KDF salts: not secret, just unique per identity. Stored server-side so
+    # the client can retrieve them after authentication. Random 16 bytes each,
+    # generated on identity creation. If null (legacy), client falls back to
+    # localStorage salts with a migration warning.
+    kdf_salt_enc: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    kdf_salt_idx: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    # KDF version for future algorithm upgrades. Version 1 = Argon2id with
+    # OPSLIMIT_INTERACTIVE, MEMLIMIT_INTERACTIVE (current).
+    kdf_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[dt.datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at: Mapped[dt.datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 

@@ -1,5 +1,15 @@
 # Vault — working prototype
 
+**Architecture update (2026-10-11):** The server-side bank relay (`/api/relay`,
+`fakebank.py`, `simplefin.py`) has been removed. Bank data ingestion is now
+entirely client-side via `static/simplefin-client.js`. The server never sees
+plaintext transactions. See `docs/TRUST_BOUNDARIES.md` for the honest trust
+model.
+
+**KDF salts (2026-10-11):** Fixed `DEMO_SALT_ENC`/`DEMO_SALT_IDX` have been
+replaced with per-identity server-side salts (`/api/kdf/salts`). See
+`docs/TRUST_BOUNDARIES.md`.
+
 A privacy-first finance tracker where the server stores your transactions and
 cannot read them. Fake bank data, real cryptography, charts computed entirely
 in your browser.

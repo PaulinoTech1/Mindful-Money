@@ -1026,6 +1026,48 @@ def disable_passkeys():
 
 # ---------- Incident response ----------
 
+# ---------- KDF salt management ----------
+
+@app.get("/api/kdf/salts")
+def get_kdf_salts():
+    """Get the KDF salts for the current identity. If not set, generates random
+    salts, stores them, and returns them. Salts are not secret, just unique per
+    identity. The client uses these to derive encryption keys from the passphrase."""
+    denied = require_access()
+    if denied: return denied
+    identity_id = current_identity_id()
+    if not identity_id:
+        return api_error("No identity", 403)
+    table = models.VaultIdentity.__table__
+    conn = db()
+    row = conn.execute(
+        select(table.c.kdf_salt_enc, table.c.kdf_salt_idx, table.c.kdf_version)
+        .where(table.c.id == identity_id)
+    ).first()
+    if not row:
+        return api_error("Identity not found", 404)
+    # Generate salts if not set (first use)
+    if row.kdf_salt_enc is None or row.kdf_salt_idx is None:
+        import secrets
+        salt_enc = secrets.token_bytes(16)
+        salt_idx = secrets.token_bytes(16)
+        conn.execute(
+            update(table)
+            .where(table.c.id == identity_id)
+            .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, updated_at=func.now())
+        )
+        conn.commit()
+        LOG.info('event="kdf_salts_generated" client="%s"', _client_log_id())
+    else:
+        salt_enc = bytes(row.kdf_salt_enc)
+        salt_idx = bytes(row.kdf_salt_idx)
+    return jsonify({
+        "salt_enc": salt_enc.hex(),
+        "salt_idx": salt_idx.hex(),
+        "kdf_version": row.kdf_version,
+    })
+
+
 @app.get("/api/audit/events")
 def list_audit_events():
     """List audit events for incident response. Requires authentication."""

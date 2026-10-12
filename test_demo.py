@@ -35,32 +35,35 @@ from sqlalchemy import create_engine, text
 sys.path.insert(0, str(Path(__file__).parent))
 import app as server_app
 import db as dbmod
-import fakebank
 import models
 
 # Must match the constants in static/app.js.
 SALT_ENC = bytes([73, 26, 201, 4, 155, 88, 17, 240, 63, 129, 7, 198, 44, 90, 231, 12])
 SALT_IDX = bytes([9, 144, 37, 222, 101, 58, 175, 20, 86, 3, 249, 130, 66, 11, 193, 77])
 
-ALL_MERCHANTS = (
-    {m for m, *_ in fakebank.RECURRING_WEEKLY}
-    | {m for m, *_ in fakebank.OCCASIONAL}
-    | {m for m, *_ in fakebank.MONTHLY_FIXED}
-    | {m for m, *_ in fakebank.IRREGULAR}
-    | {fakebank.PAYCHECK[0]}
-)
+# Demo merchants (previously from fakebank.py, now generated client-side in simplefin-client.js)
+ALL_MERCHANTS = {
+    "Whole Foods", "Trader Joe's", "Starbucks", "Amazon", "Netflix",
+    "Rent Payment", "Paycheck Deposit", "Shell Gas", "CVS Pharmacy",
+}
 
 
 class BrowserSim:
     """Line-for-line equivalent of the crypto in static/app.js."""
 
-    def __init__(self, passphrase: str):
+    def __init__(self, passphrase: str, salt_enc: bytes = None, salt_idx: bytes = None):
+        # Test fixtures use deterministic salts; production uses per-browser random salts.
+        # Default to the legacy fixed salts for backward compatibility with existing test vectors.
+        if salt_enc is None:
+            salt_enc = SALT_ENC
+        if salt_idx is None:
+            salt_idx = SALT_IDX
         kdf = nacl.pwhash.argon2id.kdf
         ops = nacl.pwhash.argon2id.OPSLIMIT_INTERACTIVE
         mem = nacl.pwhash.argon2id.MEMLIMIT_INTERACTIVE
-        seed = kdf(32, passphrase.encode(), SALT_ENC, opslimit=ops, memlimit=mem)
+        seed = kdf(32, passphrase.encode(), salt_enc, opslimit=ops, memlimit=mem)
         self.pk, self.sk = nacl.bindings.crypto_box_seed_keypair(seed)
-        self.index_key = kdf(32, passphrase.encode(), SALT_IDX, opslimit=ops, memlimit=mem)
+        self.index_key = kdf(32, passphrase.encode(), salt_idx, opslimit=ops, memlimit=mem)
 
     def seal(self, obj: dict) -> str:
         payload = json.dumps(obj, separators=(",", ":")).encode()
@@ -160,67 +163,6 @@ class ServerCase(unittest.TestCase):
 
 # ---------------------------------------------------------------- fake bank
 
-
-class TestFakeBank(unittest.TestCase):
-    def test_is_deterministic(self):
-        self.assertEqual(fakebank.generate(), fakebank.generate())
-
-    def test_produces_a_useful_volume(self):
-        txns = fakebank.generate(months=6)
-        self.assertGreater(len(txns), 200, "too sparse to make charts interesting")
-        self.assertLess(len(txns), 1500)
-
-    def test_no_future_dates(self):
-        import datetime as dt
-
-        today = dt.date.today().isoformat()
-        self.assertTrue(all(t["date"] <= today for t in fakebank.generate()))
-
-    def test_starts_on_a_month_boundary(self):
-        # Otherwise the first month is missing its rent and the opening chart
-        # column is misleadingly low.
-        self.assertTrue(fakebank.generate()[0]["date"].endswith("-01"))
-
-    def test_every_complete_month_has_rent(self):
-        txns = fakebank.generate()
-        months = sorted({t["date"][:7] for t in txns})
-        rent_months = {t["date"][:7] for t in txns if "Rent" in t["merchant"]}
-        for m in months[:-1]:  # last month may be partial
-            self.assertIn(m, rent_months, f"{m} has no rent charge")
-
-    def test_has_both_income_and_spending(self):
-        txns = fakebank.generate()
-        income = -sum(t["amount"] for t in txns if t["amount"] < 0)
-        spend = sum(t["amount"] for t in txns if t["amount"] > 0)
-        self.assertGreater(income, 0)
-        self.assertGreater(spend, 0)
-        # Realistic ratio: neither a fantasy surplus nor an impossible deficit.
-        self.assertTrue(0.6 < spend / income < 1.4, f"ratio {spend/income:.2f} unrealistic")
-
-    def test_ids_are_unique(self):
-        txns = fakebank.generate()
-        self.assertEqual(len({t["id"] for t in txns}), len(txns))
-
-    def test_includes_checking_ira_and_401k_feeds(self):
-        txns = fakebank.generate()
-        counts = {account: sum(t["account"] == account for t in txns) for account in fakebank.ACCOUNTS}
-        self.assertEqual(set(counts), set(fakebank.ACCOUNTS))
-        self.assertTrue(all(count > 0 for count in counts.values()))
-        self.assertEqual({fakebank.ACCOUNTS[t["account"]]["bank"] for t in txns}, {
-            "Scammers Inc", "Wells Foreclosure", "DC Unc"
-        })
-        self.assertTrue(all(t["bank"] == fakebank.ACCOUNTS[t["account"]]["bank"] for t in txns))
-        self.assertTrue(all(t["account_label"] == fakebank.ACCOUNTS[t["account"]]["label"] for t in txns))
-        self.assertTrue(all(t["account_type"] == fakebank.ACCOUNTS[t["account"]]["type"] for t in txns))
-
-    def test_fans_only_is_a_monthly_423_23_subscription(self):
-        charges = [t for t in fakebank.generate() if t["merchant"] == "Fans Only"]
-        self.assertGreaterEqual(len(charges), 6)
-        self.assertTrue(all(t["amount"] == 423.23 for t in charges))
-        self.assertEqual(len({t["date"][:7] for t in charges}), len(charges))
-
-
-# ---------------------------------------------------------------- crypto
 
 
 class TestBrowserCrypto(unittest.TestCase):

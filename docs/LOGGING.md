@@ -31,8 +31,11 @@ Or in the GCP Console: Logging → Log Explorer → filter by `mindful-money`.
 
 ## Tier 2: Postgres audit events (application)
 
-The `audit_events` table is the application-level incident trail. Append-only,
-never deleted by the app.
+The `audit_events` table is the application-level incident trail. Events are never
+deleted. The `acknowledged_at`/`acknowledged_by` columns may be updated to mark
+events as reviewed (this is a status update, not a modification of the event
+itself). For strict append-only auditing, query the `INCIDENT_ACKNOWLEDGED`
+events rather than relying on the acknowledgment columns.
 
 **Event types:**
 - `PASSKEY_REGISTERED` / `PASSKEY_REMOVED`
