@@ -551,3 +551,66 @@ Shell using the Secret Manager value directly (no paste):
 export VAULT_DATABASE_URL=$(gcloud secrets versions access latest --secret=neon-db-url)
 python3 -c 'import os; from sqlalchemy import create_engine, inspect; e = create_engine(os.environ["VAULT_DATABASE_URL"]); print(sorted(inspect(e).get_table_names()))'
 ```
+
+## /api/* 503 from schema drift; kdf_version hypothesis tested and rejected (2026-10-13)
+
+**Symptom:** After the `_seed_identity` fix (previous entry) and a
+credential rotation, `/health` returns 200 but every `/api/*` request
+still returns the handled 503.
+
+**Context (same window, separately confirmed faults):**
+
+1. The `neon-db-url` secret held a `postgresql://` URL while the image
+   ships only psycopg3, so SQLAlchemy's default psycopg2 dialect failed
+   to load. Cloud Shell masked this: it has psycopg2 installed, so
+   direct tests against the same secret value passed there.
+2. The first rotated secret version (v4) was built with the
+   `postgresql+psycopg://` prefix applied twice. SQLAlchemy parses
+   `postgresql+psycopg://postgresql+psycopg://user@host/db` with
+   username `postgresql+psycopg`, so Postgres rejected authentication
+   and every route returned 500 (the custom session interface writes
+   to the DB on the response path, `app.py` `save_session`). Diagnosed
+   from the Cloud Logging traceback plus a local `make_url` parse
+   check. A start-of-string prefix check did not catch the doubling;
+   count occurrences instead. v5 (single prefix) fixed authentication.
+
+**Root cause (confirmed):** schema drift. The production
+`vault_identity` table has 5 columns (`id`, `user_handle`,
+`passkey_required`, `created_at`, `updated_at`); `models.py` maps 10.
+The migrations that add the other five were never applied to the
+production database: `c4d9e3f2a1b6_add_kdf_salts` (`kdf_salt_enc`,
+`kdf_salt_idx`, `kdf_version`) and `f1a2b3c4d5e6_add_recovery_blob`
+(`recovery_blob`, `recovery_created_at`). Inserts name their columns
+explicitly, so the seed and health paths pass. Selects built from the
+model's `Table` object name every mapped column, so identity-touching
+`/api/*` calls fail on the missing columns (a `SQLAlchemyError`) and
+the handler returns 503.
+
+**Hypothesis tested and rejected:** that `kdf_version` was a second
+`_seed_identity` landmine of the same class as `passkey_required`
+(NOT NULL, Python-only `default=1`, omitted from the Core insert).
+Tested from Cloud Shell against the production database: an
+`information_schema` probe of `vault_identity`, plus the app's exact
+insert run as-is and with `kdf_version=1` added. Result: the column
+does not exist in the production table at all; the as-is insert
+succeeds, and the with-`kdf_version` variant errors with "Unconsumed
+column names: kdf_version". The theory was wrong. The probe is what
+killed it, and the same probe is what exposed the drift.
+
+**Fix:** apply the outstanding migrations from a current checkout
+with the unpooled connection string (DDL cannot run through the
+pooler):
+
+```bash
+alembic upgrade head
+```
+
+No redeploy is required: the running code already expects the full
+schema and generates SQL per request.
+
+**Lesson:** after any migration run, verify the applied state against
+the models (`alembic current` versus `alembic heads`, plus a column
+probe), not just the table list. A table existing is not evidence that
+its columns match the models. Drift of this kind breaks selects while
+inserts keep passing, which makes the failure look like an application
+bug instead of a deployment gap.
