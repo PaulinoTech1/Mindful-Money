@@ -1194,17 +1194,22 @@ minted session as in phases 2-4.
   `upgrade head` reports index `ix_audit_events_identity_occurred` exists in
   the migrations but not in `models.py`. Unrelated to the new tables, which
   show no diff.
-- **Q (low, CI flake):** the first CI run of `6fde62b` failed `browser-test`
-  at the very first bootstrap with "Passkey ceremony could not be verified"
-  (before any changed code path); a rerun of the same commit passed, and it
-  passed 3 of 3 locally. Not investigated.
+- **Q (medium, CI):** `browser-test` failed at the very first bootstrap with
+  "Passkey ceremony could not be verified" on 2 of 3 CI runs of this
+  change (a rerun of `6fde62b` passed; 3 of 3 local runs passed). Likely
+  cause: bug F. In bootstrap mode the button has both `loginPasskey`
+  (addEventListener) and `bootstrapPasskey` (onclick); the two option
+  requests race, and the login request's session save can overwrite the
+  bootstrap `active_ceremony_id`, so `_take_challenge` finds none. Not fixed
+  (F was left unfixed by decision); one-line fix proposed in the PR report.
 - **P (low):** an unfinished rekey blocks normal writes for up to 15 minutes
   if the browser dies before it can call abort (documented trade-off in
   RECOVERY.md; a new begin or the TTL clears it).
 
-CodeQL flagged `py/polynomial-redos` on the two new hex checks; they now
-check the length bound before the regex (same pattern as before, bounded
-input).
+CodeQL flagged `py/polynomial-redos` on the two new hex checks. Checking
+the length first did not clear it, so they now use a set-membership check
+(`_is_lower_hex`) with no regex. The older `_LOWER_HEX` regex sites are
+unchanged and were not flagged.
 
 **Verification:** implemented and locally tested in a clean env; migration
 verified on a fresh database (`alembic current` = `heads` =
