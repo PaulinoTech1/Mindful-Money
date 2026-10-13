@@ -925,3 +925,62 @@ the intended new-vault `GET /api/kdf/salts` then generate flow.
   (arithmetic; not exercised by a test).
 - **F (low):** on a fresh vault the "Create passkey" button also fires the
   login request (409 in the console). Reported earlier.
+
+### Fixed: bugs D and E (2026-10-13, later)
+
+**D. Migrate now stores `kdf_version` with the salts.**
+- Change (`app.py` `migrate_kdf_salts`): `kdf_version` is REQUIRED in the
+  request body and must be an integer in {1, 2, 3} (type checked, so `3.0`,
+  `"3"`, `true` and lists are rejected with 400). It is written in the same
+  `UPDATE` as `kdf_salt_enc` / `kdf_salt_idx`, so salts and version change
+  together or not at all.
+- Omitted version: rejected (400). The only client caller is
+  `importBackup()`, which now always sends the backup's validated version.
+  A default was rejected because a wrong default is exactly bug D.
+- Client: both migrate calls send `kdf_version`. The interim client guard
+  (refuse restore when versions differ) was removed: with the server fix,
+  restoring a v1 backup into an empty v3 vault (or the reverse) is correct,
+  and the guard would have blocked it.
+- Schema: none. `vault_identity.kdf_version` already exists (INTEGER NOT
+  NULL, server_default 1, migration `c4d9e3f2a1b6`); no Alembic revision.
+- Tests (`test_kdf_migrate_and_limits.py`): fresh vault migrate with v3
+  stores v3; missing, 0, 4, "3", 3.0, true, [3] all 400 with salts and
+  version unchanged; force overwrite changes salts and version together; a
+  refused overwrite (409) changes neither. Browser (`test_playwright_recovery.py`):
+  phase 3 now reloads the restored vault, unlocks from scratch and checks
+  identical records and `kdf_version` 3; new phase 4 restores a v3 backup
+  into an empty vault seeded at v1 with its own salts, reloads, unlocks and
+  checks identical records and that the version moved to 3. Run against the
+  previous `app.py`, phase 4 times out after the reload (records cannot be
+  decrypted), so the test detects the bug.
+
+**E. Max sealed size matches the largest bucket.**
+- Computed, not assumed: largest bucket 8192 (`PAD_BUCKETS`), sealed-box
+  overhead `crypto_box_SEALBYTES` = 48 (asserted via PyNaCl in the test),
+  so 8240 bytes = 16480 hex. Default `VAULT_MAX_SEALED_HEX_LENGTH` raised
+  from 16384 to 16480. Primary statement of the limit: README.
+- Checked: `records.sealed` is `TEXT` (no length cap); `MAX_CONTENT_LENGTH`
+  is 8 MiB, which covers single and batched uploads at the restore batch
+  size (100 x 16480 hex is about 1.6 MB).
+- Rejected: shrinking the client to the 4096 bucket (would lose the 8192
+  bucket that THREAT_MODEL relies on for length hiding of large records).
+- Tests: a real sealed box of an 8192-byte plaintext (exactly 16480 hex) is
+  accepted; one byte more (16482 hex) is rejected with 400. Browser phase 4
+  seals an 8,145-byte JSON record in the browser, uploads it, reads it back
+  and decrypts it; ciphertext length is exactly 16480 hex; the plaintext
+  never appears in outbound requests.
+
+**Verification:** locally tested in a clean env (only `VAULT_ENV` and
+`VAULT_TEST_DATABASE_URL` set): pytest 150 passed; node padding and KDF
+tests pass; `test_browser.py` 119/119; `test_playwright_recovery.py` 36/36.
+CI: see PR #8. Not production-verified. Confidence high.
+
+**New issues found, NOT fixed:**
+- **G (low):** `MAX_RECORDS_PER_BATCH` is 1000 while `MAX_REQUEST_BYTES`
+  is 8 MiB; 1000 records near the max size would be about 16.5 MB, so such a
+  batch is rejected with 413. Normal records are 512-bucket (about 1.1 KB
+  hex) and restore batches 100, so this only affects a single connect/sync
+  of hundreds of very large records.
+- **H (low, flaky test):** `test_browser.py` "no horizontal overflow at
+  390px" failed once locally and passed on the rerun; it waits a fixed 900 ms
+  after resizing.

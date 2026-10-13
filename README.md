@@ -197,8 +197,12 @@ origin inference.
 ```
 
 The whole batch is validated before an atomic upsert. Unknown fields,
-duplicates, malformed blind indexes, and ciphertext outside 96–16384 hex
-characters are rejected without partial writes. Defaults are an 8 MiB request
+duplicates, malformed blind indexes, and ciphertext outside 96 to 16480 hex
+characters are rejected without partial writes. 16480 is exact: the largest
+client padding bucket is 8192 bytes and a NaCl sealed box adds 48
+(`crypto_box_SEALBYTES`: 32-byte ephemeral public key plus 16-byte MAC), so
+8240 bytes, 16480 hex. Raise it only together with `PAD_BUCKETS` in
+`static/app.js`. Defaults are an 8 MiB request
 and JSON limit, 1,000 records per batch, and 100,000 stored records per tenant.
 Byte counts are computed from decoded hex on the server.
 
