@@ -179,7 +179,9 @@ RATE_LIMITS = {
     "login_options": (int(os.environ.get("VAULT_RATE_LOGIN_OPTIONS", "20")), 300),
     "login_verify": (int(os.environ.get("VAULT_RATE_LOGIN_VERIFY", "10")), 600),
     "registration": (int(os.environ.get("VAULT_RATE_REGISTRATION", "10")), 3600),
-    "upload": (int(os.environ.get("VAULT_RATE_UPLOAD", "10")), 60),
+    # 60 per minute per identity (anonymous: per client IP). Derivation:
+    # README "Ciphertext and resource limits".
+    "upload": (int(os.environ.get("VAULT_RATE_UPLOAD", "60")), 60),
     "delete": (int(os.environ.get("VAULT_RATE_DELETE", "3")), 3600),
     "zkp_challenge": (int(os.environ.get("VAULT_RATE_ZKP_CHALLENGE", "20")), 300),
     # Proof verification shells out to `bb` -- meaningfully more expensive

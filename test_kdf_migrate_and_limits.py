@@ -125,3 +125,40 @@ class WorstCaseBatchAcceptedTest(ServerCase):
                    for i in range(n)]
         r = self.unsafe("post", "/api/records", json={"records": records})
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:200])
+
+
+class UploadRateLimitTest(ServerCase):
+    """Bug I: realistic editing bursts pass at the production default.
+
+    Derivation of the default: README "Ciphertext and resource limits".
+    """
+
+    def _post_one(self, i):
+        # Fetch CSRF headers once: each security_headers() call is a
+        # GET /api/session, which has its own (session) budget.
+        if not hasattr(self, "_headers"):
+            self._headers = self.security_headers()
+        record = {"blind_index": f"{i:064x}", "sealed": "ab" * 560}
+        return self.client.post("/api/records", headers=self._headers,
+                                json={"records": [record]}).status_code
+
+    def _wait_for_fresh_window(self, needed_seconds):
+        import time
+        seconds = server_app.RATE_LIMITS["upload"][1]
+        if seconds - time.time() % seconds < needed_seconds:
+            time.sleep(seconds - time.time() % seconds + 0.1)
+
+    def test_production_default_is_60_per_minute(self):
+        self.assertEqual(server_app.RATE_LIMITS["upload"], (60, 60))
+
+    def test_burst_of_30_single_edits_accepted(self):
+        self._wait_for_fresh_window(20)
+        statuses = [self._post_one(i) for i in range(30)]
+        self.assertEqual(statuses, [200] * 30)
+
+    def test_limit_triggers_above_default(self):
+        limit = server_app.RATE_LIMITS["upload"][0]
+        self._wait_for_fresh_window(25)
+        statuses = [self._post_one(i) for i in range(limit + 1)]
+        self.assertEqual(statuses[:limit], [200] * limit)
+        self.assertEqual(statuses[limit], 429)

@@ -28,6 +28,7 @@ const apiFetch = async (url, options = {}) => {
   if (!response.ok) {
     const error = new Error(data.error || (response.status === 401 ? 'Your passkey session expired.' : 'Request failed.'));
     error.status = response.status;
+    error.retryAfter = Number(response.headers.get('Retry-After')) || 0;
     throw error;
   }
   if (typeof data.csrf_token === 'string') CSRF = data.csrf_token;
@@ -43,6 +44,8 @@ const api = apiFetch;
 // uploads are idempotent upserts keyed by blind_index, so a retry converges).
 const UPLOAD_MAX_RECORDS = 500;
 const UPLOAD_MAX_BYTES = 6 * 1024 * 1024;
+const UPLOAD_RATE_RETRIES = 3;
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function chunkSealedRecords(rows, maxRecords = UPLOAD_MAX_RECORDS, maxBytes = UPLOAD_MAX_BYTES) {
   const chunks = [];
@@ -65,11 +68,23 @@ async function uploadSealedRecords(rows, onProgress) {
   const chunks = chunkSealedRecords(rows);
   let done = 0;
   for (const chunk of chunks) {
-    await api('/api/records', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: chunk }),
-    });
+    // A very large bulk upload (more than 60 chunks, i.e. tens of thousands
+    // of records) can reach the per-minute upload limit. Wait for the
+    // server's Retry-After (capped at 60 s) and retry the same chunk, at most
+    // UPLOAD_RATE_RETRIES times; any other error stops immediately.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await api('/api/records', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ records: chunk }),
+        });
+        break;
+      } catch (e) {
+        if (e.status !== 429 || attempt >= UPLOAD_RATE_RETRIES) throw e;
+        await sleepMs(Math.min(Math.max(e.retryAfter, 1), 60) * 1000);
+      }
+    }
     done += chunk.length;
     if (onProgress) onProgress(done, rows.length);
   }
@@ -1506,7 +1521,8 @@ function localGraphicAnswer(question) {
   const chartBase = {
     responsive: true,
     maintainAspectRatio: false,
-    animation: { duration: 350 },
+    // No animation: see the baseOpts comment (bug J).
+    animation: false,
     plugins: { legend: { display: false } },
   };
 
@@ -1791,7 +1807,14 @@ const baseOpts = {
   responsive: true,
   maintainAspectRatio: false,
   plugins: { legend: { display: false } },
-  animation: { duration: 380 },
+  // No animation (bug J). Chart.js 4.4.7 defers a resize that arrives while
+  // an animation is running (_resizeBeforeDraw) and applies it on the next
+  // draw; when the animation ends around the resize, the chart keeps a stale
+  // width (e.g. 1060 px canvas in a 316 px container) and the page overflows
+  // on mobile. render() recreates every chart, so any viewport change shortly
+  // after a data change could hit this. Without animation the animator never
+  // runs and every resize is applied immediately.
+  animation: false,
 };
 const axis = (extra = {}) => ({
   grid: { color: GRID, drawTicks: false },

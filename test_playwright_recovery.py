@@ -534,6 +534,45 @@ def main() -> int:
             check(not any("M" * 64 in body or "M" * 64 in url for url, body in req_d),
                   "~8 KB record plaintext never leaves the browser")
             check_no_plaintext_leak(check, req_d, base, "browser D")
+
+            # ---------- Phase 5: hypothesis K probe (recovery re-encryption) ----------
+            # Hypothesis K: re-encryption (handleRecoverVault, the only
+            # re-encryption path) re-uploads records under their OLD blind
+            # index, so a later sync under the new index key duplicates them.
+            # This phase runs the real flow on a vault with records and checks
+            # whether any re-encrypted record is ever uploaded.
+            print("\n\033[1mPhase 5: recovery re-encryption (hypothesis K)\033[0m")
+            before_k = page_d.evaluate(
+                "() => api('/api/records').then(r => r.records.map(x => x.blind_index + ':' + x.sealed).sort())")
+            mnemonic = page_d.evaluate("() => setupRecoveryKey()")
+            # Bug L: GET /api/recovery/blob requires session["passkey_authenticated"],
+            # which nothing sets and the server session store cannot persist,
+            # so the real flow always stops there with 403. Test-only probe:
+            # serve the stored (encrypted) blob from the DB to the page so the
+            # rest of the flow runs unchanged.
+            engine = create_engine(test_db_url, future=True)
+            with engine.connect() as conn:
+                blob_hex = conn.execute(text(
+                    "SELECT encode(recovery_blob, 'hex') FROM vault_identity WHERE id = 3")).scalar_one()
+            engine.dispose()
+            page_d.route("**/api/recovery/blob", lambda route: route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"recovery_blob": blob_hex})))
+            check(isinstance(mnemonic, str) and len(mnemonic.split()) >= 12, "recovery key set up")
+            posts_before = len(req_d)
+            page_d.evaluate("""m => { $('recoverMnemonic').value = m;
+                $('recoverNewPass').value = 'a different long passphrase for recovery 2026'; }""", mnemonic)
+            page_d.once("dialog", lambda d: d.accept())
+            page_d.evaluate("() => { $('doRecoverBtn').click(); }")
+            page_d.wait_for_function("() => /(failed|complete)/i.test($('recoverNote').textContent)", timeout=120000)
+            note_k = page_d.inner_text("#recoverNote")
+            print(f"    recovery outcome: {note_k!r}")
+            after_k = page_d.evaluate(
+                "() => api('/api/records').then(r => r.records.map(x => x.blind_index + ':' + x.sealed).sort())")
+            uploads = [b for url, b in req_d[posts_before:] if url.endswith("/api/records") and b]
+            check(not uploads and after_k == before_k,
+                  "K: no re-encrypted record is uploaded, stored records unchanged",
+                  f"uploads={len(uploads)} note={note_k!r}")
             ctx_d.close()
 
             browser.close()

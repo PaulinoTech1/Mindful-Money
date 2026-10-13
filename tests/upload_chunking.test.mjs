@@ -15,7 +15,7 @@ function extractFn(sig) {
   }
   return src.slice(start, i + 1);
 }
-const consts = ['UPLOAD_MAX_RECORDS', 'UPLOAD_MAX_BYTES'].map(n => src.match(new RegExp('const ' + n + ' = [^;]+;'))[0]);
+const consts = ['UPLOAD_MAX_RECORDS', 'UPLOAD_MAX_BYTES', 'UPLOAD_RATE_RETRIES'].map(n => src.match(new RegExp('const ' + n + ' = [^;]+;'))[0]);
 // Server limits, read from app.py defaults so the test tracks them.
 const py = fs.readFileSync(new URL('../app.py', import.meta.url), 'utf8');
 const SERVER_MAX_RECORDS = Number(py.match(/VAULT_MAX_RECORDS_PER_BATCH", "(\d+)"/)[1]);
@@ -24,9 +24,16 @@ const SERVER_MAX_BYTES = 8 * 1024 * 1024;
 assert.ok(/VAULT_MAX_REQUEST_BYTES", str\(8 \* 1024 \* 1024\)/.test(py));
 
 const requests = [];
+const waits = [];
+let fail429 = 0;  // number of upcoming requests to reject with 429
 const ctx = {
-  JSON, Error,
+  JSON, Error, Math,
+  sleepMs: async (ms) => { waits.push(ms); },
   apiFetch: async (path, opts) => {
+    if (fail429 > 0) {
+      fail429--;
+      const e = new Error('Request rate limit exceeded'); e.status = 429; e.retryAfter = 17; throw e;
+    }
     const body = opts.body;
     const parsed = JSON.parse(body);
     assert.equal(path, '/api/records');
@@ -39,7 +46,7 @@ const ctx = {
 vm.createContext(ctx);
 vm.runInContext(['const api = apiFetch;', ...consts, extractFn('function chunkSealedRecords('),
   extractFn('async function uploadSealedRecords(')].join('\n') +
-  '\nthis.f = { chunkSealedRecords, uploadSealedRecords, UPLOAD_MAX_RECORDS, UPLOAD_MAX_BYTES };', ctx);
+  '\nthis.f = { chunkSealedRecords, uploadSealedRecords, UPLOAD_MAX_RECORDS, UPLOAD_MAX_BYTES, UPLOAD_RATE_RETRIES };', ctx);
 const { uploadSealedRecords, chunkSealedRecords, UPLOAD_MAX_RECORDS } = ctx.f;
 
 const hex = (i, len) => (i.toString(16).padStart(8, '0') + 'a'.repeat(len)).slice(0, len);
@@ -61,4 +68,17 @@ assert.deepEqual(requests.map(r => r.n), [UPLOAD_MAX_RECORDS, UPLOAD_MAX_RECORDS
 // 3. Edge cases.
 assert.equal(chunkSealedRecords([]).length, 0);
 assert.throws(() => chunkSealedRecords([{ blind_index: 'a', sealed: 'b'.repeat(7 * 1024 * 1024) }]), /exceeds/);
-console.log(`upload_chunking: 1200 near-max records in ${nChunks} chunks (largest ${maxBytes} bytes), count chunking ok`);
+// 4. 429 on a chunk: waits Retry-After, retries the same chunk, no loss or duplicates.
+requests.length = 0;
+fail429 = 2;
+await uploadSealedRecords(small);
+assert.deepEqual(Array.from(waits), [17000, 17000]);
+assert.equal(requests.flatMap(r => r.records).length, 1201);
+// 5. Persistent 429: gives up after UPLOAD_RATE_RETRIES retries and throws.
+requests.length = 0; waits.length = 0;
+fail429 = 100;
+await assert.rejects(uploadSealedRecords(small), /rate limit/);
+assert.equal(waits.length, ctx.f.UPLOAD_RATE_RETRIES);
+assert.equal(requests.length, 0);
+fail429 = 0;
+console.log(`upload_chunking: 1200 near-max records in ${nChunks} chunks (largest ${maxBytes} bytes), count chunking ok, 429 retry ok`);

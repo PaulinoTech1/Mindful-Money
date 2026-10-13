@@ -224,6 +224,20 @@ upserts keyed by blind index, so retrying the same operation converges.
 bodies at 32 MiB, and a larger limit only widens the memory and parsing DoS
 surface.
 
+`POST /api/records` is rate limited to 60 requests per 60 s fixed window,
+keyed per vault identity when signed in and per client IP (HMAC of the
+trusted remote address) otherwise. Derivation: every single edit (manual
+entry, edit, rename, fraud flag) is one request, and a fast user does well
+under one edit per second for a sustained minute; 30 edits in a minute is
+the realistic burst the tests accept. A bulk sync is a few chunks (1,200
+records is 3 chunks), so 60 covers a burst of edits plus several syncs with
+2x headroom over the 30-edit burst. The previous 10 was hit by ordinary
+editing. Abuse bound: 60 requests of at most 8 MiB is about 480 MiB per
+minute per identity, still bounded by the 100,000-record tenant cap for
+storage; the fixed window allows up to 2x at a window boundary. An upload
+larger than 60 chunks (tens of thousands of records) waits for the 429
+`Retry-After` and retries the same chunk, up to 3 times per chunk.
+
 Configuration overrides are `VAULT_SESSION_TTL`, `VAULT_SESSION_IDLE_TTL`,
 `VAULT_CHALLENGE_TTL`, `VAULT_MAX_REQUEST_BYTES`,
 `VAULT_MAX_JSON_OBJECT_BYTES`, `VAULT_MAX_RECORDS_PER_BATCH`,

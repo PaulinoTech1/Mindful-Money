@@ -104,11 +104,6 @@ def main() -> int:
         # "disable passkeys" step. Production refuses anything but "required".
         "VAULT_AUTH_POLICY": "optional",
         "VAULT_BOOTSTRAP_TOKEN": TEST_BOOTSTRAP_TOKEN,
-        # Test-only: this suite performs more than 10 record writes within
-        # 60 s on a fast machine, which tripped the production upload limit
-        # (10/60 s) intermittently. Production keeps the default; rate limiting
-        # itself is covered by test_demo.py. See TROUBLESHOOTING bug I.
-        "VAULT_RATE_UPLOAD": "100",
     })
     env_server = subprocess.Popen(
         [sys.executable, "-c", f"import app; app.app.run(port={port})"],
@@ -576,6 +571,11 @@ def main() -> int:
 
             # --- mobile --------------------------------------------------
             print("\n  Responsive")
+            # Regression for bug J: recreate every chart, then shrink the
+            # viewport while the old Chart.js entry animation would still be
+            # running (380 ms). Before the fix this left stale canvas widths.
+            page.evaluate("() => render()")
+            page.wait_for_timeout(370)
             page.set_viewport_size({"width": 390, "height": 844})
             # Condition-based wait (bug H): wait until the viewport has resized
             # and layout has settled with no overflow, up to 10 s. On timeout

@@ -1048,3 +1048,83 @@ passed; node tests 3/3 files pass; `test_playwright_recovery.py` 36/36);
 CI: see PR #8; not production-verified; confidence high. H implemented and
 locally tested; the check now fails intermittently because of bug J, so the
 browser suite is not stable; confidence high in the diagnosis.
+
+### Fixed: bugs J and I; hypothesis K not confirmed; new bugs L and M (2026-10-13, later)
+
+**J. Chart overflow at 390 px: root cause and fix.**
+- Evidence: at the moment of failure the chart containers were already the
+  right width (`.chart` 316 px, card 354 px, `.main` 390 px), but the
+  Chart.js instances for `#chBalance` and `#chMerchants` still had their
+  desktop width (502 px and 1060 px) as inline canvas width. Calling
+  `chart.resize()` by hand fixed it immediately, and hiding the canvases
+  removed all overflow. So the CSS layout was correct (cards already have
+  `min-width: 0`) and the charts had missed or misapplied a resize.
+- Root cause: Chart.js 4.4.7 `resize()` does not resize while its animator
+  is running; it stores the size in `_resizeBeforeDraw` and applies it on the
+  next draw. `render()` recreates every chart with a 380 ms entry
+  animation, so a viewport change that lands near the end of that animation
+  leaves the chart at a stale width. Reproduced by calling `render()` at
+  1280 px and resizing to 390 px 370 ms later: `#chCategory` stayed at
+  422 px in a 316 px container.
+- Fix (`static/app.js`): `animation: false` for the dashboard charts
+  (`baseOpts`) and the assistant charts. With no animation the animator
+  never runs and every resize is applied at once. The same reproduction
+  then passed at 340, 370, 380 and 400 ms.
+- Rejected: `min-width: 0` or `max-width: 100%` on containers or canvases
+  (the containers were already correct; a canvas capped by CSS would be
+  stretched, not re-rendered); a manual `ResizeObserver` calling
+  `chart.resize()` (works around Chart.js instead of removing the race,
+  and adds a second observer per chart); a longer wait in the test (the
+  stale width never recovers by itself).
+- Regression test: `test_browser.py` now calls `render()` and shrinks the
+  viewport 370 ms later, then runs the condition-based overflow check.
+
+**I. Upload rate limit.**
+- Keyed per vault identity when signed in, per client IP (HMAC) otherwise;
+  fixed 60 s window. Production default raised from 10 to 60 per minute;
+  the derivation is in README "Ciphertext and resource limits".
+- `uploadSealedRecords` now waits for `Retry-After` on 429 and retries the
+  same chunk (max 3 times), so very large uploads cannot fail midway on
+  the rate limit. Covered in `tests/upload_chunking.test.mjs`.
+- The test-only `VAULT_RATE_UPLOAD=100` override in `test_browser.py` was
+  removed; the suite passes at the production default.
+- Tests (`test_kdf_migrate_and_limits.py`): the default is (60, 60); 30
+  single-record uploads in one window are all accepted; 61 in one window
+  give 60 x 200 then 429. The tests wait for a fresh window when close to
+  the boundary so the fixed window cannot make them flaky.
+- Rejected: per-session keying (resets by clearing cookies); exempting
+  single-record writes (no abuse bound); 120 per minute (doubles the
+  write bandwidth bound for no observed need).
+
+**K. Hypothesis: re-encryption keeps the old blind index. NOT confirmed.**
+- `handleRecoverVault` (the only re-encryption path) does reuse the old
+  `blind_index` in code, but it can never reach the upload.
+  `test_playwright_recovery.py` phase 5 runs the real flow on a vault with
+  records and a real recovery key: no record is uploaded and stored rows are
+  unchanged. Two earlier blockers stop it (L and M below); phase 5 stubs the
+  first one test-only (serves the stored encrypted blob to the page) and the
+  flow then stops at the second.
+- Not fixed, because the path is unreachable and a correct fix (recompute
+  blind indexes under the new key and replace old rows atomically, which
+  needs a server replace endpoint since old and new indexes differ) only
+  makes sense together with a design for L and M.
+
+**New issues found, NOT fixed:**
+- **L (high, recovery unusable):** `GET /api/recovery/blob` and
+  `POST /api/recovery/delete` require `session["passkey_authenticated"]`,
+  which nothing in `app.py` sets and which the server-side session store
+  (`ServerSession` columns) cannot persist. Both always return 403
+  "Passkey authentication required", so the recovery key cannot be used or
+  deleted.
+- **M (high, recovery unusable):** past L, `handleRecoverVault` calls
+  `getSalts()` and requires a new vault, but an identity with records always
+  has salts (and `/api/kdf/salts/generate` refuses when records exist), so it
+  always fails with "Expected new salts for re-encryption, got existing".
+
+**Verification:** J, I implemented and locally tested in a clean env
+(pytest 156 passed; node tests pass; `test_playwright_recovery.py` 38/38;
+`test_browser.py` 10 of 10 consecutive runs 119/119, at the production
+upload limit);
+K hypothesis killed by a locally tested browser test. CI: see PR #8. Not
+production-verified. Confidence: J high (reproduced and fixed), I high, K
+high.
