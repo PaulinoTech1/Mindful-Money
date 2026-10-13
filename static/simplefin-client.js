@@ -357,68 +357,111 @@ async function fetchSimpleFinTransactions(accessUrl, days) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Deterministic demo data (bit-identical port of fakebank.py).         */
+/* Deterministic demo data: the Carter household (advisor demo).        */
 /*                                                                     */
-/* The PRNG below reproduces CPython's random.Random(SEED) exactly:    */
-/* MT19937 seeded via init_by_array over the seed's little-endian      */
-/* 32-bit words, random() via genrand_res53, uniform/choice/gauss      */
-/* matching CPython's formulas (gauss caches the spare Box-Muller normal */
-/* in gauss_next, choice uses _randbelow rejection sampling). Combined   */
-/* round-half-even decimal rounding, generateDemoTransactions()        */
-/* produces byte-identical output to fakebank.generate().              */
+/* Persona (docs/DEMO_DATASET.md): Ethan (38, mechanical engineer) and  */
+/* Priya (36, physical therapist) Carter, a dual-income household near */
+/* Charlotte, NC with two children, Leo (4, daycare) and Maya (8,      */
+/* after-school tutoring). Paid biweekly on alternating Fridays.       */
+/*                                                                     */
+/* Determinism: every calendar day draws from its own MT19937 stream    */
+/* seeded with DEMO_SEED + the day number, so a given date always       */
+/* produces the same transactions with the same ids whatever the        */
+/* window, and a refresh updates rows instead of duplicating them.     */
+/* Financial institutions are fictional; merchants are mainstream.     */
 /* ------------------------------------------------------------------ */
 
-const DEMO_SEED = 20260802;
+const DEMO_SEED = 20261013;
+const DEMO_CREEP_START = Date.UTC(2025, 9, 1);
+const DEMO_CREEP_END = Date.UTC(2026, 9, 1);
 
 const DEMO_ACCOUNTS = {
-  demo_checking: { bank: "Scammers Inc", label: "Everyday checking", type: "Checking" },
-  demo_ira: { bank: "Wells Foreclosure", label: "Traditional IRA", type: "IRA" },
-  demo_401k: { bank: "DC Unc", label: "Employer 401(k)", type: "401(k)" },
+  demo_checking: { bank: "Northbridge Bank", label: "Joint checking", type: "Checking" },
+  demo_card: { bank: "Northbridge Bank", label: "Rewards Visa", type: "Credit card" },
+  demo_savings: { bank: "Northbridge Bank", label: "Emergency fund", type: "Savings" },
+  demo_401k: { bank: "Keystone Retirement", label: "Ethan's 401(k)", type: "401(k)" },
+  demo_ira: { bank: "Keystone Investments", label: "Priya's Roth IRA", type: "IRA" },
+  demo_brokerage: { bank: "Keystone Investments", label: "Joint brokerage", type: "Brokerage" },
 };
 
-// (merchant, typical amount, spread, times per week)
-const DEMO_RECURRING_WEEKLY = [
-  ["Blue Bottle Coffee", 6.25, 1.75, 4],
-  ["MTA OMNY", 2.90, 0.00, 6],
-  ["Trader Joe's", 78.00, 26.00, 1],
-  ["Sweetgreen", 15.40, 3.20, 2],
+// Paychecks: [merchant, net amount, week parity]. Alternating Fridays.
+const DEMO_PAYCHECKS = [
+  ["Atlas Engineering Payroll", 3185.00, 0],
+  ["Novant Health Payroll", 2465.00, 1],
+];
+// Ethan's 401(k), per Atlas paycheck (6% deferral, 3% employer match).
+const DEMO_401K = [["401(k) Employee Deferral", 290.00], ["401(k) Employer Match", 145.00]];
+
+// Monthly fixed items from checking: [merchant, amount, day, category, seasonal key, tag]
+const DEMO_MONTHLY_CHECKING = [
+  ["Rocket Mortgage", 2640.00, 1, "Housing", null, ""],
+  ["Bright Horizons Child Care", 1450.00, 1, "Other", null, "childcare"],
+  ["Toyota Financial Services", 465.00, 5, "Transport", null, ""],
+  ["State Farm Auto & Home", 212.40, 8, "Health & insurance", null, "insurance"],
+  ["Northwestern Mutual Life", 86.00, 8, "Health & insurance", null, "insurance"],
+  ["Duke Energy", 138.00, 12, "Utilities", "summer", ""],
+  ["Piedmont Natural Gas", 62.00, 14, "Utilities", "winter", ""],
+  ["Charlotte Water", 74.00, 16, "Utilities", null, ""],
+  ["Spectrum Internet", 79.99, 18, "Utilities", "fixed", ""],
+  ["Verizon Wireless", 164.80, 20, "Utilities", "fixed", ""],
+  ["Kumon Learning Center", 160.00, 3, "Other", "school", "education"],
+  ["St. Jude Children's Research Hospital", 50.00, 25, "Other", "fixed", "giving"],
 ];
 
-const DEMO_OCCASIONAL = [
-  ["Amazon", 42.00, 35.00, 0.9],
-  ["Duane Reade", 21.50, 12.00, 0.5],
-  ["Uber", 18.75, 9.00, 0.8],
-  ["Whole Foods Market", 63.00, 24.00, 0.6],
-  ["Lucali", 88.00, 22.00, 0.2],
-  ["Rough Trade Records", 34.00, 15.00, 0.25],
-  ["Citi Bike", 4.95, 0.00, 0.4],
-  ["Paragon Sports", 96.00, 48.00, 0.15],
+// Transfers out of checking to the household's own accounts (is_transfer).
+// [merchant in checking, amount, day, destination account, merchant there]
+const DEMO_TRANSFERS = [
+  ["Transfer to Roth IRA", 500.00, 2, "demo_ira", "Contribution from checking"],
+  ["Transfer to Emergency Fund", 400.00, 2, "demo_savings", "Transfer from checking"],
+  ["Transfer to Brokerage", 300.00, 2, "demo_brokerage", "Contribution from checking"],
+  ["NC 529 Plan Contribution", 150.00, 2, null, null],
 ];
 
-const DEMO_MONTHLY_FIXED = [
-  ["Stuyvesant Town Rent", 2150.00, 1],
-  ["Fans Only", 423.23, 1],
-  ["Con Edison", 104.00, 8],
-  ["Verizon Fios", 79.99, 12],
-  ["Spotify", 11.99, 4],
-  ["Netflix", 15.49, 17],
-  ["Equinox", 215.00, 2],
-  ["State Farm Auto", 128.40, 22],
+// Card subscriptions: [merchant, amount, day]. Peloton App is the unused one.
+const DEMO_SUBSCRIPTIONS = [
+  ["Netflix", 15.49, 4],
+  ["Spotify Family", 16.99, 7],
+  ["Disney+", 13.99, 11],
+  ["Amazon Prime", 14.99, 13],
+  ["Apple iCloud+", 2.99, 15],
+  ["Peloton App", 44.00, 19],
 ];
 
-const DEMO_PAYCHECK = ["Meridian Systems Payroll", 2415.00];
-const DEMO_IRA_CONTRIBUTION = ["IRA Contribution", 500.00];
-const DEMO_K401_EMPLOYEE = ["401(k) Employee Deferral", 375.00];
-const DEMO_K401_MATCH = ["401(k) Employer Match", 187.50];
+// Card spending: [merchant, typical, spread, times per week, category, kind]
+// kind: "weekday" (Mon to Fri only), "weekend" (boosted Sat/Sun), "dining"
+// (frequency and size creep up over the period), "" otherwise.
+const DEMO_CARD_SPEND = [
+  ["Harris Teeter", 38.00, 14.00, 0.6, "Groceries", ""],
+  ["Target", 84.00, 30.00, 0.8, "Shopping", "weekend"],
+  ["Amazon", 46.00, 28.00, 1.1, "Shopping", ""],
+  ["Shell", 54.00, 9.00, 1.2, "Transport", ""],
+  ["Starbucks", 7.40, 1.60, 2.2, "Dining", "dining"],
+  ["Chipotle", 31.00, 7.00, 0.7, "Dining", "dining"],
+  ["Panera Bread", 38.00, 9.00, 0.5, "Dining", "dining"],
+  ["DoorDash", 48.00, 12.00, 0.6, "Dining", "dining"],
+  ["Olive Garden", 92.00, 18.00, 0.25, "Dining", "dining"],
+  ["CVS Pharmacy", 27.00, 14.00, 0.5, "Health & insurance", ""],
+  ["The Home Depot", 118.00, 60.00, 0.3, "Shopping", "weekend"],
+  ["Uber", 24.00, 8.00, 0.15, "Transport", ""],
+  ["Atrium Health", 45.00, 20.00, 0.1, "Health & insurance", ""],
+];
 
-// Irregular larger expenses
-const DEMO_IRREGULAR = [
-  ["Delta Air Lines", 428.00, 140.00],
-  ["Weill Cornell Physicians", 215.00, 95.00],
-  ["Apple Store", 329.00, 180.00],
-  ["Con Edison True-Up", 186.00, 40.00],
-  ["Enterprise Rent-A-Car", 264.00, 70.00],
-  ["Warby Parker", 195.00, 0.00],
+// Calendar events (month 1..12): [month, day, account, merchant, amount, category, tag]
+// Negative amount = money in. They anchor the advisor talking points.
+const DEMO_EVENTS = [
+  [1, 9, "demo_card", "Costco Annual Membership", 130.00, "Shopping", ""],
+  [2, 17, "demo_card", "Firestone Complete Auto Care", 1238.60, "Transport", "car repair"],
+  [3, 13, "demo_checking", "Atlas Engineering Annual Bonus", -4800.00, "Income", "bonus"],
+  [4, 21, "demo_checking", "IRS Treas 310 Tax Refund", -2340.00, "Refund", "tax refund"],
+  [6, 10, "demo_checking", "YMCA Summer Day Camp", 640.00, "Other", "childcare"],
+  [7, 1, "demo_checking", "YMCA Summer Day Camp", 640.00, "Other", "childcare"],
+  [7, 8, "demo_card", "Delta Air Lines", 1864.40, "Transport", "vacation"],
+  [7, 19, "demo_card", "Marriott Myrtle Beach", 1412.75, "Shopping", "vacation"],
+  [8, 1, "demo_checking", "YMCA Summer Day Camp", 640.00, "Other", "childcare"],
+  [8, 23, "demo_card", "Target Back to School", 286.30, "Shopping", "back to school"],
+  [11, 28, "demo_card", "Best Buy", 642.18, "Shopping", "holiday"],
+  [12, 6, "demo_card", "Amazon Holiday Gifts", 488.92, "Shopping", "holiday"],
+  [12, 18, "demo_checking", "Habitat for Humanity", 500.00, "Other", "giving"],
 ];
 
 function createSeededRandom(seedInt) {
@@ -524,12 +567,10 @@ function createSeededRandom(seedInt) {
 }
 
 function generateDemoTransactions(months) {
-  if (months === undefined) months = 6;
-  const rng = createSeededRandom(DEMO_SEED);
+  if (months === undefined) months = 12;
   const now = new Date();
   const tYear = now.getFullYear(), tMonth = now.getMonth(), tDay = now.getDate();
-  // Anchor to the first of the month, else the earliest month is missing
-  // its rent charge and the chart opens on a misleading spike.
+  // Anchor to the first of the month so the first month is complete.
   let y = tYear, m = (tMonth + 1) - months;
   while (m <= 0) { m += 12; y -= 1; }
   const DAY = 86400000;
@@ -537,107 +578,131 @@ function generateDemoTransactions(months) {
   const todayMs = Date.UTC(tYear, tMonth, tDay);
 
   const rows = [];
-  const counts = { demo_checking: 0, demo_ira: 0, demo_401k: 0 };
+  const idCounts = {};
+  const cardByMonth = {};
 
   function fmtDate(ms) { return new Date(ms).toISOString().slice(0, 10); }
-  function fmtYM(ms) {
-    const d = new Date(ms);
-    return d.getUTCFullYear() + String(d.getUTCMonth() + 1).padStart(2, "0");
-  }
+  function slug(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, ""); }
 
-  function add(ms, merchant, amount, account) {
-    if (account === undefined) account = "demo_checking";
+  function add(ms, merchant, amount, account, category, opts) {
     if (ms > todayMs) return;
-    const seq = counts[account] || 0;
-    // Keep the legacy checking IDs stable when adding a new recurring
-    // charge. The monthly charge gets its own deterministic ID, so a
-    // refresh updates old rows instead of duplicating the feed.
-    const isFansOnly = account === "demo_checking" && merchant === "Fans Only";
-    let id;
-    if (isFansOnly) id = "demo_fans_only_" + fmtYM(ms);
-    else if (account === "demo_checking") id = "demo_" + String(seq).padStart(5, "0");
-    else id = account + "_" + String(seq).padStart(5, "0");
+    opts = opts || {};
+    const date = fmtDate(ms);
+    // Stable id: account, date and merchant (plus a same-day counter).
+    const base = account + "_" + date.replace(/-/g, "") + "_" + slug(merchant);
+    const n = idCounts[base] || 0;
+    idCounts[base] = n + 1;
     const meta = DEMO_ACCOUNTS[account];
-    rows.push({
-      id: id,
+    const row = {
+      id: n ? base + "_" + n : base,
       merchant: merchant,
       amount: pyRound2(amount),
-      date: fmtDate(ms),
+      date: date,
       pending: false,
       account: account,
       bank: meta.bank,
       account_label: meta.label,
       account_type: meta.type,
+      category: category,
       source: "fakebank",
-    });
-    if (!isFansOnly) counts[account] = seq + 1;
+    };
+    if (opts.transfer) row.is_transfer = true;
+    if (opts.tag) row.tags = [opts.tag];
+    rows.push(row);
+    if (account === "demo_card" && !opts.transfer) {
+      const ym = date.slice(0, 7);
+      cardByMonth[ym] = (cardByMonth[ym] || 0) + row.amount;
+    }
   }
 
   for (let t = startMs; t <= todayMs; t += DAY) {
     const d = new Date(t);
     const dom = d.getUTCDate();
-    const weekday = (d.getUTCDay() + 6) % 7; // Monday=0, like Python
-    const daysSinceStart = Math.round((t - startMs) / DAY);
+    const month = d.getUTCMonth() + 1;
+    const weekday = (d.getUTCDay() + 6) % 7; // Monday=0
+    const dayNumber = Math.round(t / DAY);
+    const rng = createSeededRandom(DEMO_SEED + dayNumber);
+    // Dining creep is anchored to fixed dates, not to the window, so a
+    // refresh never rewrites past rows. It rises over DEMO_CREEP_START to
+    // DEMO_CREEP_END and stays flat afterwards.
+    const progress = Math.min(1, Math.max(0, (t - DEMO_CREEP_START) / (DEMO_CREEP_END - DEMO_CREEP_START)));
 
-    // Paycheck every other Friday.
-    if (weekday === 4 && Math.floor(daysSinceStart / 7) % 2 === 0) {
-      add(t, DEMO_PAYCHECK[0], -pyRound2(DEMO_PAYCHECK[1] * rng.uniform(0.98, 1.02)));
-      // Retirement contributions are separate encrypted account feeds,
-      // not checking-account expenses.
-      add(t, DEMO_K401_EMPLOYEE[0], -DEMO_K401_EMPLOYEE[1], "demo_401k");
-      add(t, DEMO_K401_MATCH[0], -DEMO_K401_MATCH[1], "demo_401k");
-    }
-
-    // One monthly contribution to the individual retirement account.
-    if (dom === 15) {
-      add(t, DEMO_IRA_CONTRIBUTION[0], -DEMO_IRA_CONTRIBUTION[1], "demo_ira");
-    }
-
-    // Fixed monthly bills.
-    for (let fi = 0; fi < DEMO_MONTHLY_FIXED.length; fi++) {
-      const merchant = DEMO_MONTHLY_FIXED[fi][0];
-      const amount = DEMO_MONTHLY_FIXED[fi][1];
-      const billDom = DEMO_MONTHLY_FIXED[fi][2];
-      if (dom === billDom) {
-        const jitter = (merchant.startsWith("Spotify") || merchant.startsWith("Netflix") ||
-                        merchant.startsWith("Fans Only"))
-          ? 1.0 : rng.uniform(0.9, 1.15);
-        add(t, merchant, amount * jitter);
+    // Paychecks on alternating Fridays (absolute week parity, window independent).
+    if (weekday === 4) {
+      const parity = Math.floor((dayNumber + 3) / 7) % 2;
+      for (const [merchant, net, p] of DEMO_PAYCHECKS) {
+        if (parity !== p) continue;
+        add(t, merchant, -net * rng.uniform(0.995, 1.005), "demo_checking", "Income");
+        if (p === 0) {
+          for (const [k, amt] of DEMO_401K) add(t, k, -amt, "demo_401k", "Investing", { transfer: true });
+        }
       }
     }
 
-    // Weekly habits, weighted toward weekdays for coffee and transit.
-    for (let wi = 0; wi < DEMO_RECURRING_WEEKLY.length; wi++) {
-      const merchant = DEMO_RECURRING_WEEKLY[wi][0];
-      const amount = DEMO_RECURRING_WEEKLY[wi][1];
-      const spread = DEMO_RECURRING_WEEKLY[wi][2];
-      const perWeek = DEMO_RECURRING_WEEKLY[wi][3];
-      if (rng.random() < perWeek / 7) {
-        if ((merchant === "Blue Bottle Coffee" || merchant === "MTA OMNY") && weekday >= 5) continue;
-        add(t, merchant, Math.max(1.0, rng.gauss(amount, spread)));
-      }
+    // Monthly checking bills with seasonality.
+    for (const [merchant, amount, day, category, season, tag] of DEMO_MONTHLY_CHECKING) {
+      if (dom !== day) continue;
+      if (season === "school" && (month === 6 || month === 7 || month === 8)) continue;
+      let amt = amount;
+      if (season === "summer") amt *= ({ 6: 1.45, 7: 1.7, 8: 1.6, 9: 1.2, 12: 1.15, 1: 1.25, 2: 1.15 })[month] || 1.0;
+      if (season === "winter") amt *= ({ 11: 1.6, 12: 2.3, 1: 2.6, 2: 2.2, 3: 1.5, 6: 0.45, 7: 0.4, 8: 0.4 })[month] || 1.0;
+      if (season !== "fixed" && amount < 1000) amt *= rng.uniform(0.94, 1.06);
+      add(t, merchant, amt, "demo_checking", category, { tag: tag });
     }
 
-    // Occasional discretionary spending, heavier on weekends.
-    const weekendBoost = weekday >= 5 ? 1.6 : 1.0;
-    for (let oi = 0; oi < DEMO_OCCASIONAL.length; oi++) {
-      const merchant = DEMO_OCCASIONAL[oi][0];
-      const amount = DEMO_OCCASIONAL[oi][1];
-      const spread = DEMO_OCCASIONAL[oi][2];
-      const perWeek = DEMO_OCCASIONAL[oi][3];
-      if (rng.random() < (perWeek * weekendBoost) / 7) {
-        add(t, merchant, Math.max(1.0, rng.gauss(amount, spread)));
-      }
+    // Weekly grocery run on Saturdays; Costco every other Sunday.
+    if (weekday === 5) add(t, "Harris Teeter", rng.gauss(172.0, 18.0), "demo_card", "Groceries");
+    if (weekday === 6 && Math.floor((dayNumber + 3) / 7) % 2 === 1) {
+      add(t, "Costco Wholesale", rng.gauss(236.0, 30.0), "demo_card", "Groceries");
     }
 
-    // Irregular one-offs, roughly twice a month across the whole list.
-    if (rng.random() < 2.0 / 30) {
-      const pick = rng.choice(DEMO_IRREGULAR);
-      add(t, pick[0], Math.max(20.0, rng.gauss(pick[1], pick[2])));
+    // Monthly transfers to the household's own accounts.
+    for (const [merchant, amount, day, dest, destMerchant] of DEMO_TRANSFERS) {
+      if (dom !== day) continue;
+      add(t, merchant, amount, "demo_checking", "Investing", { transfer: true, tag: dest ? "" : "529" });
+      if (dest) add(t, destMerchant, -amount, dest, "Investing", { transfer: true });
+    }
+
+    // Card subscriptions.
+    for (const [merchant, amount, day] of DEMO_SUBSCRIPTIONS) {
+      if (dom === day) add(t, merchant, amount, "demo_card", "Subscriptions");
+    }
+
+    // Everyday card spending.
+    for (const [merchant, typical, spread, perWeek, category, kind] of DEMO_CARD_SPEND) {
+      let rate = perWeek / 7;
+      let size = typical;
+      if (kind === "weekend" && weekday >= 5) rate *= 1.8;
+      if (kind === "dining") {
+        // Dining creep: roughly 1.6x by the end of the period.
+        rate *= 0.75 + 0.6 * progress;
+        size *= 0.92 + 0.2 * progress;
+      }
+      if (merchant === "Starbucks" && weekday >= 5) rate *= 0.3;
+      if (month === 12 && category === "Shopping") rate *= 1.6;
+      const draw = rng.random();
+      const amt = Math.max(3.0, rng.gauss(size, spread));
+      if (draw < rate) add(t, merchant, amt, "demo_card", category);
+    }
+
+    // Calendar events.
+    for (const [em, ed, account, merchant, amount, category, tag] of DEMO_EVENTS) {
+      if (em === month && ed === dom) add(t, merchant, amount, account, category, { tag: tag });
+    }
+
+    // Card paid in full on the 20th for the previous month's statement.
+    if (dom === 20) {
+      const prev = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1));
+      const ym = prev.toISOString().slice(0, 7);
+      if (cardByMonth[ym]) {
+        const bill = pyRound2(cardByMonth[ym]);
+        add(t, "Northbridge Visa Payment", bill, "demo_checking", "Other", { transfer: true });
+        add(t, "Payment received, thank you", -bill, "demo_card", "Other", { transfer: true });
+      }
     }
   }
 
-  rows.sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; });
+  rows.sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : (a.id < b.id ? -1 : a.id > b.id ? 1 : 0); });
   return rows;
 }
 

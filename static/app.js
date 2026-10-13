@@ -199,17 +199,20 @@ function getOrCreateSalt(storageKey) {
 
 /* ---------- categorization: on the device, never on the server ---------- */
 
+// Fallback rules for imported records without a category (the demo feed
+// sets its own). Mainstream merchants only.
 const RULES = [
-  [/payroll|deposit/i,                                  'Income'],
-  [/rent|stuyvesant/i,                                  'Housing'],
-  [/trader joe|whole foods/i,                           'Groceries'],
-  [/blue bottle|sweetgreen|lucali/i,                    'Dining'],
-  [/mta|omny|uber|citi bike|enterprise|delta air/i,     'Transport'],
-  [/con edison|verizon/i,                               'Utilities'],
-  [/spotify|netflix|fans only/i,                        'Subscriptions'],
-  [/amazon|apple store|rough trade|paragon|warby/i,     'Shopping'],
-  [/duane reade|weill cornell|equinox|state farm/i,     'Health & insurance'],
-  [/ira contribution|401\(k\)|employee deferral|employer match/i, 'Investing'],
+  [/payroll|deposit|bonus/i,                            'Income'],
+  [/tax refund/i,                                       'Refund'],
+  [/rent|mortgage/i,                                    'Housing'],
+  [/trader joe|whole foods|harris teeter|costco|kroger|publix/i, 'Groceries'],
+  [/starbucks|chipotle|panera|doordash|olive garden|sweetgreen/i, 'Dining'],
+  [/uber|lyft|shell|exxon|chevron|delta air|toyota financial|auto care/i, 'Transport'],
+  [/energy|natural gas|water|spectrum|verizon|comcast|xfinity/i, 'Utilities'],
+  [/spotify|netflix|disney\+|prime|icloud|peloton/i,     'Subscriptions'],
+  [/amazon|target|home depot|best buy|apple store/i,    'Shopping'],
+  [/cvs|walgreens|health|state farm|mutual life|insurance/i, 'Health & insurance'],
+  [/ira|401\(k\)|brokerage|employee deferral|employer match|529/i, 'Investing'],
 ];
 
 const CAT_COLOR = {
@@ -1393,7 +1396,7 @@ function renderAccounts() {
   $('accounts').hidden = false;
   $('accountList').innerHTML = [...groups.entries()].map(([id, rows]) => {
     const meta = accountMeta(id, rows);
-    const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
+    const net = rows.filter((t) => !t.excluded).reduce((sum, t) => sum - t.amount, 0);
     return `<div class="accountItem">
       <div class="accountBank">${escapeHtml(meta.bank)}</div>
       <div class="accountLabel">${escapeHtml(meta.type)} · ${escapeHtml(meta.label)}<span>${rows.length} records</span></div>
@@ -1401,12 +1404,16 @@ function renderAccounts() {
     </div>`;
   }).join('');
 
-  const totalVisible = [...groups.values()].reduce((sum, rows) => sum + rows.filter(reportable).reduce((inner, t) => inner + (t.amount < 0 ? -t.amount : 0), 0), 0);
+  // Account cards show money moved into each account, transfers included:
+  // a contribution from checking to an IRA is a transfer for spending and
+  // income totals, but it is exactly what the account card should show.
+  const counted = (t) => !t.excluded;
+  const totalVisible = [...groups.values()].reduce((sum, rows) => sum + rows.filter(counted).reduce((inner, t) => inner + (t.amount < 0 ? -t.amount : 0), 0), 0);
   $('dashboardAccounts').innerHTML = [...groups.entries()].map(([id, rows]) => {
     const meta = accountMeta(id, rows);
-    const contributions = rows.filter(reportable).reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
-    const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
-    const retirement = ['IRA', '401(k)'].includes(meta.type);
+    const contributions = rows.filter(counted).reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
+    const net = rows.filter(counted).reduce((sum, t) => sum - t.amount, 0);
+    const retirement = ['IRA', '401(k)', 'Savings', 'Brokerage'].includes(meta.type);
     const amount = retirement ? contributions : net;
     const amountLabel = retirement ? 'Contributed' : 'Net flow';
     const width = totalVisible ? Math.max(5, Math.round((contributions / totalVisible) * 100)) : 5;
@@ -1415,7 +1422,7 @@ function renderAccounts() {
       <div class="accountCardBank">${escapeHtml(meta.bank)}</div>
       <div class="accountCardLabel">${escapeHtml(meta.label)}</div>
       <div class="accountCardAmount"><small>${amountLabel}</small>${money(amount, true)}</div>
-      <div class="accountCardMeta">${retirement ? 'Retirement contributions' : 'Everyday account movement'}</div>
+      <div class="accountCardMeta">${['IRA', '401(k)'].includes(meta.type) ? 'Retirement contributions' : retirement ? 'Savings and investments' : 'Everyday account movement'}</div>
       <progress class="accountBar" aria-label="${width}% of deposits" max="100" value="${width}"></progress>
     </article>`;
   }).join('');

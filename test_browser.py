@@ -239,13 +239,17 @@ def main() -> int:
             check(records > 200, f"{records} transactions encrypted in-browser and stored")
             check(page.inner_text("#statReadable") == "0", "readable-by-server counter is zero")
             accounts_text = page.inner_text("#accounts")
-            check("Scammers Inc" in accounts_text, "checking account shows Scammers Inc")
-            check("Wells Foreclosure" in accounts_text and "IRA" in accounts_text, "IRA shows Wells Foreclosure")
-            check("DC Unc" in accounts_text and "401(k)" in accounts_text, "401(k) shows DC Unc")
+            check("Northbridge Bank" in accounts_text and "Joint checking" in accounts_text, "checking account shows Northbridge Bank")
+            check("Keystone Investments" in accounts_text and "IRA" in accounts_text, "Roth IRA shows Keystone Investments")
+            check("Keystone Retirement" in accounts_text and "401(k)" in accounts_text, "401(k) shows Keystone Retirement")
             dashboard_accounts = page.query_selector_all("#dashboardAccounts .accountCard")
-            check(len(dashboard_accounts) == 3, "dashboard shows three account cards")
-            check("Scammers Inc" in page.inner_text("#dashboardAccounts"), "dashboard visual includes checking bank")
-            check("Wells Foreclosure" in page.inner_text("#dashboardAccounts") and "DC Unc" in page.inner_text("#dashboardAccounts"), "dashboard visual includes both investment banks")
+            check(len(dashboard_accounts) == 6, "dashboard shows six account cards")
+            cards_text = page.inner_text("#dashboardAccounts")
+            check(all(label in cards_text for label in ("Joint checking", "Rewards Visa", "Emergency fund", "Ethan's 401(k)", "Priya's Roth IRA", "Joint brokerage")),
+                  "dashboard visual includes every demo account", cards_text[:200])
+            demo_merchants = page.evaluate("() => [...new Set(TXNS.map((t) => t.merchant))]")
+            unprofessional = [m for m in demo_merchants if any(w in m.lower() for w in ("fans only", "onlyfans", "scammer", "foreclosure", "dc unc", "casino", "betting", "draftkings", "fanduel", "poker"))]
+            check(not unprofessional, "demo data contains no unprofessional merchants", repr(unprofessional))
             page.click("#syncBtn")
             page.wait_for_function("() => !document.getElementById('syncBtn').disabled", timeout=60000)
             page.wait_for_function(
@@ -274,7 +278,7 @@ def main() -> int:
                 "every row categorized on-device",
             )
             user_view_text = page.inner_text("#dash")
-            check("Blue Bottle Coffee" in user_view_text, "merchant names visible to the user")
+            check(any(m in user_view_text for m in demo_merchants), "merchant names visible to the user")
             check(page.is_visible("#fraudWatch"), "browser-only unusual activity watch is visible")
             check("not confirmed fraud" in page.inner_text("#fraudWatch"), "detector presents a clear statistical caveat")
             check(len(page.query_selector_all("#fraudList [data-review-anomaly]")) > 0, "historical baseline produces explainable review candidates")
@@ -295,12 +299,12 @@ def main() -> int:
             check("Across" in chat_text, "assistant summarizes decrypted transactions locally")
             check("LOCAL ONLY" in page.inner_text("#assistant"), "assistant shows its local-only privacy boundary")
             check(requests == before_chat_requests, "chat question made no network request", str(requests[len(before_chat_requests):]))
-            page.fill("#chatInput", "How much did I spend at Fans Only last month?")
+            page.fill("#chatInput", "How much did I spend at Peloton App last month?")
             page.click("#chatSend")
             page.wait_for_function(
                 "() => document.querySelectorAll('#chatMessages .chatBubble').length >= 5"
             )
-            check("$423.23" in page.inner_text("#chatMessages"), "assistant reports the exact Fans Only charge")
+            check("$44.00" in page.inner_text("#chatMessages"), "assistant reports the exact Peloton App charge")
             page.fill("#chatInput", "Graph my spending by category")
             page.click("#chatSend")
             page.wait_for_selector("#chatMessages .chatGraph canvas")
@@ -353,7 +357,7 @@ def main() -> int:
             page.wait_for_timeout(1500)
 
             sv_text = page.inner_text("#serverview")
-            leaked = [m for m in ("Blue Bottle", "Stuyvesant", "Spotify", "Trader Joe")
+            leaked = [m for m in ("Rocket Mortgage", "Harris Teeter", "Spotify", "Peloton")
                       if m in sv_text]
             check(not leaked, "no merchant name appears in the server view", f"leaked: {leaked}")
             check(str(records) in sv_text, "server view reports the real row count")
@@ -493,7 +497,7 @@ def main() -> int:
             page.wait_for_selector("#addExpenseDialog[open]")
             expense_categories = page.locator("#addExpenseCategory option").all_text_contents()
             account_options = page.locator("#addExpenseAccount option").all_text_contents()
-            check("Scammers Inc" in " | ".join(account_options), "manual transaction destination lists the checking account", repr(account_options))
+            check("Northbridge Bank" in " | ".join(account_options), "manual transaction destination lists the checking account", repr(account_options))
             page.select_option("#addExpenseAccount", index=0)
             check("Other" in expense_categories and "Dining" in expense_categories, "expense dropdown has discrete categories including Other")
             check("Salary" not in expense_categories, "income-only categories are absent from the expense dropdown")

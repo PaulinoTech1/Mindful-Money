@@ -257,11 +257,12 @@ challenge tables. Existing record rows and ciphertext are never rewritten by
 a migration. `passkey_required` changes to true only in the same transaction
 that commits a successfully verified credential.
 
-Set any passphrase, click **Connect demo bank**. Six months of transactions get
-generated across a checking account, an IRA and a 401(k), encrypted in your
-browser, and stored as ciphertext. The demo banks are Scammers Inc, Wells
-Foreclosure and DC Unc. The checking feed includes a fixed $423.23 monthly
-Fans Only subscription charge.
+Set any passphrase, click **Connect demo bank**. Twelve months of
+transactions for a fictional dual-income household (the Carters, see
+[docs/DEMO_DATASET.md](docs/DEMO_DATASET.md)) get generated across joint
+checking, a rewards credit card, an emergency fund, a 401(k), a Roth IRA and a
+brokerage account, encrypted in your browser, and stored as ciphertext. The
+financial institutions are fictional; merchants are mainstream brands.
 
 No *external* network access required — PostgreSQL is a local (or
 operator-controlled) service, not a third party. Chart.js and libsodium are
@@ -400,7 +401,7 @@ is precise and cannot flake. A test you learn to ignore is worse than no test.
 
 ```bash
 psql postgresql://vault:vault_dev_only_password@localhost:5432/vault_dev \
-    -At -c "SELECT sealed FROM records" | grep -c "Blue Bottle"     # 0
+    -At -c "SELECT sealed FROM records" | grep -c "Harris Teeter"   # 0
 psql postgresql://vault:vault_dev_only_password@localhost:5432/vault_dev \
     -At -c "SELECT blind_index, sealed FROM records" | grep -v '^[0-9a-f,]*$' | head
 ```

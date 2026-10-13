@@ -67,6 +67,7 @@ jobs:
           node tests/padding.test.mjs
           node tests/upload_chunking.test.mjs
           node tests/record_shape.test.mjs
+          node tests/demo_dataset.test.mjs
 
       - name: Run full test suite
         run: |
