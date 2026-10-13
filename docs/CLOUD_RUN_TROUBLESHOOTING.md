@@ -1322,3 +1322,17 @@ Resolves [R](#fixed-bugs-f-q-n-o-and-p-2026-10-13-later).
 
 **Labels:** implemented and locally tested in a clean env (high); CI: see
 PR #8; not production-verified. No migration.
+
+### Production migration to a7b8c9d0e1f2 (2026-10-13)
+
+Boss ran `alembic upgrade head` against Neon on the unpooled URL before the
+merge: `alembic current` before was `f1a2b3c4d5e6`; after, the probe showed
+`vault_rekeys` and `vault_rekey_records` with 6 columns each, matching
+`models.py`. PR #8 was merged as `dee30a547bd4dbbc4190d6539af4409b26295b1e`;
+deploy run 38476462666 passed tests (including the schema drift check),
+deployed, and passed all smoke tests (/health, /ready, /api/version commit
+`dee30a547bd4`, /api/passkeys/status, JS integrity). Independent checks
+after deploy matched; `bootstrap_needed` was true.
+Order for future schema changes: run the migration on Neon (unpooled URL)
+and verify it before merging, since the deploy does not migrate.
+Labels: production-verified (deploy and smoke tests); confidence high.
