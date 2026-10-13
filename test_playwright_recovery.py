@@ -459,8 +459,82 @@ def main() -> int:
                     ".sort((a, b) => a[0] < b[0] ? -1 : 1)")
                 check([tuple(r) for r in recovered_c] == EXPECTED,
                       "new-vault recovery is byte-identical", f"got {recovered_c}")
+
+            # Bug D regression: after restore the vault must unlock again with
+            # the backup's salts AND its KDF version (stored atomically by
+            # /api/kdf/salts/migrate). Reload and unlock from scratch.
+            page_c.reload(wait_until="networkidle")
+            check(page_c.is_visible("#gate"), "restored vault: reload shows the passphrase gate")
+            passphrase_unlock(page_c)
+            page_c.wait_for_function(
+                f"() => TXNS && TXNS.length === {len(EXPECTED)}", timeout=60000)
+            reloaded_c = page_c.evaluate(
+                "() => TXNS.map(t => [t.merchant, t.amount])"
+                ".sort((a, b) => a[0] < b[0] ? -1 : 1)")
+            check([tuple(r) for r in reloaded_c] == EXPECTED,
+                  "restored vault unlocks after reload with identical records", f"got {reloaded_c}")
+            check(page_c.evaluate("() => api('/api/kdf/salts').then(r => r.kdf_version)") == 3,
+                  "restored vault stores the backup's kdf_version (3)")
             check_no_plaintext_leak(check, req_c, base, "browser C")
             ctx_c.close()
+
+            # ---------- Phase 4: v3 backup into an empty v1 vault (bug D) ----------
+            print("\n\033[1mPhase 4: v3 backup into an empty v1 vault (bug D)\033[0m")
+            engine = create_engine(test_db_url, future=True)
+            with Session(engine) as s:
+                s.add(_models.VaultIdentity(
+                    id=3, user_handle=b"playwright-device-d", passkey_required=False,
+                    kdf_version=1, kdf_salt_enc=os.urandom(16), kdf_salt_idx=os.urandom(16)))
+                s.flush()
+                s.add(_models.PasskeyCredential(
+                    identity_id=3, credential_id=b"pw-bug-d-probe",
+                    credential_public_key=b"x", label="probe", sign_count=0, transports=[]))
+                s.commit()
+            engine.dispose()
+            ctx_d = browser.new_context(viewport={"width": 1280, "height": 900}, accept_downloads=True)
+            ctx_d.add_cookies([{**session_cookie_for_identity(3), "url": base}])
+            page_d = ctx_d.new_page()
+            req_d: list = []
+            err_d: list = []
+            attach_interception(page_d, req_d, err_d)
+            page_d.goto(base, wait_until="networkidle")
+            passphrase_unlock(page_d)   # derives v1 keys on this vault's own salts
+            check(page_d.evaluate("() => api('/api/kdf/salts').then(r => r.kdf_version)") == 1,
+                  "phase 4 vault starts at kdf_version 1")
+            msg_d = next((m for t, m in import_backup(page_d, PASSPHRASE) if t == "alert"), "")
+            check(f"Restored {len(EXPECTED)} records" in msg_d,
+                  "v3 backup restores into a v1 vault", f"got: {msg_d!r}")
+            page_d.reload(wait_until="networkidle")
+            passphrase_unlock(page_d)
+            page_d.wait_for_function(
+                f"() => TXNS && TXNS.length === {len(EXPECTED)}", timeout=60000)
+            reloaded_d = page_d.evaluate(
+                "() => TXNS.map(t => [t.merchant, t.amount])"
+                ".sort((a, b) => a[0] < b[0] ? -1 : 1)")
+            check([tuple(r) for r in reloaded_d] == EXPECTED,
+                  "after reload the v1 vault unlocks as v3 with identical records", f"got {reloaded_d}")
+            check(page_d.evaluate("() => api('/api/kdf/salts').then(r => r.kdf_version)") == 3,
+                  "kdf_version moved to 3 together with the salts")
+            # Bug E regression: a record in the largest bucket (8192 bytes
+            # padded) seals to the server's max size and round-trips.
+            big = page_d.evaluate("""async () => {
+                const obj = { id: 'big-record', merchant: 'M'.repeat(8100), amount: -1 };
+                const sealed = seal(obj);
+                await api('/api/records', { method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ records: [{ blind_index: blindIndex(obj.id), sealed }] }) });
+                const { records } = await api('/api/records');
+                const mine = records.find(r => r.blind_index === blindIndex(obj.id));
+                const back = mine ? open(mine.sealed) : null;
+                return { hexLen: sealed.length, plainLen: JSON.stringify(obj).length,
+                         ok: !!back && back.merchant === obj.merchant && back.amount === -1 };
+            }""")
+            check(big["hexLen"] == 16480 and big["ok"],
+                  f"~8 KB record ({big['plainLen']} bytes) seals to the max size and round-trips", repr(big))
+            check(not any("M" * 64 in body or "M" * 64 in url for url, body in req_d),
+                  "~8 KB record plaintext never leaves the browser")
+            check_no_plaintext_leak(check, req_d, base, "browser D")
+            ctx_d.close()
 
             browser.close()
     finally:
