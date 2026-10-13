@@ -48,7 +48,11 @@ MAX_REQUEST_BYTES = int(os.environ.get("VAULT_MAX_REQUEST_BYTES", str(8 * 1024 *
 MAX_RECORDS_PER_BATCH = int(os.environ.get("VAULT_MAX_RECORDS_PER_BATCH", "1000"))
 MAX_TOTAL_RECORDS = int(os.environ.get("VAULT_MAX_TOTAL_RECORDS", "100000"))
 MIN_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MIN_SEALED_HEX_LENGTH", "96"))
-MAX_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MAX_SEALED_HEX_LENGTH", "16384"))
+# Largest client bucket (static/app.js PAD_BUCKETS) is 8192 bytes; a NaCl
+# sealed box adds crypto_box_SEALBYTES = 48 (ephemeral public key 32 + MAC 16),
+# so the largest ciphertext is 8240 bytes = 16480 hex characters.
+MAX_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MAX_SEALED_HEX_LENGTH", "16480"))
+KDF_VERSIONS = frozenset({1, 2, 3})
 MAX_JSON_OBJECT_BYTES = int(os.environ.get("VAULT_MAX_JSON_OBJECT_BYTES", str(8 * 1024 * 1024)))
 MAX_LABEL_LENGTH = 80
 VAULT_STEPUP_WINDOW_SECONDS = int(os.environ.get("VAULT_STEPUP_WINDOW_SECONDS", "300"))
@@ -1962,6 +1966,13 @@ def migrate_kdf_salts():
     force = payload.get("force", False)
     if not salt_enc_hex or not salt_idx_hex:
         return api_error("salt_enc and salt_idx required", 400)
+    # kdf_version is REQUIRED and stored in the same UPDATE as the salts.
+    # Salts without their KDF version make the next unlock derive different
+    # keys (docs/CLOUD_RUN_TROUBLESHOOTING.md, bug D). No default: the only
+    # client (importBackup) always sends it.
+    kdf_version = payload.get("kdf_version")
+    if type(kdf_version) is not int or kdf_version not in KDF_VERSIONS:
+        return api_error("kdf_version required: one of 1, 2, 3", 400)
     try:
         salt_enc = bytes.fromhex(salt_enc_hex)
         salt_idx = bytes.fromhex(salt_idx_hex)
@@ -1997,10 +2008,11 @@ def migrate_kdf_salts():
     conn.execute(
         update(table)
         .where(table.c.id == identity_id)
-        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, updated_at=func.now())
+        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, kdf_version=kdf_version,
+                updated_at=func.now())
     )
     conn.commit()
-    LOG.info('event="kdf_salts_migrated" client="%s"', _client_log_id())
+    LOG.info('event="kdf_salts_migrated" kdf_version=%d client="%s"', kdf_version, _client_log_id())
     return jsonify({"migrated": True})
 
 

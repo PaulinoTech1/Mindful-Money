@@ -2102,19 +2102,15 @@ async function importBackup(event) {
     try {
       const saltResp = await api('/api/kdf/salts');
       if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
-        // /api/kdf/salts/migrate replaces salts but not kdf_version, so a
-        // version mismatch would make the next unlock derive different keys.
-        // Refuse loudly instead (docs/CLOUD_RUN_TROUBLESHOOTING.md, bug D).
-        if ((saltResp.kdf_version || 1) !== backupKdfVersion) {
-          throw new Error(`Backup uses KDF v${backupKdfVersion} but this vault uses v${saltResp.kdf_version || 1}. ` +
-            'Restore into a vault with the same KDF version.');
-        }
+        // migrate stores salts and kdf_version together (bug D fix), so the
+        // vault takes the backup's KDF version along with its salts.
         await api('/api/kdf/salts/migrate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             salt_enc: backup.kdf.salt_enc,
             salt_idx: backup.kdf.salt_idx,
+            kdf_version: backupKdfVersion,
             force: true,
           }),
         });
@@ -2129,6 +2125,7 @@ async function importBackup(event) {
           body: JSON.stringify({
             salt_enc: backup.kdf.salt_enc,
             salt_idx: backup.kdf.salt_idx,
+            kdf_version: backupKdfVersion,
           }),
         });
         CACHED_SALTS = null;
