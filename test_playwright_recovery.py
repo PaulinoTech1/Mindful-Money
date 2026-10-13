@@ -54,6 +54,8 @@ HERE = Path(__file__).parent
 BACKUP_PATH = Path("/tmp/playwright-recovery-backup.json")
 
 PASSPHRASE = "playwright-recovery-passphrase"
+# TEST-ONLY dummy bootstrap token, set only in this test server's env.
+TEST_BOOTSTRAP_TOKEN = "test-only-bootstrap-token-not-a-secret"
 MERCHANTS = [
     "PLAYWRIGHT-MERCHANT-9999",
     "PLAYWRIGHT-MERCHANT-1000",
@@ -111,6 +113,7 @@ def start_server(port: int, test_db_url: str) -> subprocess.Popen:
         "VAULT_SECRET_KEY": "playwright-recovery-test-secret",
         "VAULT_CSP_MODE": "enforce",
         "VAULT_DATABASE_URL": test_db_url,
+        "VAULT_BOOTSTRAP_TOKEN": TEST_BOOTSTRAP_TOKEN,
     })
     proc = subprocess.Popen(
         [sys.executable, "-c", f"import app; app.app.run(port={port})"],
@@ -173,19 +176,28 @@ def do_bootstrap(page, check: Check) -> None:
     """Real first-passkey enrollment through the bootstrap UI.
 
     The bootstrap flow prompts for a token via prompt(); the test server runs
-    without VAULT_BOOTSTRAP_TOKEN configured, so any non-empty value is
-    accepted server-side.
+    with the test-only TEST_BOOTSTRAP_TOKEN, so the token check is exercised.
     """
     cdp, authenticator_id = add_virtual_authenticator(page)
     try:
         def handle_prompt(dialog):
-            dialog.accept("dev-bootstrap-token")
+            dialog.accept(TEST_BOOTSTRAP_TOKEN)
             page.remove_listener("dialog", handle_prompt)
         page.on("dialog", handle_prompt)
         page.click("#passkeyLoginBtn")  # relabeled "Create passkey" in bootstrap mode
         page.wait_for_selector("#gate:not([hidden])", timeout=30000)
         check("Create your vault passphrase" in page.inner_text("#gate"),
               "real WebAuthn bootstrap ceremony enrolled the first passkey",
+              page.inner_text("#gateNote"))
+        # Bootstrap verify enrolls but deliberately does not set
+        # authenticated_at (only login_verify does), so complete a real
+        # passkey login with the same authenticator before unlocking.
+        page.reload(wait_until="networkidle")
+        page.wait_for_selector("#passkeyGate:not([hidden])", timeout=15000)
+        page.click("#passkeyLoginBtn")
+        page.wait_for_selector("#gate:not([hidden])", timeout=15000)
+        check("Passkey accepted" in page.inner_text("#gateNote"),
+              "passkey login after bootstrap reaches the passphrase gate",
               page.inner_text("#gateNote"))
     finally:
         cdp.send("WebAuthn.removeVirtualAuthenticator",

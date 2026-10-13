@@ -23,6 +23,12 @@ from pathlib import Path
 HERE = Path(__file__).parent
 SHOTS = HERE / "screenshots"
 PASSPHRASE = "demo passphrase"
+# TEST-ONLY dummy bootstrap token. Set only in this test server's env. It is
+# not, and must never be, a real deployment secret.
+TEST_BOOTSTRAP_TOKEN = "test-only-bootstrap-token-not-a-secret"
+# Expected console noise: in bootstrap mode the gate button keeps its login
+# listener, so one click also POSTs /api/passkeys/login/options -> 409.
+EXPECTED_BOOTSTRAP_409 = "Failed to load resource: the server responded with a status of 409 (CONFLICT)"
 
 try:
     from playwright.sync_api import sync_playwright
@@ -94,6 +100,10 @@ def main() -> int:
         "VAULT_ORIGIN": f"http://localhost:{port}", "VAULT_RP_ID": "localhost",
         "VAULT_SECRET_KEY": "browser-test-secret-not-for-production", "VAULT_CSP_MODE": "enforce",
         "VAULT_DATABASE_URL": test_db_url,
+        # Test-only: passphrase-only mode must stay reachable for the
+        # "disable passkeys" step. Production refuses anything but "required".
+        "VAULT_AUTH_POLICY": "optional",
+        "VAULT_BOOTSTRAP_TOKEN": TEST_BOOTSTRAP_TOKEN,
     })
     env_server = subprocess.Popen(
         [sys.executable, "-c", f"import app; app.app.run(port={port})"],
@@ -147,10 +157,47 @@ def main() -> int:
             errors.clear()  # Chromium logs the deliberately rejected raw fetch as a resource error.
             page.screenshot(path=SHOTS / "1-unlock.png")
 
+            # --- first-passkey bootstrap (real UI, virtual authenticator) ---
+            # RP ID "localhost" and origin http://localhost:<port> in server_env
+            # match the page origin (base), which WebAuthn requires.
+            check(page.evaluate("() => location.origin") == base, "page origin matches VAULT_ORIGIN / RP ID")
+            cdp = page.context.new_cdp_session(page)
+            cdp.send("WebAuthn.enable", {"enableUI": False})
+            authenticator = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+                "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
+                "hasUserVerification": True, "isUserVerified": True,
+                "automaticPresenceSimulation": True,
+            }})["authenticatorId"]
+            if page.is_visible("#passkeyGate"):
+                page.once("dialog", lambda dialog: dialog.accept(TEST_BOOTSTRAP_TOKEN))
+                page.click("#passkeyLoginBtn")  # relabeled "Create passkey" in bootstrap mode
+                try:
+                    page.wait_for_selector("#gate:not([hidden])", timeout=30000)
+                except Exception:
+                    print("    bootstrap error:", page.inner_text("#passkeyGateNote"))
+                    raise
+                check("Create your vault passphrase" in page.inner_text("#gate"),
+                      "real bootstrap ceremony enrolls the first passkey", page.inner_text("#gateNote"))
+                while EXPECTED_BOOTSTRAP_409 in errors:
+                    errors.remove(EXPECTED_BOOTSTRAP_409)
+                # Bootstrap verify enrolls but deliberately does not set
+                # authenticated_at (only login_verify does), so complete a real
+                # passkey login before unlocking. Same virtual authenticator.
+                page.reload(wait_until="networkidle")
+                page.wait_for_selector("#passkeyGate:not([hidden])", timeout=15000)
+                page.click("#passkeyLoginBtn")
+                page.wait_for_selector("#gate:not([hidden])", timeout=15000)
+                check("Passkey accepted" in page.inner_text("#gateNote"),
+                      "passkey login after bootstrap reaches the passphrase gate", page.inner_text("#gateNote"))
+
             t0 = time.time()
             page.fill("#pass", PASSPHRASE)
             page.click("#unlockBtn")
-            page.wait_for_selector("#empty:not([hidden]), #dash:not([hidden])", timeout=30000)
+            try:
+                page.wait_for_selector("#empty:not([hidden]), #dash:not([hidden])", timeout=30000)
+            except Exception:
+                print("    unlock error:", page.inner_text("#gateNote"), "; console:", "; ".join(errors[:3]))
+                raise
             page.wait_for_function("() => document.getElementById('lock').dataset.state === 'open'", timeout=30000)
             kdf_ms = int((time.time() - t0) * 1000)
 
@@ -318,23 +365,12 @@ def main() -> int:
             check("Edited Merchant" in page.inner_text("#ledgerBody"), "encrypted transaction edits survive reload")
 
             # --- optional passkeys (Chromium virtual authenticator) ----
-            print("\n  Optional passkeys")
-            cdp = page.context.new_cdp_session(page)
-            cdp.send("WebAuthn.enable", {"enableUI": False})
-            authenticator = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
-                "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
-                "hasUserVerification": True, "isUserVerified": True,
-                "automaticPresenceSimulation": True,
-            }})["authenticatorId"]
-            page.fill("#passkeyLabel", "Test laptop")
-            page.click("#enablePasskeyBtn")
-            try:
-                page.wait_for_function("() => document.querySelector('#passkeyState').innerText === 'Enabled'", timeout=15000)
-            except Exception:
-                print("    passkey error:", page.inner_text("#securityNote"))
-                raise
+            print("\n  Passkeys")
+            # The first passkey was enrolled by the bootstrap ceremony above,
+            # on the same virtual authenticator (still attached).
+            page.wait_for_function("() => document.querySelector('#passkeyState').innerText === 'Enabled'", timeout=15000)
             page.wait_for_function("() => document.querySelectorAll('#passkeyList .passkeyItem').length === 1", timeout=15000)
-            check("Test laptop" in page.inner_text("#passkeyList"), "optional passkey enrollment succeeds", page.inner_text("#passkeyList"))
+            check("Primary passkey" in page.inner_text("#passkeyList"), "bootstrap passkey is listed", page.inner_text("#passkeyList"))
 
             page.reload(wait_until="networkidle")
             check(page.is_visible("#gate"), "authenticated reload proceeds to passphrase stage")
