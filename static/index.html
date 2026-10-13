@@ -124,7 +124,7 @@
 
     <section class="empty" id="empty" hidden>
       <h1>Your Money is empty</h1>
-      <p class="lede">Connect the demo bank to fetch six months of transactions. They will be encrypted in your browser before anything is stored.</p>
+      <p class="lede">Connect the demo bank to fetch twelve months of transactions. They will be encrypted in your browser before anything is stored.</p>
       <button class="primary" id="connectBtn">Connect demo bank</button>
       <button class="primary" id="connectSimplefinBtn" hidden>Connect via SimpleFin</button>
       <div class="mt-4">
@@ -196,7 +196,7 @@
           <span class="privacyBadge">LOCAL ONLY</span>
         </div>
         <div class="chatMessages" id="chatMessages" aria-live="polite">
-          <div class="chatBubble bot">I can summarize your spending, income, categories, merchants, and monthly patterns—with enough attitude to keep you honest. Ask nicely or don't; the arithmetic will be the same. No chat message or plaintext transaction is sent to the server.</div>
+          <div class="chatBubble bot">I can summarize your spending, income, categories, merchants, and monthly patterns. No chat message or plaintext transaction is sent to the server.</div>
         </div>
         <div class="chatForm">
           <label class="srOnly" for="chatInput">Money Chat</label>
@@ -222,11 +222,11 @@
       </header>
 
       <div class="chartGrid serverCharts">
-        <article class="card"><h2>Blob sizes — the one real leak</h2><div class="chart serverChart"><canvas id="chSizes"></canvas></div></article>
+        <article class="card"><h2>Blob sizes: the remaining length signal</h2><div class="chart serverChart"><canvas id="chSizes"></canvas></div></article>
         <article class="card"><h2>Records written per day</h2><div class="chart serverChart"><canvas id="chDays"></canvas></div></article>
       </div>
 
-      <p class="callout">Ciphertext length hints at the length of the merchant name. Padding every blob to fixed 256-byte buckets closes it — about ten lines of code.</p>
+      <p class="callout">Ciphertext length can hint at plaintext length. Records are padded to fixed-size buckets before encryption, so only the bucket size is visible.</p>
 
       <section class="ledger rawLedger">
         <h2>Raw rows, straight from the table</h2>
@@ -314,6 +314,6 @@
   <script src="/static/simplefin-client.js" crossorigin="anonymous" crossorigin="anonymous" crossorigin="anonymous" crossorigin="anonymous" integrity="sha384-9P8nhm64pRMjoCXBYcnfz1Y9ohFUSsKvmKBpEdM12Hdiem/voNP46LbRyrsntswV" crossorigin="anonymous"></script>
   <script src="/static/recovery-words.js"
     crossorigin="anonymous" crossorigin="anonymous" crossorigin="anonymous" integrity="sha384-if7vpoSqNmmVR3eVBOOfBboAo7y8K0acMtTnZvlqeUDcGXn/WtzzPJXjgs6JNmk+" crossorigin="anonymous"></script>
-  <script src="/static/app.js" crossorigin="anonymous" crossorigin="anonymous" crossorigin="anonymous" crossorigin="anonymous" integrity="sha384-VaKfWcARYfODjSHgWSGXz1oj1mn8B4oIFVUhZk9E6zyTE5CSOSSHzhBzbUqOFVxX" crossorigin="anonymous"></script>
+  <script src="/static/app.js" crossorigin="anonymous" crossorigin="anonymous" crossorigin="anonymous" crossorigin="anonymous" integrity="sha384-j1/QFNc6ADONW4ydShYde+b9Blpka91iOwO7J4NtOQnAyDdf7M0HTvm50+EFDLno" crossorigin="anonymous"></script>
 </body>
 </html>
