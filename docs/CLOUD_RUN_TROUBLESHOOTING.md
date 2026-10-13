@@ -773,3 +773,71 @@ Driving the real ceremony found two issues:
 
 Status: bootstrap path locally tested; both suites still red. Not
 CI-verified as passing.
+
+### Update: stale browser-test steps investigated; three app bugs found (2026-10-13, later)
+
+Scope: test-only changes. App bugs below are documented, NOT fixed.
+
+**Intended flow, from the code:**
+- Demo bank was not removed or renamed. `#connectBtn` ("Connect demo bank")
+  still calls `connect('fakebank')`, which now generates demo transactions
+  client-side (`generateDemoTransactions`), seals them, uploads, and calls
+  `load()`, which shows `#dash`. The test step is correct as written.
+- Backup import: the unlock gate clears `#pass`, so `importBackup()` asks
+  for the passphrase with `prompt()`, verifies the HMAC and canary with
+  candidate keys BEFORE changing server salts, migrates salts if they differ,
+  then reports with `alert()` ("Restored N records" or "Restore failed: ...").
+  The "Backup salts do not match" message the old phase 3 expected no longer
+  exists: cross-vault restore with the right passphrase is now intended.
+
+**Test changes (implemented):**
+- `test_playwright_recovery.py`: new `import_backup()` helper answers the
+  passphrase prompt and collects the result alert. Phase 2 asserts the
+  prompt happens. Phase 3 now asserts the current security property: a
+  foreign backup with a WRONG passphrase is rejected with an integrity or
+  wrong-passphrase error, leaves this vault's KDF salts unchanged, and
+  imports nothing; with the right passphrase the restore succeeds and is
+  byte-identical.
+- `test_browser.py`: diagnostics only (prints `#connectNote`, console errors
+  and HTTP >= 400 responses when the connect step times out). No assertion
+  loosened.
+
+**App bug A (high severity, confirmed): padding length overflows one byte.**
+- Symptom: "Connect demo bank" shows `Error: Unexpected non-whitespace
+  character after JSON at position 235`; `#dash` never appears.
+- Evidence: stack `JSON.parse` in `open()` from `load()`. `padPlaintext()`
+  in `static/app.js` stores the pad length in every pad byte of a
+  `Uint8Array`, but buckets are 512 to 8192 bytes, so any pad length of 256
+  or more is stored modulo 256. `unpadPlaintext()` then strips too little.
+  A node round-trip of the exact functions over lengths 2 to 8192:
+  1275 ok, 6916 broken.
+- Impact: most newly sealed records cannot be read back. The plaintext
+  prefix is intact inside the ciphertext, so data is recoverable with a
+  corrected unpad (for example, strip trailing bytes after the JSON value).
+  Production has no enrolled passkey yet, so no real vault data is believed
+  affected. Confidence high.
+- Proposed fix (not done): store the pad length in a 2-byte or 4-byte
+  trailer (format version bump), with a tolerant reader for existing
+  records. Zero-knowledge unaffected.
+
+**App bug B (high, confirmed): backup restore always fails.**
+- Symptom: every import alerts `Restore failed: S.crypto_verify_32 is not a
+  function` (phase 2 same-vault restore, phase 3 both passphrases).
+- Root cause: the loaded libsodium build does not expose
+  `crypto_verify_32` at runtime. Proposed fix: use `S.memcmp` or a
+  constant-time compare on the two 32-byte arrays.
+
+**App bug C (medium, code-read, masked by B): two more restore defects.**
+- `candidateSalts` omits `kdf_version`, so candidate keys are derived with
+  v1 even for v3 backups; the HMAC check would then fail.
+- `candidateOpen()` does not call `unpadPlaintext()`, but the canary is
+  sealed with the padded `seal()`, so the canary check would throw
+  "wrong passphrase". Confidence medium-high (not executed past bug B).
+
+**Status:** test changes implemented and run locally. `test_browser.py`
+fails at the demo-bank connect step (bug A). `test_playwright_recovery.py`
+20/24: the 4 failures are the restore alerts (bug B) and the resulting
+console error. Not CI-green. A weak spot noted, not changed: phase 2's
+"every recovered transaction matches" passes because browser B shares
+browser A's vault, so it does not by itself prove the import worked; the
+"Restored N records" assertion does.
