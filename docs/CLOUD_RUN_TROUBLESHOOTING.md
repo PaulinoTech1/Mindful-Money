@@ -693,3 +693,43 @@ behavior.
 
 **Lesson:** a crypto fallback that changes key material is never a graceful
 degradation. Break loudly.
+
+## PR browser-test: Playwright `json=` TypeError, then stale first-load flow (2026-10-13)
+
+**Symptom:** on PR #8 the `browser-test` job failed with
+`TypeError: APIRequestContext.post() got an unexpected keyword argument 'json'`
+at `test_browser.py:145`. `verify` and CodeQL passed.
+
+**Evidence:** Playwright for Python's `APIRequestContext.post()` signature
+(checked against the installed 1.63.0) takes `data=`, `form=`, `multipart=`;
+there is no `json=` (that is the `requests` library's spelling). A dict
+passed as `data=` is serialized as JSON. The line came in with commit
+`28e3c9b` (2026-10-12). The workflow installed an unpinned `playwright`.
+
+**Unconfirmed:** whether this job failed before PR #8. The two earlier
+Dependabot PRs failed at `verify`, so their `browser-test` never ran.
+
+**Fix:** `json=` changed to `data=`; Playwright pinned to `1.63.0` in
+`requirements-dev.txt` and `pr-verify.yml`.
+
+**Second failure (open):** with the fix, the run gets past line 145
+(hostile-Origin check passes locally) and then times out at
+`page.fill("#pass", ...)`: `#pass` is never visible. Same result on an
+unmodified `main` checkout with only the `json=` fix applied, so it is not
+caused by PR #8. Cause: `28e3c9b` also made `static/app.js` show the passkey
+bootstrap gate whenever `bootstrap_needed` is true, and the test starts from a
+truncated database (no passkeys). Setting `VAULT_AUTH_POLICY=optional` for
+the test server was tried and rejected: the bootstrap branch runs before the
+policy check, so the passphrase gate stays hidden.
+
+**Proposed next fix (not done):** enroll a passkey in the test via a
+Chromium virtual authenticator (CDP `WebAuthn.enable` and
+`WebAuthn.addVirtualAuthenticator`) plus a test-only `VAULT_BOOTSTRAP_TOKEN`,
+then continue to the passphrase gate. `test_playwright_recovery.py` has the
+same first-load assumption.
+
+**Lesson:** pin test tooling, and run the browser suite on pushes to main
+too, so a frontend flow change cannot silently strand the E2E tests.
+
+**Status:** `json=` fix implemented and locally verified past line 145;
+browser suite still failing (pre-existing). Confidence high.

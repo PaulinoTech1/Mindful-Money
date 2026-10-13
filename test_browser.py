@@ -142,7 +142,7 @@ def main() -> int:
             csrf = page.evaluate("() => CSRF")
             hostile = page.request.post(f"{base}/api/records", headers={
                 "Origin": "http://localhost.evil", "X-CSRF-Token": csrf,
-            }, json={"records": []})
+            }, data={"records": []})
             check(hostile.status == 403, "unsafe request with hostile Origin is rejected")
             errors.clear()  # Chromium logs the deliberately rejected raw fetch as a resource error.
             page.screenshot(path=SHOTS / "1-unlock.png")
