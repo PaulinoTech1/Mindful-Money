@@ -2315,7 +2315,8 @@ def rekey_stage_records():
         if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind): return api_error("Invalid record", 400)
         if not isinstance(old, str) or not _LOWER_HEX_64.fullmatch(old): return api_error("Invalid record", 400)
         if blind in seen or old in seen_old: return api_error("Duplicate record in batch", 400)
-        if not isinstance(sealed, str) or not _LOWER_HEX.fullmatch(sealed) or len(sealed) % 2 or not MIN_SEALED_HEX_LENGTH <= len(sealed) <= MAX_SEALED_HEX_LENGTH:
+        # Length first, so the regex only ever runs on bounded input.
+        if not isinstance(sealed, str) or not MIN_SEALED_HEX_LENGTH <= len(sealed) <= MAX_SEALED_HEX_LENGTH or len(sealed) % 2 or not _LOWER_HEX.fullmatch(sealed):
             return api_error("Invalid record", 400)
         seen.add(blind); seen_old.add(old); validated.append((blind, old, sealed, len(sealed) // 2))
     conn = db()
@@ -2357,7 +2358,7 @@ def rekey_commit():
     if type(version) is not int or version not in KDF_VERSIONS: return api_error("Invalid kdf_version", 400)
     blob_hex = payload.get("recovery_blob")
     if blob_hex is not None:
-        if not isinstance(blob_hex, str) or not _LOWER_HEX.fullmatch(blob_hex) or len(blob_hex) % 2 or not 64 <= len(blob_hex) <= 2048:
+        if not isinstance(blob_hex, str) or not 64 <= len(blob_hex) <= 2048 or len(blob_hex) % 2 or not _LOWER_HEX.fullmatch(blob_hex):
             return api_error("Invalid recovery_blob", 400)
     conn = db()
     ident = models.VaultIdentity.__table__

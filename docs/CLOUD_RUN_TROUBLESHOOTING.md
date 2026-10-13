@@ -1194,9 +1194,17 @@ minted session as in phases 2-4.
   `upgrade head` reports index `ix_audit_events_identity_occurred` exists in
   the migrations but not in `models.py`. Unrelated to the new tables, which
   show no diff.
+- **Q (low, CI flake):** the first CI run of `6fde62b` failed `browser-test`
+  at the very first bootstrap with "Passkey ceremony could not be verified"
+  (before any changed code path); a rerun of the same commit passed, and it
+  passed 3 of 3 locally. Not investigated.
 - **P (low):** an unfinished rekey blocks normal writes for up to 15 minutes
   if the browser dies before it can call abort (documented trade-off in
   RECOVERY.md; a new begin or the TTL clears it).
+
+CodeQL flagged `py/polynomial-redos` on the two new hex checks; they now
+check the length bound before the regex (same pattern as before, bounded
+input).
 
 **Verification:** implemented and locally tested in a clean env; migration
 verified on a fresh database (`alembic current` = `heads` =
