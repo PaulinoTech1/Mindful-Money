@@ -614,3 +614,12 @@ probe), not just the table list. A table existing is not evidence that
 its columns match the models. Drift of this kind breaks selects while
 inserts keep passing, which makes the failure look like an application
 bug instead of a deployment gap.
+
+**Resolution:** Applied 2026-10-13. The 2026-10-12 upgrade had run
+from a stale local checkout (local head `5ece671`, whose newest
+migration was `9c1e4a7b2d10`), so it stopped five revisions short
+without erroring. After `git pull`, `alembic upgrade head` applied the
+five outstanding revisions in order, ending at `f1a2b3c4d5e6`.
+Verified from outside: `/health`, `/api/version`, and
+`/api/passkeys/status` all return 200 on the already-running
+revision; no redeploy was needed.
