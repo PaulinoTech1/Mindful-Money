@@ -1,8 +1,20 @@
 # Operations Runbook
 
-**Last updated:** 2026-10-11
+**Last updated:** 2026-10-13
 
 Quick reference for common operations.
+
+## Canonical hostname
+
+`https://mindful-money-k23ukkh5cq-uc.a.run.app` is the canonical URL. It is the
+only host that matches `VAULT_RP_ID` / `VAULT_ORIGIN` in
+`.github/workflows/deploy.yml`, so it is the only host where passkeys work.
+
+Cloud Run also serves the same service at
+`mindful-money-31393284277.us-central1.run.app`. That host reaches the same
+revision, but **it is not valid for passkeys** (WebAuthn binds to the RP ID)
+and must not be used for enrollment, login, or docs. Residual risks live in
+`docs/THREAT_MODEL.md`; this runbook links there rather than restating them.
 
 ## Deploy
 
@@ -43,19 +55,57 @@ the latest commit's manifest. This is expected. To verify a rollback:
 
 ## Database migrations
 
+**Rules (each one learned from an incident, see
+`docs/CLOUD_RUN_TROUBLESHOOTING.md`):**
+
+1. Run from a CURRENT checkout. The 2026-10-12 run used a stale checkout and
+   stopped five revisions short without erroring.
+2. Use the **UNPOOLED** Neon connection string. DDL cannot run through the
+   pooler. The `neon-db-url` secret (used by Cloud Run at runtime) is the
+   POOLED string, so do not export it for migrations.
+3. The driver prefix must be `postgresql+psycopg://`, exactly once. The image
+   ships psycopg 3 only.
+4. The URL is typed with `read -s`: never in shell history, never echoed.
+
+`migrations/env.py` refuses to run (with a message that never shows the
+value) if the URL is empty, has the wrong or a doubled prefix, or points at a
+`-pooler` host.
+
 ```bash
-# From Cloud Shell
-export PATH="$HOME/.local/bin:$PATH"
-export VAULT_DATABASE_URL=$(gcloud secrets versions access latest --secret=neon-db-url --project=project-c89a7f58-b865-4112-bf8)
+# Cloud Shell
 cd ~/Mindful-Money/Mindful-Money
+git pull --ff-only && git log --oneline -1   # confirm you are on current main
+export PATH="$HOME/.local/bin:$PATH"
+pip install --user alembic sqlalchemy "psycopg[binary]"
 
-# Check current version
-alembic current
+# Neon dashboard: Connection string with "Connection pooling" OFF
+# (host has no "-pooler"). Paste at the hidden prompt.
+read -rs NEON_UNPOOLED; echo
+case "$NEON_UNPOOLED" in
+  postgresql+psycopg://*) VAULT_DATABASE_URL="$NEON_UNPOOLED" ;;
+  postgresql://*)         VAULT_DATABASE_URL="postgresql+psycopg://${NEON_UNPOOLED#postgresql://}" ;;
+  postgres://*)           VAULT_DATABASE_URL="postgresql+psycopg://${NEON_UNPOOLED#postgres://}" ;;
+  *)                      echo "Unrecognized scheme, aborting"; VAULT_DATABASE_URL="" ;;
+esac
+export VAULT_DATABASE_URL; unset NEON_UNPOOLED
 
-# Apply pending migrations
+alembic heads          # expected head(s) from this checkout
+alembic current        # what the database is at
 alembic upgrade head
+alembic current        # MUST equal `alembic heads`
 
-# Roll back one migration (dangerous - backup first)
+unset VAULT_DATABASE_URL
+```
+
+Then verify columns, not just tables (see the 2026-10-13 schema-drift entry
+in `docs/CLOUD_RUN_TROUBLESHOOTING.md`), and check
+`curl -s -o /dev/null -w "%{http_code}" https://mindful-money-k23ukkh5cq-uc.a.run.app/ready`.
+
+Current state (2026-10-13): 8 revisions, head `f1a2b3c4d5e6`.
+
+```bash
+# Roll back one migration (dangerous: take a Neon branch/backup first,
+# see docs/BACKUP_RESTORE.md)
 alembic downgrade -1
 ```
 
@@ -83,9 +133,11 @@ gcloud run services update mindful-money \
   --region us-central1 \
   --project project-c89a7f58-b865-4112-bf8 \
   --min-instances 0 \
-  --max-instances 10
+  --max-instances 3
 
-# Current: min=0 (scale to zero), max=default (100)
+# Current: min=0 (scale to zero), max=3. Source of truth is the
+# `--max-instances 3` flag in .github/workflows/deploy.yml: every deploy
+# re-applies it, so a manual change here is overwritten on the next deploy.
 # For personal use, min=0 is fine (cold starts acceptable)
 ```
 

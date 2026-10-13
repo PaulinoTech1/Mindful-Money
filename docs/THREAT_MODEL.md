@@ -1,6 +1,6 @@
 # Threat Model
 
-**Date:** 2026-10-12
+**Date:** 2026-10-12 (risk register extended 2026-10-13)
 **Scope:** Mindful Money personal finance tracker (single-user, Cloud Run + Neon)
 **Method:** Adversarial review of code on main. Honesty is mandatory.
 
@@ -64,6 +64,11 @@ This is architectural, not a bug. The browser must trust the server to deliver c
 | SimpleFin credential theft | Medium (localStorage) | High (bank transaction access) | Server never sees URL; user responsible for device security | Bearer credential; anyone with the URL can fetch transactions |
 | Passkey phishing | Very low (WebAuthn) | Medium (account access, not plaintext) | WebAuthn origin binding | Cannot decrypt vault without passphrase |
 | Insider (developer) | Low (single operator) | Catastrophic (could ship malicious JS) | Git history, CI checks | **Same as origin compromise; must be accepted** |
+| KDF v3 silently falling back to v2 keys (split-brain vault) | Medium on memory-limited mobile browsers | High (records unreadable; new records sealed to a second key pair) | Fallback removed: v3 failure now throws `KDF_ALLOCATION_FAILED`, derives nothing (branch `hardening/2026-10-13`) | Implemented and unit-tested, not production-verified. Real-device v3 unlock still unverified. Detail: `docs/CLOUD_RUN_TROUBLESHOOTING.md` "KDF v3 silent fallback to v2" |
+| CSP `connect-src 'self' https:` | Low (needs XSS or origin compromise first) | High (any HTTPS host is a valid exfiltration endpoint, so CSP does not limit where stolen data goes) | Needed because the SimpleFin bridge URL is user-supplied; CSP still blocks script injection | **Open.** Narrowing to known SimpleFin hosts would help if the bridge host set is stable. Confidence high (read from `app.py` CSP). |
+| Bootstrap token exposure before first passkey | Low to medium while `bootstrap_needed` is true | High (whoever presents the token first enrolls the first passkey and owns the vault) | Token mandatory in production; constant-time compare; registration rate limit; refused once any passkey exists | **Open until enrollment.** RUNBOOK records the token was set with `--set-env-vars`, so it is a plain env var visible to anyone with Cloud Run viewer access, not a Secret Manager reference. Enroll on the canonical host, then remove the token. See `docs/BOOTSTRAP_TOKEN.md`. |
+| Per-request DB write in the rate limiter | Medium (any DB fault) | Medium (every `/api/*` returns 503 while `/health` stays 200) | Postgres-backed limiter is shared across instances (correct); `/ready` now in deploy smoke tests | **Accepted coupling.** `apply_rate_limit` upserts `rate_limits` before every `/api/*` request, so DB failure equals full API outage (this is how the 2026-10-12 seed bug spread). Fail-open would weaken auth rate limits; keep fail-closed but make it loud (see `docs/HARDENING_PROPOSALS.md`). Confidence high. |
+| ZKP verifier absent in production | Certain with the current image | Low (feature unavailable, not bypassed) | `zkp_verifier.artifacts_available()` gates the challenge endpoint, returning 503; "unavailable" is never treated as "accepted" | **Open.** The Dockerfile copies neither `bb` nor `zkp/` (also excluded by `.dockerignore`), so v3 binding proofs are not verified server-side in production. Startup logs `zkp_artifacts_available available="0"`. Confidence high (code read; not production-verified). |
 
 ## What the operator must accept
 

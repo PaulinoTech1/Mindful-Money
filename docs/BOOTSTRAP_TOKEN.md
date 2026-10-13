@@ -25,9 +25,13 @@ Do not commit it to git. Do not paste it in chat.
 
 ```bash
 # Create the secret (one-time)
-echo -n "YOUR_TOKEN_HERE" | gcloud secrets create mindful-money-bootstrap-token \
+# Hidden prompt: the token never enters shell history (see
+# docs/CLOUD_RUN_TROUBLESHOOTING.md "Secrets via Secret Manager").
+read -rs BOOTSTRAP_TOKEN; echo
+printf %s "$BOOTSTRAP_TOKEN" | gcloud secrets create mindful-money-bootstrap-token \
   --data-file=- \
   --project=project-c89a7f58-b865-4112-bf8
+unset BOOTSTRAP_TOKEN
 
 # Grant the Cloud Run service account access
 gcloud secrets add-iam-policy-binding mindful-money-bootstrap-token \
@@ -72,6 +76,15 @@ gcloud run services describe mindful-money \
   --project=project-c89a7f58-b865-4112-bf8 \
   --format="value(spec.template.spec.containers[0].env)"
 ```
+
+Warning: with the plain env var alternative, this command PRINTS the token.
+Run it only where the output is not logged or shared, or check presence
+instead: append `| grep -c VAULT_BOOTSTRAP_TOKEN`.
+
+Residual risk while the token is live: `docs/THREAT_MODEL.md` risk register,
+"Bootstrap token exposure before first passkey". After the first passkey is
+enrolled, remove the token (`--remove-env-vars=VAULT_BOOTSTRAP_TOKEN` or
+`--remove-secrets=VAULT_BOOTSTRAP_TOKEN`).
 
 ### 4. Bootstrap
 

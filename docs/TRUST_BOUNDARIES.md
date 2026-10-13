@@ -44,7 +44,7 @@ Mindful Money does not reduce the trust you place in SimpleFin or your bank. It 
 
 ## KDF and offline attack resistance
 
-New vaults use Argon2id with elevated parameters (see `docs/OFFLINE_ATTACK_COST.md` for current version table and cost estimates). Legacy vaults retain prior parameters until the user upgrades. A 60-bit minimum passphrase entropy floor is enforced for new vaults. Weak passphrases still dominate residual risk.
+New vaults use Argon2id with elevated parameters (v3; a v3 vault never falls back to weaker parameters, see `docs/THREAT_MODEL.md` risk register) (see `docs/OFFLINE_ATTACK_COST.md` for current version table and cost estimates). Legacy vaults retain prior parameters until the user upgrades. A 60-bit minimum passphrase entropy floor is enforced for new vaults. Weak passphrases still dominate residual risk.
 
 Sealed records are padded to fixed bucket sizes, closing the prior merchant-name length side-channel.
 
@@ -56,7 +56,7 @@ An optional recovery key (256-bit, 32-word mnemonic) encrypts the vault seed. Th
 
 A v3 circuit binds the validated plaintext to the stored ciphertext via a Poseidon2-based AEAD (ciphertext is a public circuit output). The prior v2 gap (proof of A, ciphertext of B) is closed for records that use the v3 path. v2 remains for backward compatibility. See `docs/ZKP_BINDING.md`.
 
-ZKP verification still requires the `bb` binary and verification key to be present; production images may omit them.
+ZKP verification requires the `bb` binary and verification key. The current production image omits both, so server-side ZKP verification is unavailable (fails closed with 503). Residual risk: `docs/THREAT_MODEL.md` risk register, "ZKP verifier absent in production".
 
 ## What "zero-knowledge" means here (and doesn't)
 
@@ -114,6 +114,8 @@ The app enforces a strict CSP:
 - `form-action 'self'`
 
 No `unsafe-inline` or `unsafe-eval`. All JavaScript is served from `/static/`.
+
+`connect-src` allows any `https:` host (for the SimpleFin bridge), so CSP does not restrict exfiltration destinations. Residual risk: `docs/THREAT_MODEL.md` risk register, "CSP `connect-src 'self' https:`".
 
 ## Frontend security
 

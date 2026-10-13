@@ -55,7 +55,7 @@ Users can independently verify the served JS:
 curl -s https://raw.githubusercontent.com/PaulinoTech1/Mindful-Money/main/static/integrity-manifest.json
 
 # Fetch served JS and compare hashes
-curl -s https://mindful-money-31393284277.us-central1.run.app/static/app.js | sha256sum
+curl -s https://mindful-money-k23ukkh5cq-uc.a.run.app/static/app.js | sha256sum
 ```
 
 If the hashes don't match, do not enter your passphrase.

@@ -75,7 +75,7 @@ a stale deployment, build corruption, or tampering.
 ## Manual verification
 
 ```bash
-BASE="https://mindful-money-31393284277.us-central1.run.app"
+BASE="https://mindful-money-k23ukkh5cq-uc.a.run.app"
 
 # Liveness
 curl -s $BASE/health | python3 -m json.tool

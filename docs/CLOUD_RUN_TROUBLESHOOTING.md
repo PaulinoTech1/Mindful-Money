@@ -267,16 +267,12 @@ python3 -m alembic upgrade head
 
 ## Running migrations from Cloud Shell
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-pip install alembic sqlalchemy "psycopg[binary]"
-export VAULT_DATABASE_URL=$(gcloud secrets versions access latest --secret=neon-db-url)
-cd ~/Mindful-Money/Mindful-Money
-alembic upgrade head
-```
-
-The secret value stays in the shell environment and is never printed
-or pasted into chat.
+**Superseded (2026-10-13).** The earlier procedure here exported the
+`neon-db-url` secret, which is the POOLED runtime string; DDL needs the
+UNPOOLED string (see the 2026-10-13 schema-drift entry below). The only
+supported procedure is `docs/RUNBOOK.md` "Database migrations" (current
+checkout, unpooled URL via `read -s`, single `postgresql+psycopg://` prefix,
+`alembic current` equals `alembic heads`).
 
 ## App returns 500: Could not parse SQLAlchemy URL
 
@@ -397,7 +393,9 @@ removed endpoint paths."
 
 **Working:**
 - Cloud Run service deployed and running
-- Database migrations completed (3 migrations applied)
+- Database migrations completed (3 migrations applied at the time; this
+  count is historical. As of 2026-10-13 there are 8 revisions, head
+  `f1a2b3c4d5e6`. See `docs/RUNBOOK.md` "Database migrations".)
 - Secrets in Secret Manager (Flask key, Neon URL)
 - WebAuthn RP_ID/ORIGIN configured for the Cloud Run URL
 - Docker build pipeline functional
@@ -623,3 +621,72 @@ five outstanding revisions in order, ending at `f1a2b3c4d5e6`.
 Verified from outside: `/health`, `/api/version`, and
 `/api/passkeys/status` all return 200 on the already-running
 revision; no redeploy was needed.
+
+## Two run.app hostnames; only one works for passkeys (2026-10-13)
+
+**Symptom:** Docs and the deploy smoke test used
+`mindful-money-31393284277.us-central1.run.app`, while the runbook, incident
+docs and `VAULT_RP_ID` / `VAULT_ORIGIN` used
+`mindful-money-k23ukkh5cq-uc.a.run.app`.
+
+**Evidence:** `deploy.yml` sets `VAULT_RP_ID=mindful-money-k23ukkh5cq-uc.a.run.app`;
+the smoke test `BASE_URL` pointed at the other host. Both hosts are Cloud
+Run URLs for the same service and serve the same revision
+(`docs/POST_MORTEM_STALE_DEPLOY.md` item 4).
+
+**Root cause:** Cloud Run issues a legacy hash URL and a newer
+project-number URL. Different docs were written from different consoles.
+
+**Fix:** `k23ukkh5cq-uc` is canonical everywhere (docs and smoke tests). The
+`31393284277` host is not valid for passkeys because WebAuthn binds the
+credential to the RP ID; a ceremony started there fails origin checks.
+
+**Lesson:** one hostname, defined next to `VAULT_RP_ID`, referenced everywhere.
+
+**Status:** implemented on branch `hardening/2026-10-13` (docs and smoke-test
+URL). Not production-verified. Confidence high.
+
+## KDF v3 silent fallback to v2 (2026-10-13)
+
+**Symptom:** none observed yet. Found by code review while the KDF v3 end to
+end check was still open.
+
+**Evidence:** `static/app.js` `deriveKeys()` caught any exception from the
+v3 Argon2id call (5 ops, 256MB) and retried with v2 parameters (3 ops,
+256MB), showing only a small note under the unlock box.
+
+**Root cause:** different Argon2id parameters produce different keys. For a
+vault whose stored `kdf_version` is 3, a v2 derivation cannot decrypt its
+records, and anything sealed in that session would be encrypted to a second
+key pair (a split-brain vault). The fallback was meant to avoid lockout on
+memory-limited mobile browsers, but it trades a loud failure for silent
+data inconsistency.
+
+**Fix:** `deriveKeys()` derives with exactly the stored version. On failure
+it throws `KDF_ALLOCATION_FAILED`, derives nothing, and the unlock gate
+shows a clear message (nothing decrypted or saved, try a desktop browser).
+v2 is used only for vaults whose stored version is 2. `kdf_version` values
+other than 1, 2, 3 are rejected.
+
+**Default-version reconciliation:** `getSalts()` used `|| 1` for
+`GET /api/kdf/salts` and `|| 3` for `POST /api/kdf/salts/generate`. Both are
+correct and stay: GET returns the stored NOT NULL column whose
+`server_default` is 1 (rows that predate KDF versioning are v1), and generate
+always writes and returns 3. They now go through the same validator.
+
+**Rejected hypothesis:** "the two defaults are inconsistent, unify on 3."
+Rejected because a v1 legacy row read with `|| 3` would derive the wrong keys,
+which is the same class of bug as the fallback.
+
+**Tests:** `tests/kdf_no_fallback.test.mjs` (node, stubbed libsodium):
+v3 allocation failure throws and never attempts v2 params; v3 success uses
+5 ops / 256MB; stored v2 still derives v2; unknown versions rejected. Wired
+into `pr-verify.yml`.
+
+**Status:** implemented, locally tested (node unit test). Not CI-verified,
+not production-verified. The real-device end to end check (v3 unlock on iOS
+Safari) is still open. Confidence high for the logic, medium for device
+behavior.
+
+**Lesson:** a crypto fallback that changes key material is never a graceful
+degradation. Break loudly.
