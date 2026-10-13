@@ -542,6 +542,9 @@ database `server_default` when using Core inserts (`pg_insert`,
 make this class of bug invisible in Cloud Logging; consider logging the
 exception before returning the generic error.
 
+**Update 2026-10-13:** the handler now logs a redacted `event="db_error"`
+line. Status and details: `docs/HARDENING_PROPOSALS.md` P1.
+
 **Diagnosis pattern:** reproduce the app's exact DB code path from Cloud
 Shell using the Secret Manager value directly (no paste):
 

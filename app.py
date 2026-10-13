@@ -197,8 +197,52 @@ def too_large(_error):
     return api_error("Request body is too large", 413)
 
 
+# Redaction for DB error logging. Patterns are applied in order to the
+# FIRST LINE of the driver error only. SQLAlchemy's str(error) appends
+# "[SQL: ...]" and "[parameters: ...]", so it is never logged.
+_REDACT_PATTERNS = [
+    (re.compile(r"[a-z][a-z0-9+.\-]*://\S+", re.I), "<url>"),
+    (re.compile(r"\b(password|passwd|pwd|user|host|hostaddr|dbname|sslpassword)\s*=\s*('[^']*'|\S+)", re.I), r"\1=<redacted>"),
+    (re.compile(r"\b[\w.+\-]+@[\w.\-]+(:\d+)?", re.I), "<user@host>"),
+    (re.compile(r"\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b"), "<ip>"),
+    (re.compile(r'\b(?:host|server|address)(?:\s+at)?\s+"?[\w.\-]+"?', re.I), "host <redacted>"),
+    # Any remaining dotted hostname (a.b.c or longer), quoted or not.
+    (re.compile(r"\b[a-z0-9\-_]+(?:\.[a-z0-9\-_]+){2,}\b", re.I), "<host>"),
+    (re.compile(r"\b(?:user|role)\s+\"[^\"]*\"", re.I), "user <redacted>"),
+    (re.compile(r"\[(?:SQL|parameters):.*", re.I | re.S), "<stmt>"),
+    (re.compile(r"\([^()]*\)=\([^()]*\)"), "(<key>)=(<redacted>)"),
+]
+
+
+def _redact_db_detail(error, limit=200):
+    """Class names, SQLSTATE, and a redacted first line. Never the URL,
+    statement, or bound parameters."""
+    orig = getattr(error, "orig", None)
+    source = orig if orig is not None else error
+    try:
+        raw = str(source)
+    except Exception:
+        raw = ""
+    first = (raw.strip().splitlines() or [""])[0]
+    for pattern, repl in _REDACT_PATTERNS:
+        first = pattern.sub(repl, first)
+    first = first.replace('"', "'")[:limit]
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None) or getattr(error, "code", None) or ""
+    return {
+        "cls": type(error).__name__,
+        "orig_cls": type(orig).__name__ if orig is not None else "",
+        "sqlstate": str(sqlstate)[:16],
+        "detail": first,
+    }
+
+
 @app.errorhandler(SQLAlchemyError)
-def database_error(_error):
+def database_error(error):
+    # Fail loudly to the operator, generically to the client.
+    # See docs/CLOUD_RUN_TROUBLESHOOTING.md "_seed_identity NotNullViolation".
+    info = _redact_db_detail(error)
+    LOG.error('event="db_error" class="%s" orig_class="%s" sqlstate="%s" path="%s" detail="%s"',
+              info["cls"], info["orig_cls"], info["sqlstate"], request.path, info["detail"])
     return api_error("The request could not be completed", 503)
 
 
@@ -1118,7 +1162,9 @@ def ready():
         conn.execute(text("SELECT 1"))
         return jsonify({"status": "ready", "database": "ok"})
     except Exception as e:
-        LOG.warning('event="readiness_failed" error="%s"', str(e)[:100])
+        info = _redact_db_detail(e, limit=100)
+        LOG.warning('event="readiness_failed" class="%s" orig_class="%s" sqlstate="%s" detail="%s"',
+                    info["cls"], info["orig_cls"], info["sqlstate"], info["detail"])
         return jsonify({"status": "not_ready", "database": "error"}), 503
 
 

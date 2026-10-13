@@ -1,12 +1,25 @@
 # Hardening Proposals (not implemented)
 
 **Date:** 2026-10-13
-**Status:** proposals only. Nothing in this file is implemented. Each item
+**Status:** proposals. P1 is implemented (see below); everything else is not. Each item
 needs the owner's go-ahead. Philosophy: the app does not need to be
 invincible; it needs to break on its own terms (loudly, predictably,
 documented).
 
 ## P1. Log the SQLAlchemyError 503 handler
+
+**Status (2026-10-13): implemented, locally tested.** Not CI-verified, not
+production-verified. Confidence high for redaction of the tested shapes
+(URL, user@host, password=/user=/host= pairs, IPs, dotted hostnames,
+quoted host/user names, `(key)=(value)` details, `[SQL: ...]` and
+`[parameters: ...]` tails); medium for driver messages of shapes not seen yet.
+Code: `app.py` `_redact_db_detail()`, `database_error()`, and `/ready`.
+Tests: `test_db_error_logging.py` (3 tests: `/api/*` 503 body and status
+unchanged and log redacted, `/ready` redacted, redactor unit). Full local
+suite: 144 passed (Python 3.13, Postgres 17; CI uses 3.12 and 16).
+Log line: `event="db_error" class=... orig_class=... sqlstate=... path=... detail=...`
+at ERROR, so `severity>=ERROR` in RUNBOOK "View logs" catches it.
+The original proposal follows for the record.
 
 **Symptom:** during the 2026-10-12 `_seed_identity` outage every `/api/*`
 call returned 503 and Cloud Logging showed nothing
