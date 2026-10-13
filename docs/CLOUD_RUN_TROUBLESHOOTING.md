@@ -1278,7 +1278,7 @@ from 900 s to 600 s; reasoning in
 while the commit lock is held, abort is scoped to the caller's identity).
 
 **New bug, NOT fixed:**
-- **R (low, drift):** migration `c4d9e3f2a1b6` gives
+- **R (low, drift) (RESOLVED, see [below](#fixed-bug-r-and-schema-drift-check-2026-10-13-later)):** migration `c4d9e3f2a1b6` gives
   `vault_identity.kdf_version` `server_default '1'`, the model only a
   client `default=1`. Invisible to default autogenerate; raw SQL inserts
   behave differently on migrated (Neon) and `create_all` (test) databases.
@@ -1296,3 +1296,29 @@ of the session row, which the app does not make; noted, not changed.
 
 **Labels:** implemented and locally tested in a clean env (high); CI: see
 PR #8; not production-verified. No migration this round.
+
+### Fixed: bug R and schema drift check (2026-10-13, later)
+
+Resolves [R](#fixed-bugs-f-q-n-o-and-p-2026-10-13-later).
+
+- **R:** the migration (what Neon production has) is the truth.
+  `models.py` now declares `kdf_version` with `server_default=text("1")`
+  next to the existing client `default=1`. No migration.
+- **Full drift scan:** fresh DB, `alembic upgrade head` (`current` =
+  `heads` = `a7b8c9d0e1f2`), autogenerate with `compare_type=True` and
+  `compare_server_default=True`: the only diff before the fix was R; after
+  it, none. No other drift found.
+- **Recurrence guard:** `migrations/env.py` turns on both compare options
+  (online and offline). New `scripts/check_schema_drift.py` fails on any
+  diff; it runs as "Schema drift check" in pr-verify `verify` and in the
+  deploy test job, on a fresh migrated database, after checking `alembic
+  current` equals `heads`. Checked locally: with the R fix reverted the
+  script exits 1 and prints the `modify_default` diff.
+- **Test:** `KdfVersionServerDefaultTest` inserts into `vault_identity`
+  with raw SQL and no `kdf_version` on the models-built test DB and expects
+  1.
+- **Rejected:** removing `server_default` from production via a migration
+  (changes production for no benefit).
+
+**Labels:** implemented and locally tested in a clean env (high); CI: see
+PR #8; not production-verified. No migration.

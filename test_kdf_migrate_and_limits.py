@@ -162,3 +162,16 @@ class UploadRateLimitTest(ServerCase):
         statuses = [self._post_one(i) for i in range(limit + 1)]
         self.assertEqual(statuses[:limit], [200] * limit)
         self.assertEqual(statuses[limit], 429)
+
+
+class KdfVersionServerDefaultTest(ServerCase):
+    """R: kdf_version defaults to 1 in the database itself, as the migration
+    (production) does, so raw SQL inserts behave the same on every DB."""
+
+    def test_raw_insert_without_kdf_version_gets_1(self):
+        from sqlalchemy import text as _text
+        with self._engine.begin() as conn:
+            conn.execute(_text("INSERT INTO vault_identity (id, user_handle, passkey_required) "
+                               "VALUES (77, 'r'::bytea, false)"))
+            v = conn.execute(_text("SELECT kdf_version FROM vault_identity WHERE id = 77")).scalar_one()
+        self.assertEqual(v, 1)

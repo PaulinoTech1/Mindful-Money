@@ -27,6 +27,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -52,7 +53,8 @@ class VaultIdentity(Base):
     kdf_salt_idx: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     # KDF version for future algorithm upgrades. Version 1 = Argon2id with
     # OPSLIMIT_INTERACTIVE, MEMLIMIT_INTERACTIVE (current).
-    kdf_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # server_default matches migration c4d9e3f2a1b6 (production truth, bug R).
+    kdf_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     # Encrypted recovery blob: vault seed encrypted with the recovery key.
     # The server never sees the recovery key. Null if recovery not set up.
     recovery_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
