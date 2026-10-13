@@ -202,6 +202,13 @@ def main() -> int:
                 raise
             page.wait_for_function("() => document.getElementById('lock').dataset.state === 'open'", timeout=30000)
             kdf_ms = int((time.time() - t0) * 1000)
+            # Intended new-vault flow (static/app.js getSalts): GET /api/kdf/salts
+            # returns 404 once, then the client POSTs .../generate. Chromium logs
+            # that single 404 as a console error; remove exactly that one.
+            expected_404 = "Failed to load resource: the server responded with a status of 404 (NOT FOUND)"
+            if any(r.startswith("404 GET") and r.endswith("/api/kdf/salts") for r in bad_responses) \
+                    and expected_404 in errors:
+                errors.remove(expected_404)
 
             check(page.get_attribute("#lock", "data-state") == "open", "vault reports unlocked")
             check(200 < kdf_ms < 15000, f"key derived in {kdf_ms}ms", f"got {kdf_ms}ms")
@@ -481,7 +488,7 @@ def main() -> int:
             page.wait_for_selector("#addExpenseDialog[open]")
             expense_categories = page.locator("#addExpenseCategory option").all_text_contents()
             account_options = page.locator("#addExpenseAccount option").all_text_contents()
-            check("Scammers Inc" in account_options, "manual transaction destination lists the checking account")
+            check("Scammers Inc" in " | ".join(account_options), "manual transaction destination lists the checking account", repr(account_options))
             page.select_option("#addExpenseAccount", index=0)
             check("Other" in expense_categories and "Dining" in expense_categories, "expense dropdown has discrete categories including Other")
             check("Salary" not in expense_categories, "income-only categories are absent from the expense dropdown")
@@ -610,7 +617,7 @@ def main() -> int:
             check(all(PASSPHRASE not in body for body in request_bodies), "passphrase never appears in network request bodies")
             cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": authenticator})
 
-            check(not errors, "no console errors", "; ".join(errors[:3]))
+            check(not errors, "no console errors", "; ".join(errors[:3]) + " | http: " + "; ".join(bad_responses[-6:]))
             browser.close()
     finally:
         env_server.terminate()

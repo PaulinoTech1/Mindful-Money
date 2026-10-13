@@ -224,8 +224,6 @@ def import_backup(page, passphrase: str) -> list:
     page.on("dialog", on_dialog)
     try:
         page.set_input_files("#importFile", str(BACKUP_PATH))
-        page.wait_for_function(
-            "() => true", timeout=1000)  # let the change handler start
         deadline = time.time() + 90
         while time.time() < deadline and not any(
                 t == "alert" for t, _ in seen):
@@ -377,6 +375,8 @@ def main() -> int:
             check(page_b.get_attribute("#lock", "data-state") == "open",
                   "browser B unlocked with the same passphrase")
 
+            check(page_b.evaluate("() => typeof S.memcmp === 'function'"),
+                  "bundled libsodium exposes constant-time memcmp (used by restore)")
             dialogs_b = import_backup(page_b, PASSPHRASE)
             check(dialogs_b[:1] and dialogs_b[0][0] == "prompt",
                   "import asks for the vault passphrase (gate cleared #pass)", repr(dialogs_b))
