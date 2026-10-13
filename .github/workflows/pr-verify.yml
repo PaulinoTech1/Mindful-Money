@@ -61,6 +61,9 @@ jobs:
                   time.sleep(1)
           "
 
+      - name: KDF no-fallback unit test (JS)
+        run: node tests/kdf_no_fallback.test.mjs
+
       - name: Run full test suite
         run: |
           python -m pytest test_demo.py test_zkp_server.py -v --tb=short --no-header -rA

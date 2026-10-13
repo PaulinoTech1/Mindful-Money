@@ -79,7 +79,10 @@ async function getSalts() {
     CACHED_SALTS = {
       enc: Uint8Array.from(data.salt_enc.match(/../g).map(h => parseInt(h, 16))),
       idx: Uint8Array.from(data.salt_idx.match(/../g).map(h => parseInt(h, 16))),
-      kdf_version: data.kdf_version || 1,
+      // Server returns the stored NOT NULL column (server_default 1 for
+      // rows that predate KDF versioning), so a missing value can only mean
+      // a legacy vault. The default must match the DB default: 1.
+      kdf_version: checkKdfVersion(data.kdf_version || 1),
     };
     return CACHED_SALTS;
   } catch (e) {
@@ -90,7 +93,9 @@ async function getSalts() {
       CACHED_SALTS = {
         enc: Uint8Array.from(data.salt_enc.match(/../g).map(h => parseInt(h, 16))),
         idx: Uint8Array.from(data.salt_idx.match(/../g).map(h => parseInt(h, 16))),
-        kdf_version: data.kdf_version || 3,
+        // POST /api/kdf/salts/generate always writes and returns 3 for a
+        // brand new vault, so 3 is the only correct default here.
+        kdf_version: checkKdfVersion(data.kdf_version || 3),
         isNewVault: true,
       };
       return CACHED_SALTS;
@@ -384,7 +389,15 @@ async function submitManualTransaction(event) {
 // v3 uses 256MB (not 512MB) because iOS Safari's Jetsam killer terminates
 // tabs that allocate large WASM heaps with zero warning. 256MB is the
 // practical iOS ceiling; 5 ops still gives 1.67x the work per guess over v2.
-// If allocation fails anyway, deriveKeys falls back to v2 (see below).
+// If allocation fails anyway, deriveKeys throws KDF_ALLOCATION_FAILED.
+// It never falls back to another version (see deriveKeys).
+function checkKdfVersion(v) {
+  if (v !== 1 && v !== 2 && v !== 3) {
+    throw new Error('Unsupported KDF version from server: ' + v);
+  }
+  return v;
+}
+
 function kdfParams(version) {
   if (version >= 3) {
     return {
@@ -458,13 +471,15 @@ async function deriveKeys(passphrase, kdfVersion) {
   const saltEnc = salts.enc;
   const saltIdx = salts.idx;
 
-  // Try the requested KDF version. If v3 fails (e.g., mobile browser
-  // cannot allocate the memory), fall back to v2 automatically rather than
-  // bricking the unlock. The fallback is logged and surfaced to the user.
-  let ops = params.ops;
-  let mem = params.mem;
-  let usedVersion = params.version;
-  let fellBack = false;
+  // Derive with exactly the stored KDF version. There is NO fallback:
+  // deriving a v3 vault with v2 parameters yields different keys, so
+  // existing records would not decrypt and anything sealed afterwards
+  // would be split across two key sets. If the device cannot allocate
+  // the v3 memory, fail loudly and derive nothing.
+  // See docs/CLOUD_RUN_TROUBLESHOOTING.md "KDF v3 silent fallback to v2".
+  const ops = params.ops;
+  const mem = params.mem;
+  const usedVersion = params.version;
 
   const tryDerive = (o, m) => {
     const seed = S.crypto_pwhash(32, passphrase, saltEnc, o, m, A);
@@ -477,20 +492,13 @@ async function deriveKeys(passphrase, kdfVersion) {
   try {
     result = tryDerive(ops, mem);
   } catch (e) {
-    if (params.version >= 3) {
-      console.warn('v3 KDF failed, falling back to v2:', e.message);
-      const fallback = kdfParams(2);
-      result = tryDerive(fallback.ops, fallback.mem);
-      usedVersion = 2;
-      fellBack = true;
-    } else {
-      throw e;
-    }
-  }
-
-  if (fellBack && typeof $('gateNote') !== 'undefined' && $('gateNote')) {
-    $('gateNote').textContent = 'Note: used lighter key derivation (device memory limit). ' +
-      'Consider a desktop browser for maximum security.';
+    console.error('KDF v' + usedVersion + ' derivation failed:', e && e.message);
+    const err = new Error(
+      'This device could not allocate the memory needed to unlock this vault ' +
+      '(key derivation v' + usedVersion + ', ' + Math.round(mem / 1048576) + ' MB). ' +
+      'Nothing was decrypted or saved. Try a desktop browser or close other tabs.');
+    err.code = 'KDF_ALLOCATION_FAILED';
+    throw err;
   }
 
   return {
@@ -499,7 +507,6 @@ async function deriveKeys(passphrase, kdfVersion) {
     indexKey: result.indexKey,
     kdfVersion: usedVersion,
     seed: result.seed,
-    kdfFallback: fellBack,
   };
 }
 
@@ -821,7 +828,9 @@ async function unlock() {
   } catch (_error) {
     KEYS = null; TXNS = [];
     $('unlockBtn').disabled = false;
-    $('gateNote').textContent = 'Incorrect vault passphrase or the records could not be decrypted.';
+    $('gateNote').textContent = (_error && _error.code === 'KDF_ALLOCATION_FAILED')
+      ? _error.message
+      : 'Incorrect vault passphrase or the records could not be decrypted.';
     return;
   }
 
