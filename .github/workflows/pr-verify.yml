@@ -45,7 +45,7 @@ jobs:
 
       - name: Security audit production dependencies
         run: |
-          pip-audit --desc -r requirements.txt
+          pip-audit --desc --require-hashes --disable-pip -r requirements-hashed.txt
 
       - name: Wait for PostgreSQL
         run: |

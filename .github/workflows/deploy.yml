@@ -11,6 +11,7 @@ on:
       - 'static/**'
       - 'migrations/**'
       - 'requirements.txt'
+      - 'requirements-hashed.txt'
       - 'Dockerfile'
   workflow_dispatch:
 
@@ -57,9 +58,11 @@ jobs:
       - name: Security audit production dependencies
         run: |
           echo "=== Auditing production dependencies (blocks on vulnerabilities) ==="
-          # Only production deps are audited here. pytest and other dev tools
-          # are in requirements-dev.txt and do not ship to Cloud Run.
-          pip-audit --desc -r requirements.txt 2>&1
+          # Audit the exact pinned, hash-locked set the Dockerfile installs.
+          # --disable-pip: the file is fully pinned with hashes, so no resolver
+          # or throwaway venv is needed. pytest and other dev tools are in
+          # requirements-dev.txt and do not ship to Cloud Run.
+          pip-audit --desc --require-hashes --disable-pip -r requirements-hashed.txt 2>&1
           echo "=== Production dependency audit passed ==="
 
       - name: Security audit dev dependencies (informational)
@@ -213,6 +216,14 @@ jobs:
             exit 1
           fi
           echo "Health check passed"
+
+          echo "=== Checking /ready (database reachable) ==="
+          READY_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/ready")
+          if [ "$READY_CODE" != "200" ]; then
+            echo "FAILED: /ready returned $READY_CODE (database unreachable from the new revision)"
+            exit 1
+          fi
+          echo "Readiness check passed"
           
           echo "=== Checking /api/version ==="
           VERSION=$(curl -s "$BASE_URL/api/version")
