@@ -96,7 +96,7 @@ Steps (all crypto in the browser):
    records a snapshot of the live record set (count and a SHA-256 over
    blind indexes and ciphertext hashes) and returns a `rekey_id`. A newer
    begin replaces an unfinished one. While a rekey is active (TTL
-   `VAULT_REKEY_TTL_SECONDS`, default 900 s), normal record writes and
+   `VAULT_REKEY_TTL_SECONDS`, default 600 s), normal record writes and
    delete-all return 409.
 3. Fetch every record (paginated), decrypt with the old keypair, generate
    two fresh random 16-byte salts in the browser, derive the new keys with
@@ -138,9 +138,20 @@ Decisions:
 - **Crash safety.** Nothing live changes before commit. If the browser dies
   mid-rekey, the old vault (records, salts, recovery blob) is intact and
   unlocks with the old passphrase, or can be recovered again with the
-  recovery key. Writes stay blocked until the rekey expires (15 minutes) or
-  a new begin replaces it; on any client error the browser calls
-  `/api/vault/rekey/abort` to unblock at once.
+  recovery key. On any client error the browser calls
+  `/api/vault/rekey/abort` at once. If it could not (tab closed, crash),
+  the next unlock in any tab of the vault aborts it; otherwise writes stay
+  blocked until the TTL (10 minutes) or a new begin. Abort takes the
+  identity row lock FOR UPDATE like commit, so it waits for a commit in
+  progress and can never interleave with one.
+- **TTL 600 s.** It must cover a slow rekey: KDF v3 (256 MB) on a phone
+  takes up to about 30 s, re-sealing a 20 MB decade of records a few
+  seconds, and uploading 20 MB on a 1 Mbit/s mobile uplink about 160 s,
+  so about 200 s worst case; 600 s keeps a 3x margin. A shorter TTL would
+  turn a slow but healthy recovery into a 404 at commit (safe, but the user
+  must start over). Trade-off: unlocking in a second tab while a recovery
+  is running in another aborts that recovery; its commit then returns 404
+  and the vault is unchanged.
 - **Rate limits.** begin/commit/abort: 10 per hour; blob fetch and delete:
   20 per hour; staging chunks count against the normal upload limit
   (60 per minute; README "Ciphertext and resource limits").

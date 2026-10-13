@@ -923,7 +923,7 @@ the intended new-vault `GET /api/kdf/salts` then generate flow.
   roughly 4091 to 8187 bytes of JSON cannot be uploaded. Proposed fix: raise
   the limit to 16480 or cap the client at the 4096 bucket. Confidence high
   (arithmetic; not exercised by a test).
-- **F (low):** on a fresh vault the "Create passkey" button also fires the
+- **F (low) (RESOLVED, see [below](#fixed-bugs-f-q-n-o-and-p-2026-10-13-later)):** on a fresh vault the "Create passkey" button also fires the
   login request (409 in the console). Reported earlier.
 
 ### Fixed: bugs D and E (2026-10-13, later)
@@ -1186,15 +1186,15 @@ passphrase leave the browser. The WebAuthn ceremony itself is bypassed by a
 minted session as in phases 2-4.
 
 **New issues found, NOT fixed:**
-- **N (medium):** `load()` sorts by `date` with `localeCompare`; a record
+- **N (medium) (RESOLVED, see [below](#fixed-bugs-f-q-n-o-and-p-2026-10-13-later)):** `load()` sorts by `date` with `localeCompare`; a record
   without a `date` throws, and `unlock()` reports it as "Incorrect vault
   passphrase", so a valid passphrase looks wrong. Found because phase 4's
   ~8 KB test record had no date (the test now gives it one).
-- **O (low, pre-existing drift):** `alembic` autogenerate against a fresh
+- **O (low, pre-existing drift) (RESOLVED, see [below](#fixed-bugs-f-q-n-o-and-p-2026-10-13-later)):** `alembic` autogenerate against a fresh
   `upgrade head` reports index `ix_audit_events_identity_occurred` exists in
   the migrations but not in `models.py`. Unrelated to the new tables, which
   show no diff.
-- **Q (medium, CI):** `browser-test` failed at the very first bootstrap with
+- **Q (medium, CI) (RESOLVED, see [below](#fixed-bugs-f-q-n-o-and-p-2026-10-13-later)):** `browser-test` failed at the very first bootstrap with
   "Passkey ceremony could not be verified" on 2 of 3 CI runs of this
   change (a rerun of `6fde62b` passed; 3 of 3 local runs passed). Likely
   cause: bug F. In bootstrap mode the button has both `loginPasskey`
@@ -1202,7 +1202,7 @@ minted session as in phases 2-4.
   requests race, and the login request's session save can overwrite the
   bootstrap `active_ceremony_id`, so `_take_challenge` finds none. Not fixed
   (F was left unfixed by decision); one-line fix proposed in the PR report.
-- **P (low):** an unfinished rekey blocks normal writes for up to 15 minutes
+- **P (low) (RESOLVED, see [below](#fixed-bugs-f-q-n-o-and-p-2026-10-13-later)):** an unfinished rekey blocks normal writes for up to 15 minutes
   if the browser dies before it can call abort (documented trade-off in
   RECOVERY.md; a new begin or the TTL clears it).
 
@@ -1216,3 +1216,72 @@ verified on a fresh database (`alembic current` = `heads` =
 `a7b8c9d0e1f2`, downgrade and re-upgrade clean, columns and constraints
 match the models). CI: see PR #8. Not production-verified (needs
 `alembic upgrade head` on Neon at deploy). Confidence high.
+
+### Fixed: bugs F, Q, N, O and P (2026-10-13, later)
+
+Resolves [F](#fixed-bugs-a-b-c-2026-10-13-later) and
+[N, O, P, Q](#fixed-bugs-l-m-and-k-recovery-works-end-to-end-2026-10-13-later).
+
+**F and Q (CI bootstrap flake).** Root cause confirmed in code: the gate
+button had `loginPasskey` (addEventListener) and, in bootstrap mode, also
+`bootstrapPasskey` (onclick), so one click sent both option requests. The
+server stores sessions in Postgres and `save_session` upserted every
+column, so the login request (which only read the session) wrote back the
+`active_ceremony_id` it had loaded and could erase the bootstrap ceremony
+started in between; bootstrap verify then failed with "Passkey ceremony
+could not be verified".
+- Client: one click handler that dispatches on `BOOTSTRAP_NEEDED`; the
+  `onclick` assignment is gone, so a second listener cannot recur.
+- Server (no schema change): the session remembers the ceremony id it
+  loaded; the upsert writes `active_ceremony_id` only when this request
+  changed it (started or consumed a ceremony), otherwise it keeps the
+  stored value. Tests: `CeremonyClobberTest` in `test_recovery_rekey.py`
+  (fails with the hardening reverted); `test_browser.py` now asserts the
+  Create passkey click sends exactly one ceremony request
+  (`bootstrap/options`) and no longer whitelists the 409.
+- Rejected: per-type ceremony ids in the session (needs a schema change for
+  the same protection; the race is in the write-back, not the key);
+  row-level locking of the session per request (serializes every request
+  of a tab).
+- Remaining limit: two requests that BOTH start ceremonies still race, last
+  writer wins; the client no longer does this.
+
+**N (undated or malformed record).** `normalizeRecords()` skips records
+without a valid `id`, `YYYY-MM-DD` date, finite `amount` or string
+`merchant`, coerces optional fields, sorts without a throwing comparator,
+and shows "N records could not be shown ... kept unchanged in your vault"
+in `#recordWarning`. Skipped records stay on the server untouched. `load()`
+tags decryption failures `DECRYPT_FAILED`; only those read "Incorrect vault
+passphrase"; any other error after key derivation reads "The vault could
+not be displayed (this is not a passphrase problem): ...". Tests:
+`tests/record_shape.test.mjs` (new, in pr-verify) and a `test_browser.py`
+step that stores an undated record, relocks and unlocks. Rejected: an
+"undated" bucket (every date based view, chart and month filter would need
+a special case; skipping with a count is visible and cannot crash a view).
+
+**O (index drift).** The model is wrong, not the migration: the
+`(identity_id, occurred_at)` index serves the login lockout count, the
+security dashboard windows and the audit log listing (all filter by
+identity and range or order by `occurred_at`). Declared in
+`AuditEvent.__table_args__`; no migration. Fresh DB: `alembic current` =
+`heads` = `a7b8c9d0e1f2`, index present, autogenerate diff with default
+options is empty. With `compare_server_default=True` one more drift shows
+(new bug R below).
+
+**P (crashed rekey blocks writes).** Unlock now calls
+`/api/vault/rekey/abort` best effort before loading; abort takes the
+identity row FOR UPDATE, the same lock commit holds, so it waits for an
+in-progress commit and then finds nothing to delete. Default TTL lowered
+from 900 s to 600 s; reasoning in
+[RECOVERY.md](RECOVERY.md#re-encryption-rekey). Tests:
+`StaleRekeyAbortTest` (TTL, abort after commit is a no-op, abort blocks
+while the commit lock is held, abort is scoped to the caller's identity).
+
+**New bug, NOT fixed:**
+- **R (low, drift):** migration `c4d9e3f2a1b6` gives
+  `vault_identity.kdf_version` `server_default '1'`, the model only a
+  client `default=1`. Invisible to default autogenerate; raw SQL inserts
+  behave differently on migrated (Neon) and `create_all` (test) databases.
+
+**Labels:** implemented and locally tested in a clean env (high); CI: see
+PR #8; not production-verified. No migration this round.

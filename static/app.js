@@ -974,14 +974,27 @@ async function unlock() {
     // removing the DOM value eliminates the most accessible copy.
     $('pass').value = '';
     updatePassphraseEntropy();
+    // Bug P: a rekey left behind by a crashed or closed recovery blocks
+    // record writes until its TTL. Unlocking proves the user is back with
+    // working keys, so discard it now (best effort; the live vault was never
+    // touched, and the server serializes abort against an in-progress commit).
+    await api('/api/vault/rekey/abort', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    }).catch(() => {});
     await load(true);
     await api('/api/vault/unlocked', { method: 'POST' });
   } catch (_error) {
     KEYS = null; TXNS = [];
     $('unlockBtn').disabled = false;
-    $('gateNote').textContent = (_error && _error.code === 'KDF_ALLOCATION_FAILED')
-      ? _error.message
-      : 'Incorrect vault passphrase or the records could not be decrypted.';
+    const code = _error && _error.code;
+    if (code === 'KDF_ALLOCATION_FAILED') $('gateNote').textContent = _error.message;
+    else if (code === 'DECRYPT_FAILED') $('gateNote').textContent = 'Incorrect vault passphrase or the records could not be decrypted.';
+    else {
+      // Bug N: a data-shape, network or render error is not a passphrase problem.
+      $('gateNote').textContent = 'The vault could not be displayed (this is not a passphrase problem): '
+        + ((_error && _error.message) || 'Unknown error');
+      console.error('Unlock failed after key derivation:', _error);
+    }
     return;
   }
 
@@ -1024,6 +1037,36 @@ async function fetchAllRecords() {
   return allRecords;
 }
 
+// Validate decrypted record shape (bug N). Records that every view depends on
+// (date, amount, merchant, id) and cannot be shown sensibly are skipped and
+// counted, never thrown on; optional fields are coerced to safe defaults.
+// Pure function: exercised directly by tests/record_shape.test.mjs.
+function normalizeRecords(decrypted) {
+  const valid = [];
+  let skipped = 0;
+  for (const t of decrypted) {
+    if (!t || typeof t !== 'object' || Array.isArray(t)
+        || typeof t.id !== 'string' || !t.id
+        || typeof t.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(t.date)
+        || typeof t.amount !== 'number' || !Number.isFinite(t.amount)
+        || typeof t.merchant !== 'string') {
+      skipped += 1;
+      continue;
+    }
+    valid.push({
+      ...t,
+      category: typeof t.category === 'string' ? t.category : '',
+      notes: typeof t.notes === 'string' ? t.notes : '',
+      tags: Array.isArray(t.tags) ? t.tags : [],
+      splits: Array.isArray(t.splits) ? t.splits : [],
+      is_transfer: Boolean(t.is_transfer), excluded: Boolean(t.excluded),
+      fraud_status: ['safe', 'fraud'].includes(t.fraud_status) ? t.fraud_status : '',
+    });
+  }
+  valid.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return { valid, skipped };
+}
+
 async function load(duringUnlock = false) {
   const records = await fetchAllRecords();
 
@@ -1031,7 +1074,17 @@ async function load(duringUnlock = false) {
 
   // Decrypt everything locally. ~20MB for a decade of history, so the whole
   // corpus lives in memory and every aggregate is computed here.
-  let decrypted = records.map((r) => open(r.sealed));
+  // A failure here means the keys are wrong (or a record is corrupt); unlock()
+  // reports it as a passphrase problem. Anything after this point is a data
+  // or rendering problem and must NOT be reported as a wrong passphrase (bug N).
+  let decrypted;
+  try {
+    decrypted = records.map((r) => open(r.sealed));
+  } catch (e) {
+    const err = new Error('Decryption failed');
+    err.code = 'DECRYPT_FAILED';
+    throw err;
+  }
 
   // Records written by older versions do not contain encrypted institution
   // metadata. This migration path was removed with the server-side relay.
@@ -1039,15 +1092,14 @@ async function load(duringUnlock = false) {
   // or demo data flow, which now generates metadata directly.
   // (Previously: fetched from /api/relay, which no longer exists.)
 
-  TXNS = decrypted.map((t) => ({
-    ...t, category: t.category || categorize(t.merchant),
-    notes: typeof t.notes === 'string' ? t.notes : '',
-    tags: Array.isArray(t.tags) ? t.tags : [],
-    splits: Array.isArray(t.splits) ? t.splits : [],
-    is_transfer: Boolean(t.is_transfer), excluded: Boolean(t.excluded),
-    fraud_status: ['safe', 'fraud'].includes(t.fraud_status) ? t.fraud_status : '',
-  }))
-                  .sort((a, b) => a.date.localeCompare(b.date));
+  const { valid, skipped } = normalizeRecords(decrypted);
+  TXNS = valid.map((t) => ({ ...t, category: t.category || categorize(t.merchant) }));
+  const warn = $('recordWarning');
+  if (warn) {
+    warn.hidden = skipped === 0;
+    warn.textContent = skipped === 0 ? '' : `${skipped} record${skipped === 1 ? '' : 's'} could not be shown `
+      + '(missing or malformed date, amount, merchant or id). They are kept unchanged in your vault.';
+  }
 
   $('statRecords').textContent = TXNS.length;
   renderAccounts();
@@ -2603,7 +2655,9 @@ async function refreshRecoveryState() {
   $('importBtn').addEventListener('click', () => $('importFile').click());
   $('importFile').addEventListener('change', importBackup);
   $('resetPassphraseBtn').addEventListener('click', resetPassphrase);
-  $('passkeyLoginBtn').addEventListener('click', loginPasskey);
+  // One handler that dispatches by mode (bug F): in bootstrap mode the same
+  // button used to fire both the login and the bootstrap ceremony.
+  $('passkeyLoginBtn').addEventListener('click', () => (BOOTSTRAP_NEEDED ? bootstrapPasskey() : loginPasskey()));
   $('enablePasskeyBtn').addEventListener('click', registerPasskey);
   $('addPasskeyBtn').addEventListener('click', registerPasskey);
   $('lockVaultBtn').addEventListener('click', lockVault);
@@ -2656,12 +2710,8 @@ async function refreshRecoveryState() {
     $('gate').hidden = true; $('passkeyGate').hidden = false;
     $('passkeyGate').querySelector('h1').textContent = 'Set up your passkey';
     $('passkeyGateNote').textContent = 'This is a new vault. Create a passkey to secure it.';
-    // Replace login button with bootstrap button
-    const loginBtn = $('passkeyLoginBtn');
-    if (loginBtn) {
-      loginBtn.textContent = 'Create passkey';
-      loginBtn.onclick = bootstrapPasskey;
-    }
+    // Same button; its single click handler dispatches on BOOTSTRAP_NEEDED.
+    $('passkeyLoginBtn').textContent = 'Create passkey';
   }
   else if (PASSKEY_REQUIRED && !PASSKEY_AUTHENTICATED) { $('gate').hidden = true; $('passkeyGate').hidden = false; }
   else $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';

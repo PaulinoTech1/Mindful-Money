@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 
 from sqlalchemy import (
+    Index,
     BigInteger,
     Boolean,
     Date,
@@ -260,6 +261,12 @@ class AuditEvent(Base):
     acknowledged_by: Mapped[int | None] = mapped_column(
         ForeignKey("vault_identity.id", ondelete="SET NULL")
     )
+
+    # Created by migration e1f2a3b4c5d6; declared here so autogenerate sees no
+    # drift (bug O). Serves the per-identity time-range queries: login lockout
+    # (identity + occurred_at >= now - 15 min), the security dashboard counts
+    # and the audit log listing (identity ORDER BY occurred_at DESC).
+    __table_args__ = (Index("ix_audit_events_identity_occurred", "identity_id", "occurred_at"),)
 
 
 class VaultRekey(Base):

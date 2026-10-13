@@ -652,6 +652,9 @@ class ServerSession(dict, SessionMixin):
     def __init__(self, initial=None, sid=None, new=False):
         super().__init__(initial or {})
         self.sid, self.new, self.modified = sid, new, False
+        # Ceremony id as loaded, so save_session can tell whether THIS request
+        # changed it (bug F: a concurrent request must not clobber it).
+        self.loaded_ceremony_id = self.get("active_ceremony_id")
 
 
 def _sid_hash(sid: str) -> str:
@@ -704,12 +707,18 @@ class SQLAlchemySessionInterface(SessionInterface):
                 vault_unlocked=bool(sess.get("vault_unlocked")), active_ceremony_id=sess.get("active_ceremony_id"),
                 created_at=created, last_seen_at=now, expires_at=expires, revoked_at=None,
             )
+            # Only a request that started or consumed a ceremony writes
+            # active_ceremony_id; any other request keeps the stored value, so
+            # an overlapping request on the same session (e.g. a stray login
+            # options call during bootstrap) cannot erase a live ceremony.
+            ceremony_changed = getattr(sess, "loaded_ceremony_id", None) != sess.get("active_ceremony_id")
             stmt = stmt.on_conflict_do_update(
                 index_elements=["session_id_hash"],
                 set_=dict(
                     csrf_token=stmt.excluded.csrf_token, identity_id=stmt.excluded.identity_id,
                     authenticated_at=stmt.excluded.authenticated_at, vault_unlocked=stmt.excluded.vault_unlocked,
-                    active_ceremony_id=stmt.excluded.active_ceremony_id, last_seen_at=stmt.excluded.last_seen_at,
+                    active_ceremony_id=stmt.excluded.active_ceremony_id if ceremony_changed else table.c.active_ceremony_id,
+                    last_seen_at=stmt.excluded.last_seen_at,
                     expires_at=stmt.excluded.expires_at, revoked_at=stmt.excluded.revoked_at,
                 ),
             )
@@ -1218,7 +1227,7 @@ def logout():
     LOG.info('event="session_revoked" client="%s"', _client_log_id())
     return jsonify({"signed_out": True})
 
-REKEY_TTL_SECONDS = int(os.environ.get("VAULT_REKEY_TTL_SECONDS", "900"))
+REKEY_TTL_SECONDS = int(os.environ.get("VAULT_REKEY_TTL_SECONDS", "600"))
 
 
 def _vault_write_guard(conn, owner_id):
@@ -2427,7 +2436,13 @@ def rekey_abort():
     if payload: return api_error("Body must be empty", 400)
     rekeys = models.VaultRekey.__table__
     conn = db()
-    gone = conn.execute(delete(rekeys).where(rekeys.c.identity_id == current_identity_id())).rowcount
+    owner_id = current_identity_id()
+    # Same lock as commit (FOR UPDATE): an abort waits for an in-progress
+    # commit and then finds nothing to delete, so writes never interleave
+    # with a commit (bug P).
+    ident = models.VaultIdentity.__table__
+    conn.execute(select(ident.c.id).where(ident.c.id == owner_id).with_for_update())
+    gone = conn.execute(delete(rekeys).where(rekeys.c.identity_id == owner_id)).rowcount
     conn.commit()
     return jsonify({"aborted": bool(gone)})
 

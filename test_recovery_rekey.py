@@ -310,3 +310,87 @@ class RekeyTest(RecoveryCase):
         row = {"blind_index": "a" * 64, "old_blind_index": "b" * 64, "sealed": "c" * server_app.MAX_SEALED_HEX_LENGTH}
         body = json.dumps({"rekey_id": "x" * 43, "records": [row] * n}, separators=(",", ":"))
         self.assertLessEqual(len(body), server_app.MAX_REQUEST_BYTES)
+
+
+class StaleRekeyAbortTest(RekeyTest):
+    """P: a crashed rekey must not block writes for long, and abort must never
+    interleave with a commit."""
+
+    def test_default_ttl_is_600_seconds(self):
+        self.assertEqual(server_app.REKEY_TTL_SECONDS, 600)
+        self.assertEqual(self.post("/api/vault/rekey/begin").get_json()["expires_in"], 600)
+
+    def test_abort_after_commit_is_a_no_op(self):
+        rid = self.begin()
+        self.stage(rid, self.new_rows())
+        self.assertEqual(self.commit(rid).status_code, 200)
+        after = self.state()
+        self.assertEqual(self.post("/api/vault/rekey/abort").get_json(), {"aborted": False})
+        self.assertEqual(self.state(), after)
+
+    def test_abort_waits_for_an_in_progress_commit(self):
+        rid = self.begin()
+        self.stage(rid, self.new_rows())
+        # Hold the identity row FOR UPDATE, exactly as a running commit does.
+        with self._engine.connect() as locker:
+            tx = locker.begin()
+            locker.execute(text("SELECT id FROM vault_identity WHERE id = 1 FOR UPDATE"))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(self.post, "/api/vault/rekey/abort")
+                time.sleep(0.7)
+                self.assertFalse(fut.done(), "abort must block while a commit holds the row lock")
+                tx.rollback()
+                self.assertEqual(fut.result(timeout=10).get_json(), {"aborted": True})
+        self.assertEqual(self.state(), self.before)
+        self.assertEqual(self.commit(rid).status_code, 404)
+
+    def test_abort_is_scoped_to_the_callers_identity(self):
+        self.begin()
+        with server_app.app.app_context():
+            server_app.db().execute(models.VaultIdentity.__table__.insert().values(
+                id=2, user_handle=b"other", passkey_required=False))
+            server_app.db().commit()
+        other = server_app.app.test_client()
+        with other.session_transaction() as sess:
+            sess["identity_id"] = 2; sess["authenticated_at"] = time.time()
+        oh = {"Origin": server_app.ORIGIN, "X-CSRF-Token": other.get("/api/session").get_json()["csrf_token"]}
+        self.assertEqual(other.post("/api/vault/rekey/abort", headers=oh, json={}).get_json(), {"aborted": False})
+        r = self.post("/api/records", {"records": [{"blind_index": bi(9), "sealed": sealed(9)}]})
+        self.assertEqual(r.status_code, 409)
+
+
+class CeremonyClobberTest(RecoveryCase):
+    """F/Q: a request that did not touch the WebAuthn ceremony must not erase a
+    ceremony another overlapping request on the same session started."""
+
+    def _row(self):
+        with self.raw_conn() as conn:
+            return conn.execute(text("SELECT active_ceremony_id FROM server_sessions WHERE revoked_at IS NULL "
+                                     "ORDER BY last_seen_at DESC LIMIT 1")).scalar_one()
+
+    def _overlap(self, mutate):
+        cookie = self.client.get_cookie(server_app.COOKIE_NAME).value
+        iface = server_app.app.session_interface
+        with server_app.app.test_request_context(headers={"Cookie": f"{server_app.COOKIE_NAME}={cookie}"}):
+            from flask import request
+            sess = iface.open_session(server_app.app, request)    # loaded: no ceremony
+            with self._engine.begin() as conn:                     # overlapping request starts one
+                conn.execute(text("UPDATE server_sessions SET active_ceremony_id = 'ceremony-from-B'"))
+            mutate(sess)
+            sess.modified = True
+            iface.save_session(server_app.app, sess, server_app.app.response_class())
+
+    def test_untouched_ceremony_is_not_clobbered(self):
+        self.assertIsNone(self._row())
+        self._overlap(lambda sess: sess.__setitem__("vault_unlocked", True))
+        self.assertEqual(self._row(), "ceremony-from-B")
+
+    def test_a_request_that_changes_the_ceremony_still_writes_it(self):
+        self._overlap(lambda sess: sess.__setitem__("active_ceremony_id", "ceremony-from-A"))
+        self.assertEqual(self._row(), "ceremony-from-A")
+
+    def test_consuming_the_ceremony_clears_it(self):
+        with self._engine.begin() as conn:
+            conn.execute(text("UPDATE server_sessions SET active_ceremony_id = 'c1'"))
+        self._overlap(lambda sess: sess.pop("active_ceremony_id", None) or sess.__setitem__("active_ceremony_id", None))
+        self.assertIsNone(self._row())

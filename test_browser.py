@@ -26,9 +26,6 @@ PASSPHRASE = "demo passphrase"
 # TEST-ONLY dummy bootstrap token. Set only in this test server's env. It is
 # not, and must never be, a real deployment secret.
 TEST_BOOTSTRAP_TOKEN = "test-only-bootstrap-token-not-a-secret"
-# Expected console noise: in bootstrap mode the gate button keeps its login
-# listener, so one click also POSTs /api/passkeys/login/options -> 409.
-EXPECTED_BOOTSTRAP_409 = "Failed to load resource: the server responded with a status of 409 (CONFLICT)"
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -172,6 +169,11 @@ def main() -> int:
             }})["authenticatorId"]
             if page.is_visible("#passkeyGate"):
                 page.once("dialog", lambda dialog: dialog.accept(TEST_BOOTSTRAP_TOKEN))
+                ceremony_requests: list[str] = []
+                def on_ceremony(req):
+                    if "/api/passkeys/" in req.url and req.url.endswith("/options"):
+                        ceremony_requests.append(req.url.split("/api/passkeys/")[1])
+                page.on("request", on_ceremony)
                 page.click("#passkeyLoginBtn")  # relabeled "Create passkey" in bootstrap mode
                 try:
                     page.wait_for_selector("#gate:not([hidden])", timeout=30000)
@@ -180,8 +182,11 @@ def main() -> int:
                     raise
                 check("Create your vault passphrase" in page.inner_text("#gate"),
                       "real bootstrap ceremony enrolls the first passkey", page.inner_text("#gateNote"))
-                while EXPECTED_BOOTSTRAP_409 in errors:
-                    errors.remove(EXPECTED_BOOTSTRAP_409)
+                page.remove_listener("request", on_ceremony)
+                # Bug F: the click must start exactly one ceremony (no stray
+                # login options request racing the bootstrap ceremony).
+                check(ceremony_requests == ["bootstrap/options"],
+                      "Create passkey sends exactly one ceremony request (bootstrap)", repr(ceremony_requests))
                 # Bootstrap verify enrolls but deliberately does not set
                 # authenticated_at (only login_verify does), so complete a real
                 # passkey login before unlocking. Same virtual authenticator.
@@ -597,6 +602,21 @@ def main() -> int:
             page.screenshot(path=SHOTS / "4-mobile.png", full_page=True)
 
             # --- destructive deletion step-up ---------------------------
+            print("\n  Malformed record (bug N)")
+            shown_before = int(page.inner_text("#statRecords"))
+            page.evaluate("""async () => {
+                const bad = { id: 'undated-bug-n', amount: -1, merchant: 'No date' };
+                await api('/api/records', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ records: [{ blind_index: blindIndex(bad.id), sealed: seal(bad) }] }) });
+            }""")
+            page.click("#lockVaultBtn")
+            page.fill("#pass", PASSPHRASE); page.click("#unlockBtn")
+            page.wait_for_selector("#dash:not([hidden])", timeout=30000)
+            check("Incorrect" not in page.inner_text("#gateNote"), "an undated record never reads as a wrong passphrase")
+            check(page.is_visible("#recordWarning") and page.inner_text("#recordWarning").startswith("1 record could not be shown"),
+                  "an undated record is skipped with a visible warning count", page.inner_text("#recordWarning"))
+            check(int(page.inner_text("#statRecords")) == shown_before, "valid records still render next to a malformed one")
+
             print("\n  Destructive deletion step-up")
             page.set_viewport_size({"width": 1280, "height": 900})
 
