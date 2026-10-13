@@ -205,7 +205,8 @@ jobs:
           echo "=== Waiting for deployment to stabilize ==="
           sleep 30
           
-          BASE_URL="https://mindful-money-31393284277.us-central1.run.app"
+          # Canonical host: the only one matching VAULT_RP_ID / VAULT_ORIGIN.
+          BASE_URL="https://mindful-money-k23ukkh5cq-uc.a.run.app"
           EXPECTED_SHA="${{ github.sha }}"
           EXPECTED_SHORT=$(echo "$EXPECTED_SHA" | cut -c1-12)
           
