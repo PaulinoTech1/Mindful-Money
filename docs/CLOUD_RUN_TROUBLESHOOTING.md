@@ -841,3 +841,87 @@ console error. Not CI-green. A weak spot noted, not changed: phase 2's
 "every recovered transaction matches" passes because browser B shares
 browser A's vault, so it does not by itself prove the import worked; the
 "Restored N records" assertion does.
+
+### Fixed: bugs A, B, C (2026-10-13, later)
+
+All changes are client-side in `static/app.js`; the server still stores
+only ciphertext, and keys never leave the browser. Zero-knowledge
+unchanged.
+
+**A. Padding format v2.** Layout of a padded plaintext of bucket size B:
+`[data][0x00 fill][padLen uint32 big-endian][0x02]`. Buckets are unchanged
+(512 to 8192), so length-hiding is unchanged. Max data per record drops from
+8192 to 8187 bytes (5-byte trailer); larger records are rejected with
+"Record too large", as before.
+- Reader: tries v2 strictly (marker, length within bucket, zero fill),
+  else reads legacy v1. For v1, candidate pad lengths are P with
+  P mod 256 equal to the last byte and P within the trailing run (plus P=0
+  for exact bucket fits). A candidate is accepted only if the remaining
+  bytes are canonical JSON (valid UTF-8, parses, no surrounding whitespace,
+  which is what `seal()` always wrote). Exactly one match is required;
+  more than one throws "Ambiguous legacy padding". In the exhaustive test
+  no legacy record was ambiguous.
+- Why legacy and v2 cannot be confused: a valid v2 trailer needs the two
+  high bytes of the length to be 0x00, and v1 JSON plaintext never contains
+  0x00 and v1 pad runs are a single repeated byte.
+- Also used by the passphrase re-encryption path (same `unpadPlaintext`).
+  The ZKP v3 sealed path (`static/zkp/manual_expense_sealed_client.js`) uses
+  its own Poseidon2 AEAD without bucket padding; not changed.
+- Rejected approaches: (1) 2-byte length with no marker: cannot be told
+  apart from legacy records reliably. (2) Fixing only the reader: writers
+  would keep producing ambiguous records. (3) New bucket sizes: would change
+  the length-hiding profile documented in THREAT_MODEL.
+- Tests: `tests/padding.test.mjs` (in pr-verify): v2 round trip for every
+  length 0 to 8187 and every bucket edge; 8188 to 8193 rejected; legacy
+  records produced by the old writer verbatim read back for every JSON
+  length 8 to 8192 (plus '}' and space stress cases, and pad byte equal to
+  '}'); malformed input (wrong length, all zero, no JSON, dirty fill, bad
+  length field, invalid UTF-8) rejected with a clear error.
+
+**B. Restore integrity compare.** `crypto_verify_32` is not exported at
+runtime by the bundled libsodium-wrappers; replaced with `S.memcmp`
+(constant time). The backup's `integrity` field must be 64 lowercase hex
+characters. The browser test asserts `typeof S.memcmp === 'function'`
+at runtime.
+
+**C. Restore key derivation and canary.**
+- The backup's `kdf_version` is validated (`checkKdfVersion`) and passed
+  to every derivation in the restore path. Backups without the field (made
+  before KDF versioning) are v1. No fallback to another version.
+- The canary is unpadded before parsing (it is written by `seal()`).
+
+**Old backups:** a backup made before this fix carries v1-padded canary and
+records; both read through the legacy reader, and restored records are
+re-uploaded as-is and read the same way. Status: implemented, covered at
+the padding level by the unit test; an end to end restore of a pre-fix
+backup file was not run. Confidence medium-high.
+
+**Verification:** node unit tests (padding, KDF no-fallback): pass.
+pytest 144 passed. `test_browser.py` 119/119. `test_playwright_recovery.py`
+26/26, including phase 3: a foreign backup with a wrong passphrase is
+rejected with "Integrity check failed", leaves the vault's KDF salts
+unchanged and imports nothing; the right passphrase restores byte-identical
+records. All locally tested (Python 3.13, Postgres 17, Chromium headless
+shell 1243). CI status: see PR #8. Not production-verified.
+
+Test-only adjustments in the same round: the account dropdown assertion
+compared a substring against a list (option text is "bank - type ·
+label"); the console-error check now removes exactly one expected 404 from
+the intended new-vault `GET /api/kdf/salts` then generate flow.
+
+**New bugs found, NOT fixed:**
+- **D (medium):** `POST /api/kdf/salts/migrate` replaces salts but not
+  `kdf_version`. Restoring a backup into a vault with a different stored
+  version would make the next unlock derive different keys. Client-side
+  guard added: restore now refuses loudly when the vault's version differs.
+  Not covered: the branch where the vault has no salts yet (404), whose
+  stored version is the column default 1. Proposed fix: let migrate accept
+  and store `kdf_version`. Confidence high (code read).
+- **E (medium):** `MAX_SEALED_HEX_LENGTH` defaults to 16384 hex (8192
+  bytes), but a record in the 8192-byte bucket seals to 8240 bytes (48 bytes
+  sealed-box overhead), 16480 hex, so the server rejects it. Records of
+  roughly 4091 to 8187 bytes of JSON cannot be uploaded. Proposed fix: raise
+  the limit to 16480 or cap the client at the 4096 bucket. Confidence high
+  (arithmetic; not exercised by a test).
+- **F (low):** on a fresh vault the "Create passkey" button also fires the
+  login request (409 in the console). Reported earlier.
