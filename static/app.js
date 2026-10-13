@@ -28,12 +28,76 @@ const apiFetch = async (url, options = {}) => {
   if (!response.ok) {
     const error = new Error(data.error || (response.status === 401 ? 'Your passkey session expired.' : 'Request failed.'));
     error.status = response.status;
+    error.retryAfter = Number(response.headers.get('Retry-After')) || 0;
     throw error;
   }
   if (typeof data.csrf_token === 'string') CSRF = data.csrf_token;
   return data;
 };
 const api = apiFetch;
+
+// Bulk record uploads are chunked by count AND body size so no request can
+// exceed the server limits (app.py MAX_RECORDS_PER_BATCH = 500 and
+// MAX_REQUEST_BYTES = 8 MiB; derivation in README "Ciphertext and resource limits").
+// 6 MiB leaves headroom under 8 MiB. Chunks are uploaded in order; a failure
+// stops at that chunk and throws (earlier chunks stay stored, which is safe:
+// uploads are idempotent upserts keyed by blind_index, so a retry converges).
+const UPLOAD_MAX_RECORDS = 500;
+const UPLOAD_MAX_BYTES = 6 * 1024 * 1024;
+const UPLOAD_RATE_RETRIES = 3;
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const UPLOAD_FIELDS = ['blind_index', 'sealed'];
+
+// `fields` picks the properties sent per record; `extra` is merged into the
+// request body (e.g. the rekey id) and counted in the byte budget.
+function chunkSealedRecords(rows, maxRecords = UPLOAD_MAX_RECORDS, maxBytes = UPLOAD_MAX_BYTES,
+                            fields = UPLOAD_FIELDS, extra = {}) {
+  const chunks = [];
+  let current = [];
+  const wrapper = JSON.stringify({ ...extra, records: [] }).length;  // {"records":[]} is 14
+  let bytes = wrapper;
+  for (const row of rows) {
+    const picked = {};
+    for (const f of fields) picked[f] = row[f];
+    const rowBytes = JSON.stringify(picked).length + 1;
+    if (wrapper + rowBytes > maxBytes) throw new Error('A single record exceeds the upload size limit.');
+    if (current.length && (current.length >= maxRecords || bytes + rowBytes > maxBytes)) {
+      chunks.push(current); current = []; bytes = wrapper;
+    }
+    current.push(picked);
+    bytes += rowBytes;
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+async function uploadSealedRecords(rows, onProgress, { path = '/api/records', fields = UPLOAD_FIELDS, extra = {} } = {}) {
+  const chunks = chunkSealedRecords(rows, UPLOAD_MAX_RECORDS, UPLOAD_MAX_BYTES, fields, extra);
+  let done = 0;
+  for (const chunk of chunks) {
+    // A very large bulk upload (more than 60 chunks, i.e. tens of thousands
+    // of records) can reach the per-minute upload limit. Wait for the
+    // server's Retry-After (capped at 60 s) and retry the same chunk, at most
+    // UPLOAD_RATE_RETRIES times; any other error stops immediately.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await api(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...extra, records: chunk }),
+        });
+        break;
+      } catch (e) {
+        if (e.status !== 429 || attempt >= UPLOAD_RATE_RETRIES) throw e;
+        await sleepMs(Math.min(Math.max(e.retryAfter, 1), 60) * 1000);
+      }
+    }
+    done += chunk.length;
+    if (onProgress) onProgress(done, rows.length);
+  }
+  return chunks.length;
+}
 
 const b64ToBytes = (value) => Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((value.length + 3) % 4)), (c) => c.charCodeAt(0));
 const bytesToB64 = (value) => btoa(String.fromCharCode(...new Uint8Array(value))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -79,7 +143,10 @@ async function getSalts() {
     CACHED_SALTS = {
       enc: Uint8Array.from(data.salt_enc.match(/../g).map(h => parseInt(h, 16))),
       idx: Uint8Array.from(data.salt_idx.match(/../g).map(h => parseInt(h, 16))),
-      kdf_version: data.kdf_version || 1,
+      // Server returns the stored NOT NULL column (server_default 1 for
+      // rows that predate KDF versioning), so a missing value can only mean
+      // a legacy vault. The default must match the DB default: 1.
+      kdf_version: checkKdfVersion(data.kdf_version || 1),
     };
     return CACHED_SALTS;
   } catch (e) {
@@ -90,7 +157,9 @@ async function getSalts() {
       CACHED_SALTS = {
         enc: Uint8Array.from(data.salt_enc.match(/../g).map(h => parseInt(h, 16))),
         idx: Uint8Array.from(data.salt_idx.match(/../g).map(h => parseInt(h, 16))),
-        kdf_version: data.kdf_version || 3,
+        // POST /api/kdf/salts/generate always writes and returns 3 for a
+        // brand new vault, so 3 is the only correct default here.
+        kdf_version: checkKdfVersion(data.kdf_version || 3),
         isNewVault: true,
       };
       return CACHED_SALTS;
@@ -384,7 +453,15 @@ async function submitManualTransaction(event) {
 // v3 uses 256MB (not 512MB) because iOS Safari's Jetsam killer terminates
 // tabs that allocate large WASM heaps with zero warning. 256MB is the
 // practical iOS ceiling; 5 ops still gives 1.67x the work per guess over v2.
-// If allocation fails anyway, deriveKeys falls back to v2 (see below).
+// If allocation fails anyway, deriveKeys throws KDF_ALLOCATION_FAILED.
+// It never falls back to another version (see deriveKeys).
+function checkKdfVersion(v) {
+  if (v !== 1 && v !== 2 && v !== 3) {
+    throw new Error('Unsupported KDF version from server: ' + v);
+  }
+  return v;
+}
+
 function kdfParams(version) {
   if (version >= 3) {
     return {
@@ -448,23 +525,26 @@ function checkPassphraseStrength(passphrase) {
   return { ok: true, entropy };
 }
 
-async function deriveKeys(passphrase, kdfVersion) {
+async function deriveKeys(passphrase, kdfVersion, saltsOverride = null) {
   const A = S.crypto_pwhash_ALG_ARGON2ID13;
   let params = kdfParams(kdfVersion || 1);
 
   // Per-identity salts from the server (not secret, just unique).
   // Falls back to localStorage for legacy vaults.
-  const salts = await getSalts();
+  // saltsOverride: fresh salts for a rekey, not yet stored on the server.
+  const salts = saltsOverride || await getSalts();
   const saltEnc = salts.enc;
   const saltIdx = salts.idx;
 
-  // Try the requested KDF version. If v3 fails (e.g., mobile browser
-  // cannot allocate the memory), fall back to v2 automatically rather than
-  // bricking the unlock. The fallback is logged and surfaced to the user.
-  let ops = params.ops;
-  let mem = params.mem;
-  let usedVersion = params.version;
-  let fellBack = false;
+  // Derive with exactly the stored KDF version. There is NO fallback:
+  // deriving a v3 vault with v2 parameters yields different keys, so
+  // existing records would not decrypt and anything sealed afterwards
+  // would be split across two key sets. If the device cannot allocate
+  // the v3 memory, fail loudly and derive nothing.
+  // See docs/CLOUD_RUN_TROUBLESHOOTING.md "KDF v3 silent fallback to v2".
+  const ops = params.ops;
+  const mem = params.mem;
+  const usedVersion = params.version;
 
   const tryDerive = (o, m) => {
     const seed = S.crypto_pwhash(32, passphrase, saltEnc, o, m, A);
@@ -477,20 +557,13 @@ async function deriveKeys(passphrase, kdfVersion) {
   try {
     result = tryDerive(ops, mem);
   } catch (e) {
-    if (params.version >= 3) {
-      console.warn('v3 KDF failed, falling back to v2:', e.message);
-      const fallback = kdfParams(2);
-      result = tryDerive(fallback.ops, fallback.mem);
-      usedVersion = 2;
-      fellBack = true;
-    } else {
-      throw e;
-    }
-  }
-
-  if (fellBack && typeof $('gateNote') !== 'undefined' && $('gateNote')) {
-    $('gateNote').textContent = 'Note: used lighter key derivation (device memory limit). ' +
-      'Consider a desktop browser for maximum security.';
+    console.error('KDF v' + usedVersion + ' derivation failed:', e && e.message);
+    const err = new Error(
+      'This device could not allocate the memory needed to unlock this vault ' +
+      '(key derivation v' + usedVersion + ', ' + Math.round(mem / 1048576) + ' MB). ' +
+      'Nothing was decrypted or saved. Try a desktop browser or close other tabs.');
+    err.code = 'KDF_ALLOCATION_FAILED';
+    throw err;
   }
 
   return {
@@ -499,7 +572,6 @@ async function deriveKeys(passphrase, kdfVersion) {
     indexKey: result.indexKey,
     kdfVersion: usedVersion,
     seed: result.seed,
-    kdfFallback: fellBack,
   };
 }
 
@@ -537,38 +609,74 @@ async function setupRecoveryKey() {
   return mnemonic;
 }
 
-async function recoverWithKey(mnemonic, newPassphrase) {
-  // Decode the mnemonic
-  const recoveryKey = decodeRecoveryKey(mnemonic);
-  
+// Fetch the encrypted recovery blob. The server requires a recent passkey
+// assertion (bug L); on 401 run the passkey ceremony once and retry.
+async function fetchRecoveryBlobWithStepUp(note) {
   try {
-    // Fetch the encrypted blob (requires passkey auth)
-    const data = await api('/api/recovery/blob');
-    const blob = S.from_hex(data.recovery_blob);
-    
-    // Split nonce and ciphertext
-    const nonce = blob.slice(0, S.crypto_secretbox_NONCEBYTES);
-    const ciphertext = blob.slice(S.crypto_secretbox_NONCEBYTES);
-    
-    // Decrypt the seed
-    const seed = S.crypto_secretbox_open_easy(ciphertext, nonce, recoveryKey);
-    if (!seed) throw new Error('Invalid recovery key or corrupted data');
-    
-    // Validate new passphrase strength (don't allow weak passphrases
-    // just because recovery is available)
-    const strength = checkPassphraseStrength(newPassphrase);
-    if (!strength.ok) {
-      throw new Error('New passphrase too weak: ' + strength.reason);
-    }
-    
-    // Generate new salts and derive keys with new passphrase
-    // (This will create a new vault; the old records are re-encrypted
-    //  using the recovered seed to derive the old keys)
-    // For now: return the seed so the caller can complete recovery
-    return seed;
-  } finally {
-    recoveryKey.fill(0);
+    return await api('/api/recovery/blob');
+  } catch (e) {
+    if (e.status === 409) throw new Error('A passkey is required to use the recovery key.');
+    if (e.status === 404) throw new Error('No recovery key is set up for this vault.');
+    if (e.status !== 401) throw e;
+    await authenticateWithPasskey(note);
+    return await api('/api/recovery/blob');
   }
+}
+
+// Unwrap the vault seed with the recovery key. Returns the seed; the caller
+// owns (and must wipe) it and the recovery key.
+async function recoverWithKey(recoveryKey, note) {
+  const data = await fetchRecoveryBlobWithStepUp(note);
+  const blob = S.from_hex(data.recovery_blob);
+  const nonce = blob.slice(0, S.crypto_secretbox_NONCEBYTES);
+  const ciphertext = blob.slice(S.crypto_secretbox_NONCEBYTES);
+  let seed;
+  try {
+    seed = S.crypto_secretbox_open_easy(ciphertext, nonce, recoveryKey);
+  } catch (e) {
+    seed = null;
+  }
+  if (!seed) throw new Error('Invalid recovery key or corrupted data');
+  return seed;
+}
+
+function wrapSeedWithRecoveryKey(seed, recoveryKey) {
+  const nonce = S.randombytes_buf(S.crypto_secretbox_NONCEBYTES);
+  const encryptedSeed = S.crypto_secretbox_easy(seed, nonce, recoveryKey);
+  const blob = new Uint8Array(nonce.length + encryptedSeed.length);
+  blob.set(nonce);
+  blob.set(encryptedSeed, nonce.length);
+  return S.to_hex(blob);
+}
+
+// Re-encrypt every record for new keys (bug K): each record is decrypted with
+// the old keypair and sealed for the new one, and its blind index is
+// recomputed from the record id under the NEW index key. Returns staged rows
+// {blind_index, old_blind_index, sealed}. Fails closed on any record it
+// cannot decrypt or that has no id, rather than dropping it.
+function reencryptForRekey(records, oldKp, newKeys) {
+  const out = [];
+  const seen = new Set();
+  for (const r of records) {
+    let padded;
+    try {
+      padded = S.crypto_box_seal_open(S.from_hex(r.sealed), oldKp.publicKey, oldKp.privateKey);
+    } catch (e) {
+      padded = null;
+    }
+    if (!padded) throw new Error(`Record ${r.blind_index.slice(0, 8)}... does not decrypt with the recovered key.`);
+    const obj = JSON.parse(S.to_string(unpadPlaintext(padded)));
+    if (typeof obj.id !== 'string' || !obj.id) {
+      throw new Error(`Record ${r.blind_index.slice(0, 8)}... has no id; cannot recompute its blind index.`);
+    }
+    const blind = S.to_hex(S.crypto_generichash(32, S.from_string(obj.id), newKeys.indexKey));
+    if (seen.has(blind)) throw new Error('Two records share an id; refusing to merge them.');
+    seen.add(blind);
+    const padNew = padPlaintext(S.from_string(JSON.stringify(obj)));
+    out.push({ blind_index: blind, old_blind_index: r.blind_index,
+               sealed: S.to_hex(S.crypto_box_seal(padNew, newKeys.publicKey)) });
+  }
+  return out;
 }
 
 // Domain-separated backup authentication key.
@@ -588,34 +696,84 @@ function backupAuthKey() {
 const PAD_BUCKETS = [512, 1024, 2048, 4096, 8192];
 const PAD_MAX = 8192;  // 8KB max plaintext
 
+// Padding format v2 (2026-10-13). Layout of a padded plaintext of size B
+// (B is always one of PAD_BUCKETS, so length-hiding is unchanged):
+//   [data][0x00 fill][padLen: uint32 big-endian][0x02 version marker]
+// padLen counts every byte after the data (fill + 5-byte trailer), so
+// data = padded[0 .. B - padLen). Max data per record is PAD_MAX - 5.
+//
+// Legacy format v1 (before 2026-10-13) filled every pad byte with
+// padLen & 0xff. Pads of 256 bytes or more were stored modulo 256, so the
+// v1 reader stripped too little (docs/CLOUD_RUN_TROUBLESHOOTING.md "padding
+// length overflows one byte"). unpadPlaintext still reads v1, including
+// those broken records, when the true pad length is unambiguous.
+const PAD_VERSION = 0x02;
+const PAD_TRAILER = 5;
+
 function padPlaintext(data) {
-  if (data.length > PAD_MAX) {
-    throw new Error(`Record too large: ${data.length} bytes (max ${PAD_MAX})`);
+  if (data.length > PAD_MAX - PAD_TRAILER) {
+    throw new Error(`Record too large: ${data.length} bytes (max ${PAD_MAX - PAD_TRAILER})`);
   }
-  // Find the smallest bucket that fits
-  let bucket = PAD_BUCKETS[PAD_BUCKETS.length - 1];
+  let bucket = null;
   for (const b of PAD_BUCKETS) {
-    if (data.length <= b) { bucket = b; break; }
+    if (data.length + PAD_TRAILER <= b) { bucket = b; break; }
   }
-  // PKCS#7-style padding: pad with bytes indicating pad length
   const padLen = bucket - data.length;
-  const padded = new Uint8Array(bucket);
+  const padded = new Uint8Array(bucket);  // fill bytes are already 0x00
   padded.set(data);
-  padded.fill(padLen, data.length);
+  padded[bucket - 5] = (padLen >>> 24) & 0xff;
+  padded[bucket - 4] = (padLen >>> 16) & 0xff;
+  padded[bucket - 3] = (padLen >>> 8) & 0xff;
+  padded[bucket - 2] = padLen & 0xff;
+  padded[bucket - 1] = PAD_VERSION;
   return padded;
 }
 
+function _unpadV2(padded) {
+  const n = padded.length;
+  if (n < PAD_TRAILER || padded[n - 1] !== PAD_VERSION) return null;
+  const padLen = ((padded[n - 5] << 24) >>> 0) + (padded[n - 4] << 16) + (padded[n - 3] << 8) + padded[n - 2];
+  if (padLen < PAD_TRAILER || padLen > n) return null;
+  for (let i = n - padLen; i < n - PAD_TRAILER; i++) {
+    if (padded[i] !== 0) return null;
+  }
+  return padded.slice(0, n - padLen);
+}
+
+function _isCanonicalJson(bytes) {
+  // seal() always writes JSON.stringify output: valid UTF-8, valid JSON,
+  // no leading or trailing whitespace.
+  let text;
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch (_e) { return false; }
+  if (text.length === 0 || text.trim() !== text) return false;
+  try { JSON.parse(text); return true; } catch (_e) { return false; }
+}
+
+function _unpadLegacyV1(padded) {
+  const n = padded.length;
+  const v = padded[n - 1];
+  let run = 0;
+  while (run < n && padded[n - 1 - run] === v) run++;
+  // True pad length P satisfies P % 256 === v, 1 <= P <= run, or P === 0
+  // when the data filled the bucket exactly (the v1 writer added no pad).
+  const matches = [];
+  if (_isCanonicalJson(padded)) matches.push(padded.slice());
+  for (let P = (v === 0 ? 256 : v); P <= run; P += 256) {
+    const candidate = padded.slice(0, n - P);
+    if (_isCanonicalJson(candidate)) matches.push(candidate);
+  }
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) throw new Error('Ambiguous legacy padding');
+  throw new Error('Invalid padding');
+}
+
 function unpadPlaintext(padded) {
-  if (padded.length === 0) throw new Error('Empty padded data');
-  const padLen = padded[padded.length - 1];
-  if (padLen === 0 || padLen > padded.length) {
-    throw new Error('Invalid padding');
+  if (!(padded instanceof Uint8Array) || !PAD_BUCKETS.includes(padded.length)) {
+    throw new Error('Invalid padded length');
   }
-  // Verify all padding bytes match
-  for (let i = padded.length - padLen; i < padded.length; i++) {
-    if (padded[i] !== padLen) throw new Error('Invalid padding bytes');
-  }
-  return padded.slice(0, padded.length - padLen);
+  const v2 = _unpadV2(padded);
+  if (v2 !== null) return v2;
+  return _unpadLegacyV1(padded);
 }
 
 const seal = (obj) => {
@@ -816,12 +974,27 @@ async function unlock() {
     // removing the DOM value eliminates the most accessible copy.
     $('pass').value = '';
     updatePassphraseEntropy();
+    // Bug P: a rekey left behind by a crashed or closed recovery blocks
+    // record writes until its TTL. Unlocking proves the user is back with
+    // working keys, so discard it now (best effort; the live vault was never
+    // touched, and the server serializes abort against an in-progress commit).
+    await api('/api/vault/rekey/abort', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    }).catch(() => {});
     await load(true);
     await api('/api/vault/unlocked', { method: 'POST' });
   } catch (_error) {
     KEYS = null; TXNS = [];
     $('unlockBtn').disabled = false;
-    $('gateNote').textContent = 'Incorrect vault passphrase or the records could not be decrypted.';
+    const code = _error && _error.code;
+    if (code === 'KDF_ALLOCATION_FAILED') $('gateNote').textContent = _error.message;
+    else if (code === 'DECRYPT_FAILED') $('gateNote').textContent = 'Incorrect vault passphrase or the records could not be decrypted.';
+    else {
+      // Bug N: a data-shape, network or render error is not a passphrase problem.
+      $('gateNote').textContent = 'The vault could not be displayed (this is not a passphrase problem): '
+        + ((_error && _error.message) || 'Unknown error');
+      console.error('Unlock failed after key derivation:', _error);
+    }
     return;
   }
 
@@ -843,12 +1016,14 @@ async function unlock() {
   $('importBtn').hidden = false;
   $('gate').hidden = true;
   $('security').hidden = false;
+  $('recovery').hidden = false;
+  refreshRecoveryState();
   await refreshSecurity();
   $('unlockBtn').disabled = false;
 }
 
-async function load(duringUnlock = false) {
-  // Fetch all records with pagination (server limits to 5000 per request)
+// Fetch all records with pagination (server limits to 5000 per request).
+async function fetchAllRecords() {
   let allRecords = [];
   let offset = 0;
   const limit = 5000;
@@ -859,13 +1034,57 @@ async function load(duringUnlock = false) {
     if (records.length < limit || allRecords.length >= (data.total || 0)) break;
     offset += limit;
   }
-  const records = allRecords;
+  return allRecords;
+}
+
+// Validate decrypted record shape (bug N). Records that every view depends on
+// (date, amount, merchant, id) and cannot be shown sensibly are skipped and
+// counted, never thrown on; optional fields are coerced to safe defaults.
+// Pure function: exercised directly by tests/record_shape.test.mjs.
+function normalizeRecords(decrypted) {
+  const valid = [];
+  let skipped = 0;
+  for (const t of decrypted) {
+    if (!t || typeof t !== 'object' || Array.isArray(t)
+        || typeof t.id !== 'string' || !t.id
+        || typeof t.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(t.date)
+        || typeof t.amount !== 'number' || !Number.isFinite(t.amount)
+        || typeof t.merchant !== 'string') {
+      skipped += 1;
+      continue;
+    }
+    valid.push({
+      ...t,
+      category: typeof t.category === 'string' ? t.category : '',
+      notes: typeof t.notes === 'string' ? t.notes : '',
+      tags: Array.isArray(t.tags) ? t.tags : [],
+      splits: Array.isArray(t.splits) ? t.splits : [],
+      is_transfer: Boolean(t.is_transfer), excluded: Boolean(t.excluded),
+      fraud_status: ['safe', 'fraud'].includes(t.fraud_status) ? t.fraud_status : '',
+    });
+  }
+  valid.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return { valid, skipped };
+}
+
+async function load(duringUnlock = false) {
+  const records = await fetchAllRecords();
 
   if (!records.length) { if (!duringUnlock) $('empty').hidden = false; else $('empty').hidden = false; return; }
 
   // Decrypt everything locally. ~20MB for a decade of history, so the whole
   // corpus lives in memory and every aggregate is computed here.
-  let decrypted = records.map((r) => open(r.sealed));
+  // A failure here means the keys are wrong (or a record is corrupt); unlock()
+  // reports it as a passphrase problem. Anything after this point is a data
+  // or rendering problem and must NOT be reported as a wrong passphrase (bug N).
+  let decrypted;
+  try {
+    decrypted = records.map((r) => open(r.sealed));
+  } catch (e) {
+    const err = new Error('Decryption failed');
+    err.code = 'DECRYPT_FAILED';
+    throw err;
+  }
 
   // Records written by older versions do not contain encrypted institution
   // metadata. This migration path was removed with the server-side relay.
@@ -873,15 +1092,14 @@ async function load(duringUnlock = false) {
   // or demo data flow, which now generates metadata directly.
   // (Previously: fetched from /api/relay, which no longer exists.)
 
-  TXNS = decrypted.map((t) => ({
-    ...t, category: t.category || categorize(t.merchant),
-    notes: typeof t.notes === 'string' ? t.notes : '',
-    tags: Array.isArray(t.tags) ? t.tags : [],
-    splits: Array.isArray(t.splits) ? t.splits : [],
-    is_transfer: Boolean(t.is_transfer), excluded: Boolean(t.excluded),
-    fraud_status: ['safe', 'fraud'].includes(t.fraud_status) ? t.fraud_status : '',
-  }))
-                  .sort((a, b) => a.date.localeCompare(b.date));
+  const { valid, skipped } = normalizeRecords(decrypted);
+  TXNS = valid.map((t) => ({ ...t, category: t.category || categorize(t.merchant) }));
+  const warn = $('recordWarning');
+  if (warn) {
+    warn.hidden = skipped === 0;
+    warn.textContent = skipped === 0 ? '' : `${skipped} record${skipped === 1 ? '' : 's'} could not be shown `
+      + '(missing or malformed date, amount, merchant or id). They are kept unchanged in your vault.';
+  }
 
   $('statRecords').textContent = TXNS.length;
   renderAccounts();
@@ -925,11 +1143,7 @@ async function connect(source = 'fakebank') {
       }, { ...t })),
     }));
 
-    await api('/api/records', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: sealedRows }),
-    });
+    await uploadSealedRecords(sealedRows);
 
     $('connectNote').textContent = '';
     await load();
@@ -993,11 +1207,7 @@ async function handleCSVUpload(event) {
     }));
 
     // Server-side input validation happens in app.py (size limits, format checks)
-    await api('/api/records', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: sealedRows }),
-    });
+    await uploadSealedRecords(sealedRows);
 
     $('connectNote').textContent = `Imported ${transactions.length} transactions.`;
     await load();
@@ -1414,7 +1624,8 @@ function localGraphicAnswer(question) {
   const chartBase = {
     responsive: true,
     maintainAspectRatio: false,
-    animation: { duration: 350 },
+    // No animation: see the baseOpts comment (bug J).
+    animation: false,
     plugins: { legend: { display: false } },
   };
 
@@ -1699,7 +1910,14 @@ const baseOpts = {
   responsive: true,
   maintainAspectRatio: false,
   plugins: { legend: { display: false } },
-  animation: { duration: 380 },
+  // No animation (bug J). Chart.js 4.4.7 defers a resize that arrives while
+  // an animation is running (_resizeBeforeDraw) and applies it on the next
+  // draw; when the animation ends around the resize, the chart keeps a stale
+  // width (e.g. 1060 px canvas in a 316 px container) and the page overflows
+  // on mobile. render() recreates every chart, so any viewport change shortly
+  // after a data change could hit this. Without animation the animator never
+  // runs and every resize is applied immediately.
+  animation: false,
 };
 const axis = (extra = {}) => ({
   grid: { color: GRID, drawTicks: false },
@@ -1986,16 +2204,22 @@ async function importBackup(event) {
       pass = prompt('Enter your vault passphrase to verify the backup:');
       if (!pass) throw new Error('Passphrase required to restore backup.');
     }
+    // Backups made before KDF versioning carry no kdf_version: those vaults
+    // were v1 (matches the DB server_default). Anything else must be a
+    // known version; no fallback to another version (see deriveKeys).
+    const backupKdfVersion = checkKdfVersion(
+      backup.kdf.kdf_version === undefined ? 1 : backup.kdf.kdf_version);
     const candidateSalts = {
       enc: Uint8Array.from(backup.kdf.salt_enc.match(/../g).map(h => parseInt(h, 16))),
       idx: Uint8Array.from(backup.kdf.salt_idx.match(/../g).map(h => parseInt(h, 16))),
+      kdf_version: backupKdfVersion,
     };
     // Temporarily override salt cache to derive candidate keys
     const savedSalts = CACHED_SALTS;
     CACHED_SALTS = candidateSalts;
     let candidateKeys;
     try {
-      candidateKeys = await deriveKeys(pass, candidateSalts.kdf_version || 1);
+      candidateKeys = await deriveKeys(pass, backupKdfVersion);
     } finally {
       CACHED_SALTS = savedSalts;
     }
@@ -2013,15 +2237,19 @@ async function importBackup(event) {
     }
     const expectedHmac = S.crypto_auth_hmacsha256(
       S.from_string(verifyCanonical), candidateBackupKey);
-    if (S.crypto_verify_32(S.from_hex(S.to_hex(expectedHmac)),
-                            S.from_hex(backup.integrity)) !== 0) {
+    // Constant-time compare. crypto_verify_32 is not exported by the bundled
+    // libsodium-wrappers build; memcmp is (constant time, equal lengths).
+    const providedHmac = (typeof backup.integrity === 'string' && /^[0-9a-f]{64}$/.test(backup.integrity))
+      ? S.from_hex(backup.integrity) : null;
+    if (!providedHmac || !S.memcmp(expectedHmac, providedHmac)) {
       throw new Error('Integrity check failed (file corrupted or tampered)');
     }
 
     // Step 3: Verify canary decrypts with candidate keys
+    // The canary and records are written by seal(), so they are padded.
     const candidateOpen = (hex) =>
-      JSON.parse(S.to_string(
-        S.crypto_box_seal_open(S.from_hex(hex), candidateKeys.publicKey, candidateKeys.privateKey)));
+      JSON.parse(S.to_string(unpadPlaintext(
+        S.crypto_box_seal_open(S.from_hex(hex), candidateKeys.publicKey, candidateKeys.privateKey))));
     try {
       const canaryObj = candidateOpen(backup.canary);
       if (!canaryObj._backup_canary) throw new Error('Invalid canary');
@@ -2033,17 +2261,20 @@ async function importBackup(event) {
     try {
       const saltResp = await api('/api/kdf/salts');
       if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
+        // migrate stores salts and kdf_version together (bug D fix), so the
+        // vault takes the backup's KDF version along with its salts.
         await api('/api/kdf/salts/migrate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             salt_enc: backup.kdf.salt_enc,
             salt_idx: backup.kdf.salt_idx,
+            kdf_version: backupKdfVersion,
             force: true,
           }),
         });
         CACHED_SALTS = null;
-        KEYS = await deriveKeys(pass, backup.kdf.kdf_version || 1);
+        KEYS = await deriveKeys(pass, backupKdfVersion);
       }
     } catch (e) {
       if (e.status === 404 || (e.message && e.message.includes('not found'))) {
@@ -2053,30 +2284,19 @@ async function importBackup(event) {
           body: JSON.stringify({
             salt_enc: backup.kdf.salt_enc,
             salt_idx: backup.kdf.salt_idx,
+            kdf_version: backupKdfVersion,
           }),
         });
         CACHED_SALTS = null;
-        KEYS = await deriveKeys(pass, backup.kdf.kdf_version || 1);
+        KEYS = await deriveKeys(pass, backupKdfVersion);
       } else {
         throw e;
       }
     }
 
     // Upload records in batches
-    const batchSize = 100;
     let uploaded = 0;
-    for (let i = 0; i < backup.records.length; i += batchSize) {
-      const batch = backup.records.slice(i, i + batchSize).map(r => ({
-        blind_index: r.blind_index,
-        sealed: r.sealed,
-      }));
-      await api('/api/records', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: batch }),
-      });
-      uploaded += batch.length;
-    }
+    await uploadSealedRecords(backup.records, (done) => { uploaded = done; });
 
     alert(`Restored ${uploaded} records from backup.`);
     await load();
@@ -2183,7 +2403,7 @@ async function bootstrapPasskey() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bootstrap_token: token }),
     });
-    const credential = await navigator.credentials.create({ publicKey: options });
+    const credential = await navigator.credentials.create({ publicKey: publicKeyOptions(options) });
     const result = await api('/api/passkeys/bootstrap/verify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ credential: credentialJSON(credential), label: 'Primary passkey', bootstrap_token: token }),
@@ -2216,7 +2436,7 @@ function lockVault() {
   Object.values(CHARTS).forEach((c) => c.destroy()); CHARTS = {};
   Object.values(CHAT_CHARTS).forEach((c) => c.destroy());
   $('ledgerBody').textContent = ''; $('accountList').textContent = ''; $('dashboardAccounts').textContent = ''; $('chatMessages').textContent = ''; $('rawBody').textContent = '';
-  ['dash','empty','serverview','security','stats','accounts','syncBtn','syncSimplefinBtn','addExpenseBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
+  ['dash','empty','serverview','security','recovery','stats','accounts','syncBtn','syncSimplefinBtn','addExpenseBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
   document.body.classList.remove('sv'); $('pass').value = ''; updatePassphraseEntropy(); $('lock').dataset.state = 'locked'; $('lockLabel').textContent = 'Locked';
   $('userGreeting').hidden = true;
   $('unlockBtn').disabled = false;
@@ -2234,6 +2454,145 @@ async function signOut() {
 async function disablePasskeys() {
   if (!confirm('Disable passkey protection and return to passphrase-only access?')) return;
   try { await api('/api/passkeys/disable', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm_unlocked: true }) }); PASSKEY_REQUIRED = false; PASSKEY_AUTHENTICATED = false; await refreshSecurity(); $('securityNote').textContent = 'Passkey protection disabled. Passphrase-only access is restored.'; } catch (e) { $('securityNote').textContent = e.message; }
+}
+
+/* ---------- recovery UI handlers ---------- */
+
+async function handleSetupRecovery() {
+  const note = $('recoveryNote');
+  try {
+    if (!KEYS) { note.textContent = 'Unlock your vault first.'; return; }
+    if (!confirm('Generate a recovery key? You will need to write down 32 words on paper.')) return;
+    
+    note.textContent = 'Generating recovery key...';
+    const mnemonic = await setupRecoveryKey();
+    
+    // Display the mnemonic ONE TIME
+    $('recoveryWords').textContent = mnemonic;
+    $('recoveryDisplay').hidden = false;
+    $('recoverForm').hidden = true;
+    note.textContent = '';
+    
+    // Clear mnemonic from JS memory after display (user must have written it down)
+    // Note: the DOM still contains it until they click Done
+  } catch (e) {
+    note.textContent = 'Error: ' + (e.message || 'Failed to generate recovery key');
+  }
+}
+
+async function handleRecoverVault() {
+  const note = $('recoverNote');
+  const mnemonic = $('recoverMnemonic').value.trim();
+  const newPass = $('recoverNewPass').value;
+
+  if (!mnemonic || !newPass) {
+    note.textContent = 'Enter both the recovery key and a new passphrase.';
+    return;
+  }
+  // Validate the new passphrase BEFORE starting; the recovery key never
+  // excuses a weak passphrase.
+  const strength = checkPassphraseStrength(newPass);
+  if (!strength.ok) {
+    note.textContent = 'New passphrase too weak: ' + strength.reason;
+    return;
+  }
+  if (!confirm('This will re-encrypt all your records with the new passphrase. Continue?')) return;
+
+  // Design: docs/RECOVERY.md "Re-encryption (rekey)". Nothing on the server
+  // changes until the final commit, which swaps records, salts, KDF version
+  // and recovery blob in one transaction. Any failure before that leaves the
+  // old vault intact and usable.
+  let recoveryKey = null, oldSeed = null, oldKp = null, newKeys = null, rekeyId = null;
+  $('doRecoverBtn').disabled = true;
+  try {
+    recoveryKey = decodeRecoveryKey(mnemonic);
+    note.textContent = 'Recovering vault key...';
+    oldSeed = await recoverWithKey(recoveryKey, note);
+    oldKp = S.crypto_box_seed_keypair(oldSeed);
+
+    note.textContent = 'Starting re-encryption...';
+    rekeyId = (await api('/api/vault/rekey/begin', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    })).rekey_id;
+
+    note.textContent = 'Fetching encrypted records...';
+    const records = await fetchAllRecords();
+
+    note.textContent = 'Deriving new keys (this takes a while)...';
+    const salts = { enc: S.randombytes_buf(16), idx: S.randombytes_buf(16) };
+    const kdfVersion = 3;
+    newKeys = await deriveKeys(newPass, kdfVersion, salts);
+
+    note.textContent = `Re-encrypting ${records.length} records...`;
+    const staged = reencryptForRekey(records, oldKp, newKeys);
+    await uploadSealedRecords(staged, (done, total) => {
+      note.textContent = `Uploading re-encrypted records... ${done}/${total}`;
+    }, { path: '/api/vault/rekey/records', fields: ['blind_index', 'old_blind_index', 'sealed'],
+         extra: { rekey_id: rekeyId } });
+
+    // Keep the same recovery key working: wrap the NEW seed with it.
+    note.textContent = 'Committing...';
+    await api('/api/vault/rekey/commit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rekey_id: rekeyId, salt_enc: S.to_hex(salts.enc), salt_idx: S.to_hex(salts.idx),
+        kdf_version: kdfVersion, recovery_blob: wrapSeedWithRecoveryKey(newKeys.seed, recoveryKey),
+      }),
+    });
+    rekeyId = null;
+    CACHED_SALTS = null;
+    $('recoverMnemonic').value = '';
+    $('recoverNewPass').value = '';
+    $('recoverForm').hidden = true;
+    lockVault();
+    $('gateNote').textContent = `Recovery complete: ${records.length} records re-encrypted. Unlock with your new passphrase. Your recovery key still works.`;
+  } catch (e) {
+    if (rekeyId) {
+      // Best effort: unblock writes now instead of waiting for the TTL. The
+      // live vault was never changed.
+      await api('/api/vault/rekey/abort', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+    }
+    note.textContent = 'Recovery failed: ' + (e.message || 'Unknown error') + ' Your vault was not changed.';
+    console.error('Recovery failed:', e);
+  } finally {
+    recoveryKey?.fill(0);
+    oldSeed?.fill(0);
+    oldKp?.privateKey?.fill(0);
+    if (newKeys) { newKeys.seed?.fill(0); newKeys.privateKey?.fill(0); newKeys.indexKey?.fill(0); }
+    $('doRecoverBtn').disabled = false;
+  }
+}
+
+async function handleDeleteRecovery() {
+  if (!confirm('Delete the recovery key? You will lose the ability to recover with the existing key.')) return;
+  try {
+    const del = () => api('/api/recovery/delete', { method: 'POST' });
+    try {
+      await del();
+    } catch (e) {
+      if (e.status !== 401) throw e;
+      await authenticateWithPasskey($('recoveryNote'));  // fresh passkey assertion (bug L)
+      await del();
+    }
+    $('recoveryNote').textContent = 'Recovery key deleted.';
+    refreshRecoveryState();
+  } catch (e) {
+    $('recoveryNote').textContent = 'Error: ' + (e.message || 'Failed to delete');
+  }
+}
+
+async function refreshRecoveryState() {
+  try {
+    const { set_up: setUp } = await api('/api/recovery/status');
+    if (!setUp) throw new Error('not set up');
+    $('recoveryState').textContent = 'Set up';
+    $('setupRecoveryBtn').hidden = true;
+    $('deleteRecoveryBtn').hidden = false;
+  } catch (e) {
+    $('recoveryState').textContent = 'Not set up';
+    $('setupRecoveryBtn').hidden = false;
+    $('deleteRecoveryBtn').hidden = true;
+  }
 }
 
 /* ---------- boot ---------- */
@@ -2296,7 +2655,9 @@ async function disablePasskeys() {
   $('importBtn').addEventListener('click', () => $('importFile').click());
   $('importFile').addEventListener('change', importBackup);
   $('resetPassphraseBtn').addEventListener('click', resetPassphrase);
-  $('passkeyLoginBtn').addEventListener('click', loginPasskey);
+  // One handler that dispatches by mode (bug F): in bootstrap mode the same
+  // button used to fire both the login and the bootstrap ceremony.
+  $('passkeyLoginBtn').addEventListener('click', () => (BOOTSTRAP_NEEDED ? bootstrapPasskey() : loginPasskey()));
   $('enablePasskeyBtn').addEventListener('click', registerPasskey);
   $('addPasskeyBtn').addEventListener('click', registerPasskey);
   $('lockVaultBtn').addEventListener('click', lockVault);
@@ -2308,178 +2669,19 @@ async function disablePasskeys() {
   $('addExpenseBtn').addEventListener('click', openAddTransactionDialog);
   $('addExpenseForm').addEventListener('submit', submitManualTransaction);
   document.querySelectorAll('input[name="addExpenseType"]').forEach((radio) => radio.addEventListener('change', updateManualCategoryOptions));
-/* ---------- recovery UI handlers ---------- */
-
-async function handleSetupRecovery() {
-  const note = $('recoveryNote');
-  try {
-    if (!KEYS) { note.textContent = 'Unlock your vault first.'; return; }
-    if (!confirm('Generate a recovery key? You will need to write down 32 words on paper.')) return;
-    
-    note.textContent = 'Generating recovery key...';
-    const mnemonic = await setupRecoveryKey();
-    
-    // Display the mnemonic ONE TIME
-    $('recoveryWords').textContent = mnemonic;
-    $('recoveryDisplay').hidden = false;
-    $('recoverForm').hidden = true;
-    note.textContent = '';
-    
-    // Clear mnemonic from JS memory after display (user must have written it down)
-    // Note: the DOM still contains it until they click Done
-  } catch (e) {
-    note.textContent = 'Error: ' + (e.message || 'Failed to generate recovery key');
-  }
-}
-
-async function handleRecoverVault() {
-  const note = $('recoverNote');
-  const mnemonic = $('recoverMnemonic').value.trim();
-  const newPass = $('recoverNewPass').value;
-  
-  if (!mnemonic || !newPass) {
-    note.textContent = 'Enter both the recovery key and a new passphrase.';
-    return;
-  }
-  
-  // Validate new passphrase strength BEFORE starting (don't leave vault
-  // in a half-migrated state due to a weak passphrase)
-  const strength = checkPassphraseStrength(newPass);
-  if (!strength.ok) {
-    note.textContent = 'New passphrase too weak: ' + strength.reason;
-    return;
-  }
-  
-  if (!confirm('This will re-encrypt all your records with the new passphrase. Continue?')) {
-    return;
-  }
-  
-  try {
-    note.textContent = 'Recovering seed...';
-    const oldSeed = await recoverWithKey(mnemonic, newPass);
-    
-    // Clear sensitive inputs immediately
-    $('recoverMnemonic').value = '';
-    $('recoverNewPass').value = '';
-    
-    // Reconstruct old keys from recovered seed
-    const oldKp = S.crypto_box_seed_keypair(oldSeed);
-    
-    // Fetch all encrypted records
-    note.textContent = 'Fetching encrypted records...';
-    const recordsData = await api('/api/records');
-    const records = recordsData.records || [];
-    
-    if (records.length === 0) {
-      note.textContent = 'No records to re-encrypt. Vault is empty.';
-      oldSeed.fill(0);
-      return;
-    }
-    
-    // Decrypt each record with old key
-    note.textContent = `Decrypting ${records.length} records...`;
-    const decrypted = [];
-    for (const r of records) {
-      try {
-        const padded = S.crypto_box_seal_open(
-          S.from_hex(r.sealed), oldKp.publicKey, oldKp.privateKey
-        );
-        if (!padded) throw new Error('Decryption failed');
-        const plaintext = unpadPlaintext(padded);
-        const obj = JSON.parse(S.to_string(plaintext));
-        decrypted.push({ blind_index: r.blind_index, data: obj });
-      } catch (e) {
-        throw new Error(`Failed to decrypt record ${r.blind_index.slice(0, 8)}...: ${e.message}`);
-      }
-    }
-    
-    // Clear old seed from memory
-    oldSeed.fill(0);
-    oldKp.privateKey.fill(0);
-    
-    // Generate new salts (this creates a new vault identity for the new passphrase)
-    note.textContent = 'Generating new vault...';
-    CACHED_SALTS = null;  // Force regeneration
-    const newSalts = await getSalts();
-    if (!newSalts.isNewVault) {
-      throw new Error('Expected new salts for re-encryption, got existing');
-    }
-    
-    // Derive new keys
-    note.textContent = 'Deriving new keys (this takes a while)...';
-    const newKeys = await deriveKeys(newPass, newSalts.kdf_version || 3);
-    
-    // Re-encrypt each record with new key (with padding)
-    note.textContent = `Re-encrypting ${decrypted.length} records...`;
-    const reencrypted = decrypted.map(({ blind_index, data }) => {
-      // Temporarily swap KEYS for seal()
-      const savedKeys = KEYS;
-      KEYS = newKeys;
-      try {
-        return { blind_index, sealed: seal(data) };
-      } finally {
-        KEYS = savedKeys;
-      }
-    });
-    
-    // Upload re-encrypted records (upsert by blind_index replaces old ciphertext)
-    note.textContent = `Uploading ${reencrypted.length} re-encrypted records...`;
-    const BATCH = 50;
-    for (let i = 0; i < reencrypted.length; i += BATCH) {
-      const batch = reencrypted.slice(i, i + BATCH);
-      await api('/api/records', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: batch }),
-      });
-      note.textContent = `Uploading... ${Math.min(i + BATCH, reencrypted.length)}/${reencrypted.length}`;
-    }
-    
-    // Update KEYS to new keys and reload
-    KEYS = newKeys;
-    $('recoverForm').hidden = true;
-    note.textContent = `Recovery complete. ${reencrypted.length} records re-encrypted with new passphrase.`;
-    
-    // Clear new keys from temp variable (KEYS now holds them)
-    newKeys.seed?.fill(0);
-    
-    // Refresh the UI
-    await load(true);
-    
-  } catch (e) {
-    note.textContent = 'Recovery failed: ' + (e.message || 'Unknown error');
-    console.error('Recovery failed:', e);
-  }
-}
-
-async function handleDeleteRecovery() {
-  if (!confirm('Delete the recovery key? You will lose the ability to recover with the existing key.')) return;
-  try {
-    await api('/api/recovery/delete', { method: 'POST' });
-    $('recoveryNote').textContent = 'Recovery key deleted.';
-    refreshRecoveryState();
-  } catch (e) {
-    $('recoveryNote').textContent = 'Error: ' + (e.message || 'Failed to delete');
-  }
-}
-
-async function refreshRecoveryState() {
-  try {
-    await api('/api/recovery/blob');
-    $('recoveryState').textContent = 'Set up';
-    $('setupRecoveryBtn').hidden = true;
-    $('deleteRecoveryBtn').hidden = false;
-  } catch (e) {
-    $('recoveryState').textContent = 'Not set up';
-    $('setupRecoveryBtn').hidden = false;
-    $('deleteRecoveryBtn').hidden = true;
-  }
-}
 
   $('addExpenseCancel').addEventListener('click', () => $('addExpenseDialog').close());
   $('addExpenseCancelX').addEventListener('click', () => $('addExpenseDialog').close());
   // Recovery key UI
   $('setupRecoveryBtn').addEventListener('click', handleSetupRecovery);
+  // Forgot passphrase: recovery runs from the locked gate. The passkey
+  // session (not the passphrase) authorizes the blob fetch.
+  $('forgotPassBtn').addEventListener('click', () => {
+    $('recovery').hidden = false;
+    $('recoverForm').hidden = false;
+    $('recoveryDisplay').hidden = true;
+    $('recoverMnemonic').focus();
+  });
   $('recoverVaultBtn').addEventListener('click', () => {
     $('recoverForm').hidden = false;
     $('recoveryDisplay').hidden = true;
@@ -2508,12 +2710,8 @@ async function refreshRecoveryState() {
     $('gate').hidden = true; $('passkeyGate').hidden = false;
     $('passkeyGate').querySelector('h1').textContent = 'Set up your passkey';
     $('passkeyGateNote').textContent = 'This is a new vault. Create a passkey to secure it.';
-    // Replace login button with bootstrap button
-    const loginBtn = $('passkeyLoginBtn');
-    if (loginBtn) {
-      loginBtn.textContent = 'Create passkey';
-      loginBtn.onclick = bootstrapPasskey;
-    }
+    // Same button; its single click handler dispatches on BOOTSTRAP_NEEDED.
+    $('passkeyLoginBtn').textContent = 'Create passkey';
   }
   else if (PASSKEY_REQUIRED && !PASSKEY_AUTHENTICATED) { $('gate').hidden = true; $('passkeyGate').hidden = false; }
   else $('gateNote').textContent = 'Deriving a key takes a moment \u2014 that slowness is deliberate.';

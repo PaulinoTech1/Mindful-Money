@@ -45,7 +45,7 @@ jobs:
 
       - name: Security audit production dependencies
         run: |
-          pip-audit --desc -r requirements.txt
+          pip-audit --desc --require-hashes --disable-pip -r requirements-hashed.txt
 
       - name: Wait for PostgreSQL
         run: |
@@ -61,9 +61,16 @@ jobs:
                   time.sleep(1)
           "
 
+      - name: KDF no-fallback unit test (JS)
+        run: |
+          node tests/kdf_no_fallback.test.mjs
+          node tests/padding.test.mjs
+          node tests/upload_chunking.test.mjs
+          node tests/record_shape.test.mjs
+
       - name: Run full test suite
         run: |
-          python -m pytest test_demo.py test_zkp_server.py -v --tb=short --no-header -rA
+          python -m pytest test_demo.py test_zkp_server.py test_db_error_logging.py test_kdf_migrate_and_limits.py test_recovery_rekey.py -v --tb=short --no-header -rA
         env:
           VAULT_ENV: test
           VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_test
@@ -88,6 +95,17 @@ jobs:
               sys.exit(1)
           print("Migration chain OK")
           PYEOF
+
+      - name: Schema drift check (models vs migrations)
+        run: |
+          # Fresh DB, upgrade head, then autogenerate compare with types and
+          # server defaults; any diff fails the job (bugs O and R).
+          PGPASSWORD=vault_test_password psql -h localhost -U vault -d postgres -c "DROP DATABASE IF EXISTS vault_drift_check;"
+          PGPASSWORD=vault_test_password psql -h localhost -U vault -d postgres -c "CREATE DATABASE vault_drift_check OWNER vault;"
+          export VAULT_ENV=test VAULT_DATABASE_URL="postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_drift_check"
+          alembic upgrade head
+          test "$(alembic current 2>/dev/null | awk '{print $1}')" = "$(alembic heads 2>/dev/null | awk '{print $1}')"
+          python scripts/check_schema_drift.py
 
   browser-test:
     runs-on: ubuntu-latest
@@ -120,7 +138,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements-dev.txt
-          pip install playwright
+          pip install playwright==1.63.0  # pinned: test_browser.py targets this API (data=, not json=)
           python -m playwright install chromium --with-deps
 
       - name: Run browser E2E tests

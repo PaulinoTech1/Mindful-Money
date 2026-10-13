@@ -13,7 +13,7 @@ consecutive failures.
 3. Configure:
    - **Title:** `mindful-money-health`
    - **Protocol:** HTTPS
-   - **Hostname:** `mindful-money-31393284277.us-central1.run.app`
+   - **Hostname:** `mindful-money-k23ukkh5cq-uc.a.run.app`
    - **Path:** `/health`
    - **Port:** 443
    - **Check interval:** 5 minutes
@@ -38,7 +38,7 @@ gcloud alpha monitoring channels create \
 
 # Create uptime check
 gcloud monitoring uptime-checks create https mindful-money-health \
-  --hostname=mindful-money-31393284277.us-central1.run.app \
+  --hostname=mindful-money-k23ukkh5cq-uc.a.run.app \
   --path=/health \
   --port=443 \
   --period=300 \
@@ -79,9 +79,9 @@ This uses 1 check. **No billing impact.**
 ## Manual status check
 
 ```bash
-curl -s https://mindful-money-31393284277.us-central1.run.app/health
+curl -s https://mindful-money-k23ukkh5cq-uc.a.run.app/health
 # Expected: {"status": "ok"}
 
-curl -s https://mindful-money-31393284277.us-central1.run.app/ready
+curl -s https://mindful-money-k23ukkh5cq-uc.a.run.app/ready
 # Expected: {"status": "ready", "database": "ok"}
 ```

@@ -1,6 +1,6 @@
 # Threat Model
 
-**Date:** 2026-10-12
+**Date:** 2026-10-12 (risk register extended 2026-10-13)
 **Scope:** Mindful Money personal finance tracker (single-user, Cloud Run + Neon)
 **Method:** Adversarial review of code on main. Honesty is mandatory.
 
@@ -31,7 +31,7 @@
 | **SimpleFin** | Sees bank transactions | By design; user trusts SimpleFin with financial data. |
 | **Bank** | Sees own transactions | By design. |
 | **Thief (device)** | Physical access to unlocked device | Session timeouts and lock mitigate; unlocked browser = full access. |
-| **Thief (recovery key)** | Finds 32-word mnemonic | Can decrypt vault seed backup; still needs passkey for blob fetch. |
+| **Thief (recovery key)** | Finds 32-word mnemonic | Can decrypt vault seed backup; still needs a recent passkey assertion for blob fetch. The key survives a recovery unless deleted (see `docs/RECOVERY.md`). |
 | **Other app users** | Normal API access | Tenant isolation by `identity_id`; cannot access others' records. |
 
 ## Dominant residual risk
@@ -58,12 +58,18 @@ This is architectural, not a bug. The browser must trust the server to deliver c
 |------|-----------|--------|----------------------------------|----------|
 | Origin compromise → JS replacement → key exfiltration | Low (requires server or pipeline breach) | Catastrophic (full plaintext + passphrase) | SRI, manifest, CI checks, audit logging | **ACCEPTED. Dominant risk.** |
 | Weak passphrase → offline brute force | Medium (user behavior) | High (full vault decryption) | 60-bit entropy floor for new vaults, Argon2id v3 (5 ops, 256MB) | Reduced for new vaults; legacy vaults retain weaker params |
-| Recovery key theft | Low (physical/paper) | High (seed decryption) | Key is 256-bit; blob fetch requires passkey auth | Single point of failure; no threshold scheme |
+| Recovery key theft | Low (physical/paper) | High (seed decryption) | Key is 256-bit; blob fetch requires a recent passkey assertion | Single point of failure; no threshold scheme |
+| Interrupted or tampered rekey | Low | High (mixed keys or lost records) | Staging plus one commit transaction; commit checks every live record is replaced exactly once and the vault did not change; other sessions revoked | Writes blocked up to 15 min after a crashed rekey (`docs/RECOVERY.md`) |
 | Session hijacking | Low | Medium (API access, not plaintext) | `__Host-` prefix, HttpOnly, SameSite=Strict, server-side sessions, rotation | Session token theft via XSS is mitigated by CSP; no XSS found |
 | Database breach (Neon) | Low | Low (ciphertext only) | Bucket padding, sealed boxes, no plaintext at rest | Metadata leakage (record count, sizes, timestamps) |
 | SimpleFin credential theft | Medium (localStorage) | High (bank transaction access) | Server never sees URL; user responsible for device security | Bearer credential; anyone with the URL can fetch transactions |
 | Passkey phishing | Very low (WebAuthn) | Medium (account access, not plaintext) | WebAuthn origin binding | Cannot decrypt vault without passphrase |
 | Insider (developer) | Low (single operator) | Catastrophic (could ship malicious JS) | Git history, CI checks | **Same as origin compromise; must be accepted** |
+| KDF v3 silently falling back to v2 keys (split-brain vault) | Medium on memory-limited mobile browsers | High (records unreadable; new records sealed to a second key pair) | Fallback removed: v3 failure now throws `KDF_ALLOCATION_FAILED`, derives nothing (branch `hardening/2026-10-13`) | Implemented and unit-tested, not production-verified. Real-device v3 unlock still unverified. Detail: `docs/CLOUD_RUN_TROUBLESHOOTING.md` "KDF v3 silent fallback to v2" |
+| CSP `connect-src 'self' https:` | Low (needs XSS or origin compromise first) | High (any HTTPS host is a valid exfiltration endpoint, so CSP does not limit where stolen data goes) | Needed because the SimpleFin bridge URL is user-supplied; CSP still blocks script injection | **Open.** Narrowing to known SimpleFin hosts would help if the bridge host set is stable. Confidence high (read from `app.py` CSP). |
+| Bootstrap token exposure before first passkey | Low to medium while `bootstrap_needed` is true | High (whoever presents the token first enrolls the first passkey and owns the vault) | Token mandatory in production; constant-time compare; registration rate limit; refused once any passkey exists | **Open until enrollment.** RUNBOOK records the token was set with `--set-env-vars`, so it is a plain env var visible to anyone with Cloud Run viewer access, not a Secret Manager reference. Enroll on the canonical host, then remove the token. See `docs/BOOTSTRAP_TOKEN.md`. |
+| Per-request DB write in the rate limiter | Medium (any DB fault) | Medium (every `/api/*` returns 503 while `/health` stays 200) | Postgres-backed limiter is shared across instances (correct); `/ready` now in deploy smoke tests | **Accepted coupling.** `apply_rate_limit` upserts `rate_limits` before every `/api/*` request, so DB failure equals full API outage (this is how the 2026-10-12 seed bug spread). Fail-open would weaken auth rate limits; kept fail-closed and now loud: DB errors log a redacted `event="db_error"` line (`docs/HARDENING_PROPOSALS.md` P1). Confidence high. |
+| ZKP verifier absent in production | Certain with the current image | Low (feature unavailable, not bypassed) | `zkp_verifier.artifacts_available()` gates the challenge endpoint, returning 503; "unavailable" is never treated as "accepted" | **Open.** The Dockerfile copies neither `bb` nor `zkp/` (also excluded by `.dockerignore`), so v3 binding proofs are not verified server-side in production. Startup logs `zkp_artifacts_available available="0"`. Confidence high (code read; not production-verified). |
 
 ## What the operator must accept
 

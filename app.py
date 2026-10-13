@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_from_directory, session
 from flask.sessions import SessionInterface, SessionMixin
-from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy import delete, func, insert, literal, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -45,10 +45,16 @@ SESSION_TTL = int(os.environ.get("VAULT_SESSION_TTL", str(4 * 60 * 60)))
 SESSION_IDLE_TTL = int(os.environ.get("VAULT_SESSION_IDLE_TTL", "900"))
 # Strict: 15 minute idle timeout (was 30min). Reduces window for session hijacking.
 MAX_REQUEST_BYTES = int(os.environ.get("VAULT_MAX_REQUEST_BYTES", str(8 * 1024 * 1024)))
-MAX_RECORDS_PER_BATCH = int(os.environ.get("VAULT_MAX_RECORDS_PER_BATCH", "1000"))
+# 500 so the worst-case batch fits MAX_REQUEST_BYTES by construction:
+# 14 + 500 * 16575 = 8,287,514 <= 8,388,608 (derivation: README "Ciphertext and resource limits").
+MAX_RECORDS_PER_BATCH = int(os.environ.get("VAULT_MAX_RECORDS_PER_BATCH", "500"))
 MAX_TOTAL_RECORDS = int(os.environ.get("VAULT_MAX_TOTAL_RECORDS", "100000"))
 MIN_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MIN_SEALED_HEX_LENGTH", "96"))
-MAX_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MAX_SEALED_HEX_LENGTH", "16384"))
+# Largest client bucket (static/app.js PAD_BUCKETS) is 8192 bytes; a NaCl
+# sealed box adds crypto_box_SEALBYTES = 48 (ephemeral public key 32 + MAC 16),
+# so the largest ciphertext is 8240 bytes = 16480 hex characters.
+MAX_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MAX_SEALED_HEX_LENGTH", "16480"))
+KDF_VERSIONS = frozenset({1, 2, 3})
 MAX_JSON_OBJECT_BYTES = int(os.environ.get("VAULT_MAX_JSON_OBJECT_BYTES", str(8 * 1024 * 1024)))
 MAX_LABEL_LENGTH = 80
 VAULT_STEPUP_WINDOW_SECONDS = int(os.environ.get("VAULT_STEPUP_WINDOW_SECONDS", "300"))
@@ -93,6 +99,12 @@ def _lookup_asn(ip_address):
     return None, None
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _LOWER_HEX = re.compile(r"[0-9a-f]+\Z")
+_LOWER_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _is_lower_hex(value: str) -> bool:
+    """Non-empty lowercase hex, checked without a regex (linear, no backtracking)."""
+    return bool(value) and set(value) <= _LOWER_HEX_CHARS
 _B64URL = re.compile(r"[A-Za-z0-9_-]{2,1024}\Z")
 
 
@@ -173,7 +185,13 @@ RATE_LIMITS = {
     "login_options": (int(os.environ.get("VAULT_RATE_LOGIN_OPTIONS", "20")), 300),
     "login_verify": (int(os.environ.get("VAULT_RATE_LOGIN_VERIFY", "10")), 600),
     "registration": (int(os.environ.get("VAULT_RATE_REGISTRATION", "10")), 3600),
-    "upload": (int(os.environ.get("VAULT_RATE_UPLOAD", "10")), 60),
+    # 60 per minute per identity (anonymous: per client IP). Derivation:
+    # README "Ciphertext and resource limits".
+    "upload": (int(os.environ.get("VAULT_RATE_UPLOAD", "60")), 60),
+    # Rekey begin/commit/abort and recovery blob fetch/delete: a handful per
+    # recovery; 10 and 20 per hour leave room for retries.
+    "rekey": (int(os.environ.get("VAULT_RATE_REKEY", "10")), 3600),
+    "recovery": (int(os.environ.get("VAULT_RATE_RECOVERY", "20")), 3600),
     "delete": (int(os.environ.get("VAULT_RATE_DELETE", "3")), 3600),
     "zkp_challenge": (int(os.environ.get("VAULT_RATE_ZKP_CHALLENGE", "20")), 300),
     # Proof verification shells out to `bb` -- meaningfully more expensive
@@ -197,8 +215,52 @@ def too_large(_error):
     return api_error("Request body is too large", 413)
 
 
+# Redaction for DB error logging. Patterns are applied in order to the
+# FIRST LINE of the driver error only. SQLAlchemy's str(error) appends
+# "[SQL: ...]" and "[parameters: ...]", so it is never logged.
+_REDACT_PATTERNS = [
+    (re.compile(r"[a-z][a-z0-9+.\-]*://\S+", re.I), "<url>"),
+    (re.compile(r"\b(password|passwd|pwd|user|host|hostaddr|dbname|sslpassword)\s*=\s*('[^']*'|\S+)", re.I), r"\1=<redacted>"),
+    (re.compile(r"\b[\w.+\-]+@[\w.\-]+(:\d+)?", re.I), "<user@host>"),
+    (re.compile(r"\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b"), "<ip>"),
+    (re.compile(r'\b(?:host|server|address)(?:\s+at)?\s+"?[\w.\-]+"?', re.I), "host <redacted>"),
+    # Any remaining dotted hostname (a.b.c or longer), quoted or not.
+    (re.compile(r"\b[a-z0-9\-_]+(?:\.[a-z0-9\-_]+){2,}\b", re.I), "<host>"),
+    (re.compile(r"\b(?:user|role)\s+\"[^\"]*\"", re.I), "user <redacted>"),
+    (re.compile(r"\[(?:SQL|parameters):.*", re.I | re.S), "<stmt>"),
+    (re.compile(r"\([^()]*\)=\([^()]*\)"), "(<key>)=(<redacted>)"),
+]
+
+
+def _redact_db_detail(error, limit=200):
+    """Class names, SQLSTATE, and a redacted first line. Never the URL,
+    statement, or bound parameters."""
+    orig = getattr(error, "orig", None)
+    source = orig if orig is not None else error
+    try:
+        raw = str(source)
+    except Exception:
+        raw = ""
+    first = (raw.strip().splitlines() or [""])[0]
+    for pattern, repl in _REDACT_PATTERNS:
+        first = pattern.sub(repl, first)
+    first = first.replace('"', "'")[:limit]
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None) or getattr(error, "code", None) or ""
+    return {
+        "cls": type(error).__name__,
+        "orig_cls": type(orig).__name__ if orig is not None else "",
+        "sqlstate": str(sqlstate)[:16],
+        "detail": first,
+    }
+
+
 @app.errorhandler(SQLAlchemyError)
-def database_error(_error):
+def database_error(error):
+    # Fail loudly to the operator, generically to the client.
+    # See docs/CLOUD_RUN_TROUBLESHOOTING.md "_seed_identity NotNullViolation".
+    info = _redact_db_detail(error)
+    LOG.error('event="db_error" class="%s" orig_class="%s" sqlstate="%s" path="%s" detail="%s"',
+              info["cls"], info["orig_cls"], info["sqlstate"], request.path, info["detail"])
     return api_error("The request could not be completed", 503)
 
 
@@ -331,6 +393,9 @@ def _rate_group():
     if path == "/api/passkeys/login/verify": return "login_verify"
     if path.startswith("/api/passkeys/register/"): return "registration"
     if path == "/api/records" and method == "POST": return "upload"
+    if path == "/api/vault/rekey/records": return "upload"
+    if path.startswith("/api/vault/rekey/"): return "rekey"
+    if path in {"/api/recovery/blob", "/api/recovery/delete"}: return "recovery"
     if path == "/api/records" and method == "DELETE": return "delete"
     if path == "/api/zkp/challenge": return "zkp_challenge"
     if path == "/api/records/manual": return "zkp_verify"
@@ -587,6 +652,9 @@ class ServerSession(dict, SessionMixin):
     def __init__(self, initial=None, sid=None, new=False):
         super().__init__(initial or {})
         self.sid, self.new, self.modified = sid, new, False
+        # Ceremony id as loaded, so save_session can tell whether THIS request
+        # changed it (bug F: a concurrent request must not clobber it).
+        self.loaded_ceremony_id = self.get("active_ceremony_id")
 
 
 def _sid_hash(sid: str) -> str:
@@ -639,12 +707,18 @@ class SQLAlchemySessionInterface(SessionInterface):
                 vault_unlocked=bool(sess.get("vault_unlocked")), active_ceremony_id=sess.get("active_ceremony_id"),
                 created_at=created, last_seen_at=now, expires_at=expires, revoked_at=None,
             )
+            # Only a request that started or consumed a ceremony writes
+            # active_ceremony_id; any other request keeps the stored value, so
+            # an overlapping request on the same session (e.g. a stray login
+            # options call during bootstrap) cannot erase a live ceremony.
+            ceremony_changed = getattr(sess, "loaded_ceremony_id", None) != sess.get("active_ceremony_id")
             stmt = stmt.on_conflict_do_update(
                 index_elements=["session_id_hash"],
                 set_=dict(
                     csrf_token=stmt.excluded.csrf_token, identity_id=stmt.excluded.identity_id,
                     authenticated_at=stmt.excluded.authenticated_at, vault_unlocked=stmt.excluded.vault_unlocked,
-                    active_ceremony_id=stmt.excluded.active_ceremony_id, last_seen_at=stmt.excluded.last_seen_at,
+                    active_ceremony_id=stmt.excluded.active_ceremony_id if ceremony_changed else table.c.active_ceremony_id,
+                    last_seen_at=stmt.excluded.last_seen_at,
                     expires_at=stmt.excluded.expires_at, revoked_at=stmt.excluded.revoked_at,
                 ),
             )
@@ -1118,7 +1192,9 @@ def ready():
         conn.execute(text("SELECT 1"))
         return jsonify({"status": "ready", "database": "ok"})
     except Exception as e:
-        LOG.warning('event="readiness_failed" error="%s"', str(e)[:100])
+        info = _redact_db_detail(e, limit=100)
+        LOG.warning('event="readiness_failed" class="%s" orig_class="%s" sqlstate="%s" detail="%s"',
+                    info["cls"], info["orig_cls"], info["sqlstate"], info["detail"])
         return jsonify({"status": "not_ready", "database": "error"}), 503
 
 
@@ -1151,6 +1227,33 @@ def logout():
     LOG.info('event="session_revoked" client="%s"', _client_log_id())
     return jsonify({"signed_out": True})
 
+REKEY_TTL_SECONDS = int(os.environ.get("VAULT_REKEY_TTL_SECONDS", "600"))
+
+
+def _vault_write_guard(conn, owner_id):
+    """Serialize record writes against a vault rekey commit.
+
+    Takes a shared lock on the identity row (rekey commit takes it FOR
+    UPDATE), then refuses the write if this session was revoked (a commit
+    revokes every other session of the vault, whose tabs hold the old keys)
+    or a rekey is in progress (records written now would be under the old
+    keys and missing from the staged set). Returns an error response or None.
+    """
+    ident = models.VaultIdentity.__table__
+    conn.execute(select(ident.c.id).where(ident.c.id == owner_id).with_for_update(read=True))
+    sessions = models.ServerSession.__table__
+    revoked = conn.execute(select(sessions.c.revoked_at).where(
+        sessions.c.session_id_hash == _sid_hash(session.sid))).scalar()
+    if revoked is not None:
+        conn.rollback(); return api_error("This session has ended. Sign in again.", 401)
+    rekeys = models.VaultRekey.__table__
+    active = conn.execute(select(func.count()).select_from(rekeys).where(
+        (rekeys.c.identity_id == owner_id) & (rekeys.c.expires_at > time.time()))).scalar_one()
+    if active:
+        conn.rollback(); return api_error("Vault re-encryption in progress. Try again shortly.", 409)
+    return None
+
+
 @app.post("/api/records")
 def put_records():
     denied = require_access()
@@ -1173,6 +1276,8 @@ def put_records():
         seen.add(blind); validated.append((blind, sealed, len(bytes.fromhex(sealed))))
     table = models.Record.__table__
     conn = db()
+    blocked = _vault_write_guard(conn, owner_id)
+    if blocked: return blocked
     existing = 0
     if seen:
         existing = conn.execute(select(func.count()).select_from(table).where(
@@ -1352,6 +1457,8 @@ def create_manual_expense_zkp():
 
     table = models.Record.__table__
     conn = db()
+    blocked = _vault_write_guard(conn, owner_id)
+    if blocked: return blocked
     today = date.today()
     stmt = pg_insert(table).values(
         identity_id=owner_id, blind_index=blind, sealed=sealed, bytes=len(bytes.fromhex(sealed)), stored_at=today,
@@ -1420,7 +1527,10 @@ def reset():
     if denied: return denied
     table = models.Record.__table__
     owner_id = current_identity_id()
-    conn=db(); conn.execute(delete(table).where(table.c.identity_id == owner_id)); conn.commit()
+    conn=db()
+    blocked = _vault_write_guard(conn, owner_id)
+    if blocked: return blocked
+    conn.execute(delete(table).where(table.c.identity_id == owner_id)); conn.commit()
     LOG.info('event="vault_records_deleted" client="%s"', _client_log_id())
     return jsonify({"reset":True})
 
@@ -1916,6 +2026,13 @@ def migrate_kdf_salts():
     force = payload.get("force", False)
     if not salt_enc_hex or not salt_idx_hex:
         return api_error("salt_enc and salt_idx required", 400)
+    # kdf_version is REQUIRED and stored in the same UPDATE as the salts.
+    # Salts without their KDF version make the next unlock derive different
+    # keys (docs/CLOUD_RUN_TROUBLESHOOTING.md, bug D). No default: the only
+    # client (importBackup) always sends it.
+    kdf_version = payload.get("kdf_version")
+    if type(kdf_version) is not int or kdf_version not in KDF_VERSIONS:
+        return api_error("kdf_version required: one of 1, 2, 3", 400)
     try:
         salt_enc = bytes.fromhex(salt_enc_hex)
         salt_idx = bytes.fromhex(salt_idx_hex)
@@ -1951,10 +2068,11 @@ def migrate_kdf_salts():
     conn.execute(
         update(table)
         .where(table.c.id == identity_id)
-        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, updated_at=func.now())
+        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, kdf_version=kdf_version,
+                updated_at=func.now())
     )
     conn.commit()
-    LOG.info('event="kdf_salts_migrated" client="%s"', _client_log_id())
+    LOG.info('event="kdf_salts_migrated" kdf_version=%d client="%s"', kdf_version, _client_log_id())
     return jsonify({"migrated": True})
 
 
@@ -2023,15 +2141,6 @@ def acknowledge_audit_event(event_id):
     return jsonify({"acknowledged": True, "event_id": event_id})
 
 
-if __name__ == "__main__":
-    if PRODUCTION:
-        raise RuntimeError("Production must run app:app through the supported Gunicorn service")
-    host=os.environ.get("VAULT_HOST","127.0.0.1")
-    if AUTH_POLICY=="optional" and host not in {"127.0.0.1","::1","localhost"}: raise RuntimeError("Optional authentication may bind only to loopback")
-    print(f"vault demo  ->  {ORIGIN}")
-    app.run(host=host,port=int(os.environ.get("VAULT_PORT","5000")),debug=False)
-
-
 # ------------------------------------------------------------------
 # Recovery key mechanism
 # ------------------------------------------------------------------
@@ -2091,11 +2200,14 @@ def recovery_get_blob():
     Requires passkey authentication (not just session). The blob is useless
     without the recovery key, which the server never sees.
     """
-    denied = require_access()
+    # Bug L: this used to check session["passkey_authenticated"], which
+    # nothing set and the server session store cannot hold, so it always
+    # returned 403. The gate is now the existing destructive-management
+    # check: a registered passkey, a passkey-authenticated session, and a
+    # WebAuthn assertion within VAULT_STEPUP_WINDOW_SECONDS. A user who
+    # forgot the passphrase can still pass it with their passkey.
+    denied = require_destructive_management()
     if denied: return denied
-    # Require fresh passkey auth for recovery blob access
-    if not session.get("passkey_authenticated"):
-        return api_error("Passkey authentication required", 403)
     identity_id = current_identity_id()
     if not identity_id:
         return api_error("No identity", 403)
@@ -2115,10 +2227,8 @@ def recovery_get_blob():
 @app.post("/api/recovery/delete")
 def recovery_delete():
     """Delete the recovery blob. Requires passkey authentication."""
-    denied = require_access()
+    denied = require_destructive_management()  # same gate as the blob fetch (bug L)
     if denied: return denied
-    if not session.get("passkey_authenticated"):
-        return api_error("Passkey authentication required", 403)
     identity_id = current_identity_id()
     if not identity_id:
         return api_error("No identity", 403)
@@ -2133,3 +2243,215 @@ def recovery_delete():
     conn.commit()
     LOG.info('event="recovery_deleted" client="%s"', _client_log_id())
     return jsonify({"ok": True})
+
+
+@app.get("/api/recovery/status")
+def recovery_status():
+    """Whether a recovery blob exists (no blob content). Session access only,
+    so the UI can show the state without a passkey step-up."""
+    denied = require_access()
+    if denied: return denied
+    table = models.VaultIdentity.__table__
+    blob = db().execute(select(table.c.recovery_blob).where(table.c.id == current_identity_id())).scalar()
+    return jsonify({"set_up": blob is not None})
+
+
+# ------------------------------------------------------------------
+# Vault rekey: atomic re-encryption under new keys (bug M, K)
+# ------------------------------------------------------------------
+# Design and crash-safety notes: docs/RECOVERY.md "Re-encryption (rekey)".
+
+_LIVE_DIGEST_SQL = text(
+    "SELECT count(*), coalesce(encode(sha256(convert_to(string_agg("
+    "blind_index || ':' || md5(sealed), ',' ORDER BY blind_index), 'UTF8')), 'hex'), '') "
+    "FROM records WHERE identity_id = :owner"
+)
+
+
+def _live_snapshot(conn, owner_id):
+    count, digest = conn.execute(_LIVE_DIGEST_SQL, {"owner": owner_id}).one()
+    return int(count), digest
+
+
+def _active_rekey(conn, owner_id, rekey_id):
+    rekeys = models.VaultRekey.__table__
+    if not isinstance(rekey_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", rekey_id):
+        return None
+    return conn.execute(select(rekeys).where(
+        (rekeys.c.id == rekey_id) & (rekeys.c.identity_id == owner_id)
+        & (rekeys.c.expires_at > time.time()))).mappings().first()
+
+
+@app.post("/api/vault/rekey/begin")
+def rekey_begin():
+    """Start a rekey. Requires a recent passkey assertion (like the recovery
+    blob fetch). Replaces any earlier unfinished rekey of this vault."""
+    denied = require_destructive_management()
+    if denied: return denied
+    owner_id = current_identity_id()
+    payload, error = _json_object()
+    if error: return error
+    if payload: return api_error("Body must be empty", 400)
+    conn = db()
+    ident = models.VaultIdentity.__table__
+    row = conn.execute(select(ident.c.kdf_salt_enc).where(ident.c.id == owner_id).with_for_update()).first()
+    if not row or row.kdf_salt_enc is None:
+        conn.rollback(); return api_error("Vault has no salts to replace", 409)
+    rekeys = models.VaultRekey.__table__
+    conn.execute(delete(rekeys).where(rekeys.c.identity_id == owner_id))
+    count, digest = _live_snapshot(conn, owner_id)
+    now = time.time()
+    rekey_id = secrets.token_urlsafe(32)
+    conn.execute(insert(rekeys).values(id=rekey_id, identity_id=owner_id, base_count=count,
+                                       base_digest=digest, created_at=now, expires_at=now + REKEY_TTL_SECONDS))
+    conn.commit()
+    LOG.info('event="vault_rekey_begin" records=%d client="%s"', count, _client_log_id())
+    return jsonify({"rekey_id": rekey_id, "record_count": count, "expires_in": REKEY_TTL_SECONDS})
+
+
+@app.post("/api/vault/rekey/records")
+def rekey_stage_records():
+    """Stage one chunk of re-encrypted records. Same shape and limits as
+    POST /api/records plus old_blind_index (the live record it replaces)."""
+    denied = require_access()
+    if denied: return denied
+    owner_id = current_identity_id()
+    payload, error = _json_object()
+    if error: return error
+    if set(payload) != {"rekey_id", "records"}: return api_error("Body must contain rekey_id and records", 400)
+    rows = payload["records"]
+    if not isinstance(rows, list): return api_error("records must be a list", 400)
+    if len(rows) > MAX_RECORDS_PER_BATCH: return api_error("Record batch is too large", 413)
+    validated, seen, seen_old = [], set(), set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"blind_index", "old_blind_index", "sealed"}:
+            return api_error("Invalid record", 400)
+        blind, old, sealed = row["blind_index"], row["old_blind_index"], row["sealed"]
+        if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind): return api_error("Invalid record", 400)
+        if not isinstance(old, str) or not _LOWER_HEX_64.fullmatch(old): return api_error("Invalid record", 400)
+        if blind in seen or old in seen_old: return api_error("Duplicate record in batch", 400)
+        if not isinstance(sealed, str) or not MIN_SEALED_HEX_LENGTH <= len(sealed) <= MAX_SEALED_HEX_LENGTH or len(sealed) % 2 or not _is_lower_hex(sealed):
+            return api_error("Invalid record", 400)
+        seen.add(blind); seen_old.add(old); validated.append((blind, old, sealed, len(sealed) // 2))
+    conn = db()
+    rk = _active_rekey(conn, owner_id, payload["rekey_id"])
+    if not rk:
+        conn.rollback(); return api_error("No active rekey with this id", 404)
+    staged = models.VaultRekeyRecord.__table__
+    have = conn.execute(select(func.count()).select_from(staged).where(staged.c.rekey_id == rk["id"])).scalar_one()
+    if have + len(validated) > rk["base_count"]:
+        conn.rollback(); return api_error("More records staged than the vault holds", 409)
+    if validated:
+        try:
+            conn.execute(insert(staged), [
+                {"rekey_id": rk["id"], "blind_index": b, "old_blind_index": o, "sealed": s_, "bytes": n}
+                for b, o, s_, n in validated])
+            conn.commit()
+        except IntegrityError:
+            conn.rollback(); return api_error("Record already staged", 409)
+    return jsonify({"staged": have + len(validated)})
+
+
+@app.post("/api/vault/rekey/commit")
+def rekey_commit():
+    """Swap in the staged records, new salts, KDF version and recovery blob
+    in ONE transaction, then end every other session of this vault."""
+    denied = require_access()
+    if denied: return denied
+    owner_id = current_identity_id()
+    payload, error = _json_object()
+    if error: return error
+    keys = set(payload)
+    if not {"rekey_id", "salt_enc", "salt_idx", "kdf_version"} <= keys or keys - {"rekey_id", "salt_enc", "salt_idx", "kdf_version", "recovery_blob"}:
+        return api_error("Invalid rekey commit", 400)
+    salt_enc, salt_idx, version = payload["salt_enc"], payload["salt_idx"], payload["kdf_version"]
+    for salt in (salt_enc, salt_idx):
+        if not isinstance(salt, str) or not re.fullmatch(r"[0-9a-f]{32}", salt):
+            return api_error("Salts must be 32 lowercase hex characters", 400)
+    if salt_enc == salt_idx: return api_error("Salts must differ", 400)
+    if type(version) is not int or version not in KDF_VERSIONS: return api_error("Invalid kdf_version", 400)
+    blob_hex = payload.get("recovery_blob")
+    if blob_hex is not None:
+        if not isinstance(blob_hex, str) or not 64 <= len(blob_hex) <= 2048 or len(blob_hex) % 2 or not _is_lower_hex(blob_hex):
+            return api_error("Invalid recovery_blob", 400)
+    conn = db()
+    ident = models.VaultIdentity.__table__
+    row = conn.execute(select(ident.c.recovery_blob, ident.c.kdf_salt_enc).where(ident.c.id == owner_id).with_for_update()).first()
+    rk = _active_rekey(conn, owner_id, payload["rekey_id"])
+    if not row or not rk:
+        conn.rollback(); return api_error("No active rekey with this id", 404)
+    if (row.recovery_blob is None) != (blob_hex is None):
+        conn.rollback()
+        return api_error("recovery_blob is required exactly when the vault has a recovery key", 400)
+    rekeys = models.VaultRekey.__table__
+    count, digest = _live_snapshot(conn, owner_id)
+    if (count, digest) != (rk["base_count"], rk["base_digest"]):
+        conn.execute(delete(rekeys).where(rekeys.c.id == rk["id"])); conn.commit()
+        return api_error("The vault changed during re-encryption. Nothing was changed; start again.", 409)
+    staged = models.VaultRekeyRecord.__table__
+    records = models.Record.__table__
+    staged_count = conn.execute(select(func.count()).select_from(staged).where(staged.c.rekey_id == rk["id"])).scalar_one()
+    matched = conn.execute(select(func.count()).select_from(staged.join(
+        records, (records.c.identity_id == owner_id) & (records.c.blind_index == staged.c.old_blind_index)
+    )).where(staged.c.rekey_id == rk["id"])).scalar_one()
+    if staged_count != count or matched != count:
+        conn.rollback()
+        return api_error("The re-encrypted set does not replace every record exactly once. Nothing was changed.", 409)
+    # Public ZK commitments (not secrets) follow their record to its new index.
+    carried = conn.execute(select(staged.c.blind_index, records.c.commitment, records.c.circuit_version).select_from(
+        staged.join(records, (records.c.identity_id == owner_id) & (records.c.blind_index == staged.c.old_blind_index))
+    ).where((staged.c.rekey_id == rk["id"]) & records.c.commitment.is_not(None))).all()
+    conn.execute(delete(records).where(records.c.identity_id == owner_id))
+    conn.execute(insert(records).from_select(
+        ["identity_id", "blind_index", "sealed", "bytes", "stored_at"],
+        select(literal(owner_id, type_=records.c.identity_id.type), staged.c.blind_index, staged.c.sealed, staged.c.bytes, func.current_date())
+        .where(staged.c.rekey_id == rk["id"])))
+    for blind, commitment, circuit in carried:
+        conn.execute(update(records).where((records.c.identity_id == owner_id) & (records.c.blind_index == blind))
+                     .values(commitment=commitment, circuit_version=circuit))
+    values = dict(kdf_salt_enc=bytes.fromhex(salt_enc), kdf_salt_idx=bytes.fromhex(salt_idx),
+                  kdf_version=version, updated_at=func.now())
+    if blob_hex is not None:
+        values.update(recovery_blob=bytes.fromhex(blob_hex), recovery_created_at=func.now())
+    conn.execute(update(ident).where(ident.c.id == owner_id).values(**values))
+    conn.execute(delete(rekeys).where(rekeys.c.id == rk["id"]))
+    sessions = models.ServerSession.__table__
+    conn.execute(update(sessions).where(
+        (sessions.c.identity_id == owner_id) & (sessions.c.session_id_hash != _sid_hash(session.sid))
+        & sessions.c.revoked_at.is_(None)).values(revoked_at=time.time()))
+    conn.commit()
+    session["vault_unlocked"] = False
+    LOG.info('event="vault_rekey_commit" records=%d client="%s"', count, _client_log_id())
+    return jsonify({"rekeyed": True, "records": count})
+
+
+@app.post("/api/vault/rekey/abort")
+def rekey_abort():
+    """Discard this vault's unfinished rekey, if any. The live vault was never
+    touched, so this only unblocks writes before the TTL expires."""
+    denied = require_access()
+    if denied: return denied
+    payload, error = _json_object()
+    if error: return error
+    if payload: return api_error("Body must be empty", 400)
+    rekeys = models.VaultRekey.__table__
+    conn = db()
+    owner_id = current_identity_id()
+    # Same lock as commit (FOR UPDATE): an abort waits for an in-progress
+    # commit and then finds nothing to delete, so writes never interleave
+    # with a commit (bug P).
+    ident = models.VaultIdentity.__table__
+    conn.execute(select(ident.c.id).where(ident.c.id == owner_id).with_for_update())
+    gone = conn.execute(delete(rekeys).where(rekeys.c.identity_id == owner_id)).rowcount
+    conn.commit()
+    return jsonify({"aborted": bool(gone)})
+
+
+# Kept last so every route above is registered before the dev server starts.
+if __name__ == "__main__":
+    if PRODUCTION:
+        raise RuntimeError("Production must run app:app through the supported Gunicorn service")
+    host=os.environ.get("VAULT_HOST","127.0.0.1")
+    if AUTH_POLICY=="optional" and host not in {"127.0.0.1","::1","localhost"}: raise RuntimeError("Optional authentication may bind only to loopback")
+    print(f"vault demo  ->  {ORIGIN}")
+    app.run(host=host,port=int(os.environ.get("VAULT_PORT","5000")),debug=False)

@@ -197,10 +197,46 @@ origin inference.
 ```
 
 The whole batch is validated before an atomic upsert. Unknown fields,
-duplicates, malformed blind indexes, and ciphertext outside 96–16384 hex
-characters are rejected without partial writes. Defaults are an 8 MiB request
-and JSON limit, 1,000 records per batch, and 100,000 stored records per tenant.
+duplicates, malformed blind indexes, and ciphertext outside 96 to 16480 hex
+characters are rejected without partial writes. 16480 is exact: the largest
+client padding bucket is 8192 bytes and a NaCl sealed box adds 48
+(`crypto_box_SEALBYTES`: 32-byte ephemeral public key plus 16-byte MAC), so
+8240 bytes, 16480 hex. Raise it only together with `PAD_BUCKETS` in
+`static/app.js`. Defaults are an 8 MiB request
+and JSON limit, 500 records per batch, and 100,000 stored records per tenant.
 Byte counts are computed from decoded hex on the server.
+
+500 records per batch is derived so that a worst-case batch always fits the
+8 MiB request limit. In compact JSON one record is
+`{"blind_index":"<64 hex>","sealed":"<16480 hex>"}` = 30 + 64 + 16480 =
+16574 bytes, plus 1 for the separating comma, and the wrapper
+`{"records":[]}` is 14 bytes. So N records take at most 14 + 16575 N bytes,
+and 14 + 16575 N <= 8,388,608 gives N <= 506. 500 leaves margin: 14 +
+500 x 16575 = 8,287,514 bytes. `test_kdf_migrate_and_limits.py` asserts this
+invariant against the configured values; if you raise any of these limits,
+keep it true. The browser (`uploadSealedRecords` in `static/app.js`) splits
+every bulk upload (connect, CSV import, backup restore, re-encryption) into
+chunks of at most 500 records and 6 MiB of body, so no client request can hit
+either limit. Each chunk is atomic, but a multi-chunk upload is not atomic as
+a whole: if a later chunk fails, earlier chunks stay stored. Uploads are
+upserts keyed by blind index, so retrying the same operation converges.
+`MAX_REQUEST_BYTES` is deliberately not raised: Cloud Run caps HTTP/1 request
+bodies at 32 MiB, and a larger limit only widens the memory and parsing DoS
+surface.
+
+`POST /api/records` is rate limited to 60 requests per 60 s fixed window,
+keyed per vault identity when signed in and per client IP (HMAC of the
+trusted remote address) otherwise. Derivation: every single edit (manual
+entry, edit, rename, fraud flag) is one request, and a fast user does well
+under one edit per second for a sustained minute; 30 edits in a minute is
+the realistic burst the tests accept. A bulk sync is a few chunks (1,200
+records is 3 chunks), so 60 covers a burst of edits plus several syncs with
+2x headroom over the 30-edit burst. The previous 10 was hit by ordinary
+editing. Abuse bound: 60 requests of at most 8 MiB is about 480 MiB per
+minute per identity, still bounded by the 100,000-record tenant cap for
+storage; the fixed window allows up to 2x at a window boundary. An upload
+larger than 60 chunks (tens of thousands of records) waits for the 429
+`Retry-After` and retries the same chunk, up to 3 times per chunk.
 
 Configuration overrides are `VAULT_SESSION_TTL`, `VAULT_SESSION_IDLE_TTL`,
 `VAULT_CHALLENGE_TTL`, `VAULT_MAX_REQUEST_BYTES`,

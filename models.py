@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 
 from sqlalchemy import (
+    Index,
     BigInteger,
     Boolean,
     Date,
@@ -26,6 +27,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -51,7 +53,8 @@ class VaultIdentity(Base):
     kdf_salt_idx: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     # KDF version for future algorithm upgrades. Version 1 = Argon2id with
     # OPSLIMIT_INTERACTIVE, MEMLIMIT_INTERACTIVE (current).
-    kdf_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # server_default matches migration c4d9e3f2a1b6 (production truth, bug R).
+    kdf_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))
     # Encrypted recovery blob: vault seed encrypted with the recovery key.
     # The server never sees the recovery key. Null if recovery not set up.
     recovery_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
@@ -259,4 +262,57 @@ class AuditEvent(Base):
     )
     acknowledged_by: Mapped[int | None] = mapped_column(
         ForeignKey("vault_identity.id", ondelete="SET NULL")
+    )
+
+    # Created by migration e1f2a3b4c5d6; declared here so autogenerate sees no
+    # drift (bug O). Serves the per-identity time-range queries: login lockout
+    # (identity + occurred_at >= now - 15 min), the security dashboard counts
+    # and the audit log listing (identity ORDER BY occurred_at DESC).
+    __table_args__ = (Index("ix_audit_events_identity_occurred", "identity_id", "occurred_at"),)
+
+
+class VaultRekey(Base):
+    """An in-progress re-encryption of one vault (recovery or passphrase change).
+
+    Records re-encrypted under the new keys are staged in ``vault_rekey_records``
+    and swapped in, together with the new salts, KDF version and recovery
+    blob, by a single commit transaction. Until then the live vault is
+    untouched. ``base_digest``/``base_count`` snapshot the live record set at
+    begin so commit can refuse if it changed. At most one per identity.
+    """
+
+    __tablename__ = "vault_rekeys"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    identity_id: Mapped[int] = mapped_column(
+        ForeignKey("vault_identity.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    base_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    base_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Double, nullable=False, index=True)
+
+
+class VaultRekeyRecord(Base):
+    """A record re-encrypted under the new keys, waiting for rekey commit.
+
+    ``old_blind_index`` names the live record it replaces, so commit can check
+    that every live record is replaced exactly once and carry over its public
+    ZK commitment. Ciphertext stays opaque to the server, as in ``records``.
+    """
+
+    __tablename__ = "vault_rekey_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rekey_id: Mapped[str] = mapped_column(
+        ForeignKey("vault_rekeys.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    blind_index: Mapped[str] = mapped_column(String(64), nullable=False)
+    old_blind_index: Mapped[str] = mapped_column(String(64), nullable=False)
+    sealed: Mapped[str] = mapped_column(Text, nullable=False)
+    bytes_len: Mapped[int] = mapped_column("bytes", Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("rekey_id", "blind_index", name="uq_rekey_records_blind_index"),
+        UniqueConstraint("rekey_id", "old_blind_index", name="uq_rekey_records_old_blind_index"),
     )

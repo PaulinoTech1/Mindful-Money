@@ -54,6 +54,8 @@ HERE = Path(__file__).parent
 BACKUP_PATH = Path("/tmp/playwright-recovery-backup.json")
 
 PASSPHRASE = "playwright-recovery-passphrase"
+# TEST-ONLY dummy bootstrap token, set only in this test server's env.
+TEST_BOOTSTRAP_TOKEN = "test-only-bootstrap-token-not-a-secret"
 MERCHANTS = [
     "PLAYWRIGHT-MERCHANT-9999",
     "PLAYWRIGHT-MERCHANT-1000",
@@ -111,6 +113,7 @@ def start_server(port: int, test_db_url: str) -> subprocess.Popen:
         "VAULT_SECRET_KEY": "playwright-recovery-test-secret",
         "VAULT_CSP_MODE": "enforce",
         "VAULT_DATABASE_URL": test_db_url,
+        "VAULT_BOOTSTRAP_TOKEN": TEST_BOOTSTRAP_TOKEN,
     })
     proc = subprocess.Popen(
         [sys.executable, "-c", f"import app; app.app.run(port={port})"],
@@ -173,13 +176,12 @@ def do_bootstrap(page, check: Check) -> None:
     """Real first-passkey enrollment through the bootstrap UI.
 
     The bootstrap flow prompts for a token via prompt(); the test server runs
-    without VAULT_BOOTSTRAP_TOKEN configured, so any non-empty value is
-    accepted server-side.
+    with the test-only TEST_BOOTSTRAP_TOKEN, so the token check is exercised.
     """
     cdp, authenticator_id = add_virtual_authenticator(page)
     try:
         def handle_prompt(dialog):
-            dialog.accept("dev-bootstrap-token")
+            dialog.accept(TEST_BOOTSTRAP_TOKEN)
             page.remove_listener("dialog", handle_prompt)
         page.on("dialog", handle_prompt)
         page.click("#passkeyLoginBtn")  # relabeled "Create passkey" in bootstrap mode
@@ -187,9 +189,48 @@ def do_bootstrap(page, check: Check) -> None:
         check("Create your vault passphrase" in page.inner_text("#gate"),
               "real WebAuthn bootstrap ceremony enrolled the first passkey",
               page.inner_text("#gateNote"))
+        # Bootstrap verify enrolls but deliberately does not set
+        # authenticated_at (only login_verify does), so complete a real
+        # passkey login with the same authenticator before unlocking.
+        page.reload(wait_until="networkidle")
+        page.wait_for_selector("#passkeyGate:not([hidden])", timeout=15000)
+        page.click("#passkeyLoginBtn")
+        page.wait_for_selector("#gate:not([hidden])", timeout=15000)
+        check("Passkey accepted" in page.inner_text("#gateNote"),
+              "passkey login after bootstrap reaches the passphrase gate",
+              page.inner_text("#gateNote"))
     finally:
         cdp.send("WebAuthn.removeVirtualAuthenticator",
                  {"authenticatorId": authenticator_id})
+
+
+def import_backup(page, passphrase: str) -> list:
+    """Drive the current import UI (static/app.js importBackup).
+
+    The unlock gate clears #pass after derivation, so importBackup asks for
+    the passphrase with prompt() and reports the outcome with alert()
+    ("Restored N records from backup." or "Restore failed: ...").
+    Returns every dialog as (type, message) in order.
+    """
+    seen: list = []
+
+    def on_dialog(dialog):
+        seen.append((dialog.type, dialog.message))
+        if dialog.type == "prompt":
+            dialog.accept(passphrase)
+        else:
+            dialog.accept()
+
+    page.on("dialog", on_dialog)
+    try:
+        page.set_input_files("#importFile", str(BACKUP_PATH))
+        deadline = time.time() + 90
+        while time.time() < deadline and not any(
+                t == "alert" for t, _ in seen):
+            page.wait_for_timeout(250)
+    finally:
+        page.remove_listener("dialog", on_dialog)
+    return seen
 
 
 def passphrase_unlock(page) -> None:
@@ -334,11 +375,12 @@ def main() -> int:
             check(page_b.get_attribute("#lock", "data-state") == "open",
                   "browser B unlocked with the same passphrase")
 
-            with page_b.expect_event("dialog", timeout=60000) as dlg_info:
-                page_b.set_input_files("#importFile", str(BACKUP_PATH))
-            dialog = dlg_info.value
-            msg_b = dialog.message
-            dialog.accept()
+            check(page_b.evaluate("() => typeof S.memcmp === 'function'"),
+                  "bundled libsodium exposes constant-time memcmp (used by restore)")
+            dialogs_b = import_backup(page_b, PASSPHRASE)
+            check(dialogs_b[:1] and dialogs_b[0][0] == "prompt",
+                  "import asks for the vault passphrase (gate cleared #pass)", repr(dialogs_b))
+            msg_b = next((m for t, m in dialogs_b if t == "alert"), "")
             check(f"Restored {len(EXPECTED)} records" in msg_b,
                   "import reports all records restored", f"dialog said: {msg_b!r}")
 
@@ -386,33 +428,190 @@ def main() -> int:
             check(page_c.get_attribute("#lock", "data-state") == "open",
                   "browser C unlocked against the new vault")
 
-            with page_c.expect_event("dialog", timeout=60000) as dlg_info_c:
-                page_c.set_input_files("#importFile", str(BACKUP_PATH))
-            dialog_c = dlg_info_c.value
-            msg_c = dialog_c.message
-            dialog_c.accept()
+            # Security property under the current UI: a backup from another
+            # vault is only accepted with the passphrase that produced it.
+            # importBackup verifies the HMAC and canary with candidate keys
+            # BEFORE touching server salts, so a wrong passphrase must be
+            # rejected and must not change this vault's salts.
+            salts_before = page_c.evaluate("() => api('/api/kdf/salts')")
+            dialogs_bad = import_backup(page_c, "definitely-not-the-passphrase")
+            msg_bad = next((m for t, m in dialogs_bad if t == "alert"), "")
+            check(msg_bad.startswith("Restore failed:") and
+                  ("Integrity check failed" in msg_bad or "wrong passphrase" in msg_bad),
+                  "foreign backup with wrong passphrase is rejected", f"got: {msg_bad!r}")
+            salts_after = page_c.evaluate("() => api('/api/kdf/salts')")
+            check(salts_before == salts_after,
+                  "rejected restore leaves this vault's KDF salts unchanged")
+            check(page_c.evaluate("() => TXNS.length") == 0,
+                  "rejected restore imports nothing")
 
+            # With the right passphrase, cross-vault restore is the intended
+            # path (salts migrated after full validation).
+            dialogs_c = import_backup(page_c, PASSPHRASE)
+            msg_c = next((m for t, m in dialogs_c if t == "alert"), "")
+            check(f"Restored {len(EXPECTED)} records" in msg_c,
+                  "new-vault restore with the right passphrase succeeds", f"got: {msg_c!r}")
             if f"Restored {len(EXPECTED)} records" in msg_c:
-                print("    \033[32m✓\033[0m new-vault restore succeeds (P1 #3 defect is fixed)")
-                check(True, "new-vault restore succeeds")
                 page_c.wait_for_function(
                     f"() => TXNS && TXNS.length === {len(EXPECTED)}", timeout=60000)
                 recovered_c = page_c.evaluate(
                     "() => TXNS.map(t => [t.merchant, t.amount])"
                     ".sort((a, b) => a[0] < b[0] ? -1 : 1)")
                 check([tuple(r) for r in recovered_c] == EXPECTED,
-                      "new-vault recovery is byte-identical")
-            else:
-                print("    \033[33m!\033[0m KNOWN DEFECT (P1 #3) reproduced in a real browser:")
-                print(f"      dialog: {msg_c!r}")
-                print("      The backup carries KDF salts, but unlock auto-generated fresh")
-                print("      salts first, so importBackup sees a mismatch and the")
-                print("      /api/kdf/salts/migrate escape hatch is unreachable (409).")
-                check("Backup salts do not match" in msg_c,
-                      "new-vault restore fails with the predicted salt-mismatch signature",
-                      f"got: {msg_c!r}")
+                      "new-vault recovery is byte-identical", f"got {recovered_c}")
+
+            # Bug D regression: after restore the vault must unlock again with
+            # the backup's salts AND its KDF version (stored atomically by
+            # /api/kdf/salts/migrate). Reload and unlock from scratch.
+            page_c.reload(wait_until="networkidle")
+            check(page_c.is_visible("#gate"), "restored vault: reload shows the passphrase gate")
+            passphrase_unlock(page_c)
+            page_c.wait_for_function(
+                f"() => TXNS && TXNS.length === {len(EXPECTED)}", timeout=60000)
+            reloaded_c = page_c.evaluate(
+                "() => TXNS.map(t => [t.merchant, t.amount])"
+                ".sort((a, b) => a[0] < b[0] ? -1 : 1)")
+            check([tuple(r) for r in reloaded_c] == EXPECTED,
+                  "restored vault unlocks after reload with identical records", f"got {reloaded_c}")
+            check(page_c.evaluate("() => api('/api/kdf/salts').then(r => r.kdf_version)") == 3,
+                  "restored vault stores the backup's kdf_version (3)")
             check_no_plaintext_leak(check, req_c, base, "browser C")
             ctx_c.close()
+
+            # ---------- Phase 4: v3 backup into an empty v1 vault (bug D) ----------
+            print("\n\033[1mPhase 4: v3 backup into an empty v1 vault (bug D)\033[0m")
+            engine = create_engine(test_db_url, future=True)
+            with Session(engine) as s:
+                s.add(_models.VaultIdentity(
+                    id=3, user_handle=b"playwright-device-d", passkey_required=False,
+                    kdf_version=1, kdf_salt_enc=os.urandom(16), kdf_salt_idx=os.urandom(16)))
+                s.flush()
+                s.add(_models.PasskeyCredential(
+                    identity_id=3, credential_id=b"pw-bug-d-probe",
+                    credential_public_key=b"x", label="probe", sign_count=0, transports=[]))
+                s.commit()
+            engine.dispose()
+            ctx_d = browser.new_context(viewport={"width": 1280, "height": 900}, accept_downloads=True)
+            ctx_d.add_cookies([{**session_cookie_for_identity(3), "url": base}])
+            page_d = ctx_d.new_page()
+            req_d: list = []
+            err_d: list = []
+            attach_interception(page_d, req_d, err_d)
+            page_d.goto(base, wait_until="networkidle")
+            passphrase_unlock(page_d)   # derives v1 keys on this vault's own salts
+            check(page_d.evaluate("() => api('/api/kdf/salts').then(r => r.kdf_version)") == 1,
+                  "phase 4 vault starts at kdf_version 1")
+            msg_d = next((m for t, m in import_backup(page_d, PASSPHRASE) if t == "alert"), "")
+            check(f"Restored {len(EXPECTED)} records" in msg_d,
+                  "v3 backup restores into a v1 vault", f"got: {msg_d!r}")
+            page_d.reload(wait_until="networkidle")
+            passphrase_unlock(page_d)
+            page_d.wait_for_function(
+                f"() => TXNS && TXNS.length === {len(EXPECTED)}", timeout=60000)
+            reloaded_d = page_d.evaluate(
+                "() => TXNS.map(t => [t.merchant, t.amount])"
+                ".sort((a, b) => a[0] < b[0] ? -1 : 1)")
+            check([tuple(r) for r in reloaded_d] == EXPECTED,
+                  "after reload the v1 vault unlocks as v3 with identical records", f"got {reloaded_d}")
+            check(page_d.evaluate("() => api('/api/kdf/salts').then(r => r.kdf_version)") == 3,
+                  "kdf_version moved to 3 together with the salts")
+            # Bug E regression: a record in the largest bucket (8192 bytes
+            # padded) seals to the server's max size and round-trips.
+            big = page_d.evaluate("""async () => {
+                const obj = { id: 'big-record', merchant: 'M'.repeat(8100), amount: -1, date: '2026-10-12' };
+                const sealed = seal(obj);
+                await api('/api/records', { method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ records: [{ blind_index: blindIndex(obj.id), sealed }] }) });
+                const { records } = await api('/api/records');
+                const mine = records.find(r => r.blind_index === blindIndex(obj.id));
+                const back = mine ? open(mine.sealed) : null;
+                return { hexLen: sealed.length, plainLen: JSON.stringify(obj).length,
+                         ok: !!back && back.merchant === obj.merchant && back.amount === -1 };
+            }""")
+            check(big["hexLen"] == 16480 and big["ok"],
+                  f"~8 KB record ({big['plainLen']} bytes) seals to the max size and round-trips", repr(big))
+            check(not any("M" * 64 in body or "M" * 64 in url for url, body in req_d),
+                  "~8 KB record plaintext never leaves the browser")
+            check_no_plaintext_leak(check, req_d, base, "browser D")
+
+            # ---------- Phase 5: recovery with the recovery key (bugs L, M, K) ----------
+            # Vault D (identity 3) holds the restored records plus the ~8 KB
+            # record. Set up a recovery key, "forget" the passphrase, recover
+            # with the key and a new passphrase through the real UI, then
+            # check: reload + unlock with the new passphrase gives identical
+            # records, the old passphrase fails, re-syncing the same
+            # transactions creates no duplicates (K), and the same recovery
+            # key still works for a second recovery.
+            print("\n\033[1mPhase 5: recovery key -> new passphrase (bugs L, M, K)\033[0m")
+            NEW_PASS = "recovered-vault passphrase 2026 #one"
+            NEXT_PASS = "second-recovery passphrase 2026 #two"
+            page_d.evaluate("() => load()")  # include the ~8 KB record added above
+            before_k = sorted(page_d.evaluate("() => TXNS.map(t => [t.id, t.merchant.slice(0, 30), t.merchant.length, t.amount])"))
+            count_before = page_d.evaluate("() => api('/api/records').then(r => r.records.length)")
+            mnemonic = page_d.evaluate("() => setupRecoveryKey()")
+            check(isinstance(mnemonic, str) and len(mnemonic.split()) == 32, "recovery key set up (32 words)")
+
+            def recover_via_ui(page, words: str, new_pass: str, label: str) -> None:
+                # Simulates a fresh passkey sign-in (the WebAuthn ceremony is
+                # bypassed as in phases 2-4) so the blob gate's step-up
+                # window is satisfied, then uses the real locked-gate UI.
+                page.context.add_cookies([{**session_cookie_for_identity(3), "url": base}])
+                page.reload(wait_until="networkidle")
+                page.wait_for_selector("#gate:not([hidden])")
+                page.click("#forgotPassBtn")
+                page.fill("#recoverMnemonic", words)
+                page.fill("#recoverNewPass", new_pass)
+                page.once("dialog", lambda d: d.accept())
+                page.click("#doRecoverBtn")
+                page.wait_for_function(
+                    "() => /Recovery complete|Recovery failed/.test("
+                    "document.getElementById('gateNote').textContent + document.getElementById('recoverNote').textContent)",
+                    timeout=180000)
+                note = page.inner_text("#gateNote") + " | " + page.inner_text("#recoverNote")
+                check("Recovery complete" in note, f"{label}: recovery completes through the locked gate", note)
+
+            def unlock_with(page, passphrase: str) -> str:
+                page.reload(wait_until="networkidle")
+                page.wait_for_selector("#gate:not([hidden])")
+                page.fill("#pass", passphrase)
+                page.click("#unlockBtn")
+                page.wait_for_function(
+                    "() => document.getElementById('lock').dataset.state === 'open' || "
+                    "/Incorrect/.test(document.getElementById('gateNote').textContent)", timeout=120000)
+                return page.get_attribute("#lock", "data-state")
+
+            req_mark = len(req_d)
+            recover_via_ui(page_d, mnemonic, NEW_PASS, "first recovery")
+            check(page_d.evaluate("() => KEYS === null"), "vault is locked after recovery (no auto unlock)")
+            check(unlock_with(page_d, NEW_PASS) == "open", "reload + unlock with the NEW passphrase",
+                  page_d.inner_text("#gateNote"))
+            after_k = sorted(page_d.evaluate("() => TXNS.map(t => [t.id, t.merchant.slice(0, 30), t.merchant.length, t.amount])"))
+            check(after_k == before_k, f"all {len(before_k)} records identical after recovery", f"{after_k} vs {before_k}")
+            check(page_d.evaluate("() => api('/api/kdf/salts').then(r => r.kdf_version)") == 3, "kdf_version is 3")
+            # K: blind indexes match the NEW index key, so a re-sync upserts.
+            in_sync = page_d.evaluate("""async () => {
+                const { records } = await api('/api/records');
+                const want = new Set(TXNS.map(t => blindIndex(t.id)));
+                return records.length === want.size && records.every(r => want.has(r.blind_index));
+            }""")
+            check(in_sync, "K: every stored blind index equals HMAC(id) under the new index key")
+            page_d.evaluate(CREATE_RECORDS_JS, [[m, a] for m, a in EXPECTED])
+            count_after_sync = page_d.evaluate("() => api('/api/records').then(r => r.records.length)")
+            check(count_after_sync == count_before,
+                  "K: re-syncing the same transactions creates no duplicates",
+                  f"{count_before} -> {count_after_sync}")
+            check(unlock_with(page_d, PASSPHRASE) != "open"
+                  and "Incorrect" in page_d.inner_text("#gateNote"), "the OLD passphrase no longer unlocks")
+            recover_via_ui(page_d, mnemonic, NEXT_PASS, "same recovery key again")
+            check(unlock_with(page_d, NEXT_PASS) == "open"
+                  and sorted(page_d.evaluate("() => TXNS.map(t => [t.id, t.merchant.slice(0, 30), t.merchant.length, t.amount])")) == before_k,
+                  "the recovery key still works after a recovery (blob rewrapped to the new seed)")
+            leaked = [u for u, body in req_d[req_mark:] if mnemonic.split()[0] + " " + mnemonic.split()[1] in body
+                      or NEW_PASS in body or NEXT_PASS in body or NEW_PASS in u]
+            check(not leaked, "recovery words and new passphrases never leave the browser")
+            check_no_plaintext_leak(check, req_d, base, "browser D after recovery")
+            ctx_d.close()
 
             browser.close()
     finally:

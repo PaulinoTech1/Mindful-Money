@@ -23,9 +23,12 @@ from pathlib import Path
 HERE = Path(__file__).parent
 SHOTS = HERE / "screenshots"
 PASSPHRASE = "demo passphrase"
+# TEST-ONLY dummy bootstrap token. Set only in this test server's env. It is
+# not, and must never be, a real deployment secret.
+TEST_BOOTSTRAP_TOKEN = "test-only-bootstrap-token-not-a-secret"
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 except ImportError:
     print("playwright not installed. Run:")
     print("  pip install playwright && python3 -m playwright install chromium")
@@ -94,6 +97,10 @@ def main() -> int:
         "VAULT_ORIGIN": f"http://localhost:{port}", "VAULT_RP_ID": "localhost",
         "VAULT_SECRET_KEY": "browser-test-secret-not-for-production", "VAULT_CSP_MODE": "enforce",
         "VAULT_DATABASE_URL": test_db_url,
+        # Test-only: passphrase-only mode must stay reachable for the
+        # "disable passkeys" step. Production refuses anything but "required".
+        "VAULT_AUTH_POLICY": "optional",
+        "VAULT_BOOTSTRAP_TOKEN": TEST_BOOTSTRAP_TOKEN,
     })
     env_server = subprocess.Popen(
         [sys.executable, "-c", f"import app; app.app.run(port={port})"],
@@ -126,6 +133,8 @@ def main() -> int:
             record_delete_statuses: list[int] = []
             page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
             page.on("pageerror", lambda e: errors.append(f"PAGEERROR: {e}"))
+            bad_responses: list[str] = []
+            page.on("response", lambda r: bad_responses.append(f"{r.status} {r.request.method} {r.url}") if r.status >= 400 else None)
             page.on("request", lambda r: (requests.append(r.url), request_bodies.append(r.post_data or "")))
             page.on("response", lambda r: record_delete_statuses.append(r.status)
                     if r.request.method == "DELETE" and r.url.endswith("/api/records") else None)
@@ -142,17 +151,69 @@ def main() -> int:
             csrf = page.evaluate("() => CSRF")
             hostile = page.request.post(f"{base}/api/records", headers={
                 "Origin": "http://localhost.evil", "X-CSRF-Token": csrf,
-            }, json={"records": []})
+            }, data={"records": []})
             check(hostile.status == 403, "unsafe request with hostile Origin is rejected")
             errors.clear()  # Chromium logs the deliberately rejected raw fetch as a resource error.
             page.screenshot(path=SHOTS / "1-unlock.png")
 
+            # --- first-passkey bootstrap (real UI, virtual authenticator) ---
+            # RP ID "localhost" and origin http://localhost:<port> in server_env
+            # match the page origin (base), which WebAuthn requires.
+            check(page.evaluate("() => location.origin") == base, "page origin matches VAULT_ORIGIN / RP ID")
+            cdp = page.context.new_cdp_session(page)
+            cdp.send("WebAuthn.enable", {"enableUI": False})
+            authenticator = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
+                "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
+                "hasUserVerification": True, "isUserVerified": True,
+                "automaticPresenceSimulation": True,
+            }})["authenticatorId"]
+            if page.is_visible("#passkeyGate"):
+                page.once("dialog", lambda dialog: dialog.accept(TEST_BOOTSTRAP_TOKEN))
+                ceremony_requests: list[str] = []
+                def on_ceremony(req):
+                    if "/api/passkeys/" in req.url and req.url.endswith("/options"):
+                        ceremony_requests.append(req.url.split("/api/passkeys/")[1])
+                page.on("request", on_ceremony)
+                page.click("#passkeyLoginBtn")  # relabeled "Create passkey" in bootstrap mode
+                try:
+                    page.wait_for_selector("#gate:not([hidden])", timeout=30000)
+                except Exception:
+                    print("    bootstrap error:", page.inner_text("#passkeyGateNote"))
+                    raise
+                check("Create your vault passphrase" in page.inner_text("#gate"),
+                      "real bootstrap ceremony enrolls the first passkey", page.inner_text("#gateNote"))
+                page.remove_listener("request", on_ceremony)
+                # Bug F: the click must start exactly one ceremony (no stray
+                # login options request racing the bootstrap ceremony).
+                check(ceremony_requests == ["bootstrap/options"],
+                      "Create passkey sends exactly one ceremony request (bootstrap)", repr(ceremony_requests))
+                # Bootstrap verify enrolls but deliberately does not set
+                # authenticated_at (only login_verify does), so complete a real
+                # passkey login before unlocking. Same virtual authenticator.
+                page.reload(wait_until="networkidle")
+                page.wait_for_selector("#passkeyGate:not([hidden])", timeout=15000)
+                page.click("#passkeyLoginBtn")
+                page.wait_for_selector("#gate:not([hidden])", timeout=15000)
+                check("Passkey accepted" in page.inner_text("#gateNote"),
+                      "passkey login after bootstrap reaches the passphrase gate", page.inner_text("#gateNote"))
+
             t0 = time.time()
             page.fill("#pass", PASSPHRASE)
             page.click("#unlockBtn")
-            page.wait_for_selector("#empty:not([hidden]), #dash:not([hidden])", timeout=30000)
+            try:
+                page.wait_for_selector("#empty:not([hidden]), #dash:not([hidden])", timeout=30000)
+            except Exception:
+                print("    unlock error:", page.inner_text("#gateNote"), "; console:", "; ".join(errors[:3]))
+                raise
             page.wait_for_function("() => document.getElementById('lock').dataset.state === 'open'", timeout=30000)
             kdf_ms = int((time.time() - t0) * 1000)
+            # Intended new-vault flow (static/app.js getSalts): GET /api/kdf/salts
+            # returns 404 once, then the client POSTs .../generate. Chromium logs
+            # that single 404 as a console error; remove exactly that one.
+            expected_404 = "Failed to load resource: the server responded with a status of 404 (NOT FOUND)"
+            if any(r.startswith("404 GET") and r.endswith("/api/kdf/salts") for r in bad_responses) \
+                    and expected_404 in errors:
+                errors.remove(expected_404)
 
             check(page.get_attribute("#lock", "data-state") == "open", "vault reports unlocked")
             check(200 < kdf_ms < 15000, f"key derived in {kdf_ms}ms", f"got {kdf_ms}ms")
@@ -167,7 +228,11 @@ def main() -> int:
             # --- connect ------------------------------------------------
             print("\n  Connect and encrypt")
             page.click("#connectBtn")
-            page.wait_for_selector("#dash:not([hidden])", timeout=60000)
+            try:
+                page.wait_for_selector("#dash:not([hidden])", timeout=60000)
+            except Exception:
+                print("    connect error:", page.inner_text("#connectNote"), "; console:", "; ".join(errors[:3]), "; http:", "; ".join(bad_responses[-5:]))
+                raise
             page.wait_for_timeout(2500)
 
             records = int(page.inner_text("#statRecords"))
@@ -318,23 +383,12 @@ def main() -> int:
             check("Edited Merchant" in page.inner_text("#ledgerBody"), "encrypted transaction edits survive reload")
 
             # --- optional passkeys (Chromium virtual authenticator) ----
-            print("\n  Optional passkeys")
-            cdp = page.context.new_cdp_session(page)
-            cdp.send("WebAuthn.enable", {"enableUI": False})
-            authenticator = cdp.send("WebAuthn.addVirtualAuthenticator", {"options": {
-                "protocol": "ctap2", "transport": "internal", "hasResidentKey": True,
-                "hasUserVerification": True, "isUserVerified": True,
-                "automaticPresenceSimulation": True,
-            }})["authenticatorId"]
-            page.fill("#passkeyLabel", "Test laptop")
-            page.click("#enablePasskeyBtn")
-            try:
-                page.wait_for_function("() => document.querySelector('#passkeyState').innerText === 'Enabled'", timeout=15000)
-            except Exception:
-                print("    passkey error:", page.inner_text("#securityNote"))
-                raise
+            print("\n  Passkeys")
+            # The first passkey was enrolled by the bootstrap ceremony above,
+            # on the same virtual authenticator (still attached).
+            page.wait_for_function("() => document.querySelector('#passkeyState').innerText === 'Enabled'", timeout=15000)
             page.wait_for_function("() => document.querySelectorAll('#passkeyList .passkeyItem').length === 1", timeout=15000)
-            check("Test laptop" in page.inner_text("#passkeyList"), "optional passkey enrollment succeeds", page.inner_text("#passkeyList"))
+            check("Primary passkey" in page.inner_text("#passkeyList"), "bootstrap passkey is listed", page.inner_text("#passkeyList"))
 
             page.reload(wait_until="networkidle")
             check(page.is_visible("#gate"), "authenticated reload proceeds to passphrase stage")
@@ -439,7 +493,7 @@ def main() -> int:
             page.wait_for_selector("#addExpenseDialog[open]")
             expense_categories = page.locator("#addExpenseCategory option").all_text_contents()
             account_options = page.locator("#addExpenseAccount option").all_text_contents()
-            check("Scammers Inc" in account_options, "manual transaction destination lists the checking account")
+            check("Scammers Inc" in " | ".join(account_options), "manual transaction destination lists the checking account", repr(account_options))
             page.select_option("#addExpenseAccount", index=0)
             check("Other" in expense_categories and "Dining" in expense_categories, "expense dropdown has discrete categories including Other")
             check("Salary" not in expense_categories, "income-only categories are absent from the expense dropdown")
@@ -522,15 +576,52 @@ def main() -> int:
 
             # --- mobile --------------------------------------------------
             print("\n  Responsive")
+            # Regression for bug J: recreate every chart, then shrink the
+            # viewport while the old Chart.js entry animation would still be
+            # running (380 ms). Before the fix this left stale canvas widths.
+            page.evaluate("() => render()")
+            page.wait_for_timeout(370)
             page.set_viewport_size({"width": 390, "height": 844})
-            page.wait_for_timeout(900)
+            # Condition-based wait (bug H): wait until the viewport has resized
+            # and layout has settled with no overflow, up to 10 s. On timeout
+            # the same assertion below is evaluated and fails normally.
+            try:
+                page.wait_for_function(
+                    "() => window.innerWidth === 390 && "
+                    "document.documentElement.scrollWidth <= window.innerWidth + 2",
+                    timeout=10_000,
+                )
+            except PlaywrightTimeoutError:
+                print("    (overflow did not settle within 10 s; scrollWidth=%s)" % page.evaluate(
+                    "document.documentElement.scrollWidth"))
             overflow = page.evaluate(
+                "window.innerWidth !== 390 || "
                 "document.documentElement.scrollWidth > window.innerWidth + 2"
             )
             check(not overflow, "no horizontal overflow at 390px")
             page.screenshot(path=SHOTS / "4-mobile.png", full_page=True)
 
             # --- destructive deletion step-up ---------------------------
+            print("\n  Malformed record (bug N)")
+            shown_before = int(page.inner_text("#statRecords"))
+            page.evaluate("""async () => {
+                const bad = { id: 'undated-bug-n', amount: -1, merchant: 'No date' };
+                await api('/api/records', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ records: [{ blind_index: blindIndex(bad.id), sealed: seal(bad) }] }) });
+            }""")
+            page.click("#lockVaultBtn")
+            page.fill("#pass", PASSPHRASE)
+            # Wait for unlock's final POST too: the next section edits the
+            # session row directly, and an in-flight request would write its
+            # loaded copy back over that edit (flake seen in CI).
+            with page.expect_response(lambda r: r.url.endswith("/api/vault/unlocked"), timeout=30000):
+                page.click("#unlockBtn")
+            page.wait_for_selector("#dash:not([hidden])", timeout=30000)
+            check("Incorrect" not in page.inner_text("#gateNote"), "an undated record never reads as a wrong passphrase")
+            check(page.is_visible("#recordWarning") and page.inner_text("#recordWarning").startswith("1 record could not be shown"),
+                  "an undated record is skipped with a visible warning count", page.inner_text("#recordWarning"))
+            check(int(page.inner_text("#statRecords")) == shown_before, "valid records still render next to a malformed one")
+
             print("\n  Destructive deletion step-up")
             page.set_viewport_size({"width": 1280, "height": 900})
 
@@ -568,7 +659,7 @@ def main() -> int:
             check(all(PASSPHRASE not in body for body in request_bodies), "passphrase never appears in network request bodies")
             cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": authenticator})
 
-            check(not errors, "no console errors", "; ".join(errors[:3]))
+            check(not errors, "no console errors", "; ".join(errors[:3]) + " | http: " + "; ".join(bad_responses[-6:]))
             browser.close()
     finally:
         env_server.terminate()
