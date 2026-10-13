@@ -2192,7 +2192,7 @@ async function bootstrapPasskey() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bootstrap_token: token }),
     });
-    const credential = await navigator.credentials.create({ publicKey: options });
+    const credential = await navigator.credentials.create({ publicKey: publicKeyOptions(options) });
     const result = await api('/api/passkeys/bootstrap/verify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ credential: credentialJSON(credential), label: 'Primary passkey', bootstrap_token: token }),
