@@ -97,7 +97,7 @@ jobs:
           # Full regression suite: authentication, tenant isolation, privacy,
           # cryptography, and lifecycle tests. All 88 tests must pass.
           # See: docs/POST_MORTEM_STALE_DEPLOY.md for history.
-          python -m pytest test_demo.py test_zkp_server.py test_db_error_logging.py test_kdf_migrate_and_limits.py -v --tb=short --no-header -rA 2>&1
+          python -m pytest test_demo.py test_zkp_server.py test_db_error_logging.py test_kdf_migrate_and_limits.py test_recovery_rekey.py -v --tb=short --no-header -rA 2>&1
           echo "=== Test exit code: $? ==="
         env:
           VAULT_ENV: test

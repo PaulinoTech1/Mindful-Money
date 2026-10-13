@@ -260,3 +260,50 @@ class AuditEvent(Base):
     acknowledged_by: Mapped[int | None] = mapped_column(
         ForeignKey("vault_identity.id", ondelete="SET NULL")
     )
+
+
+class VaultRekey(Base):
+    """An in-progress re-encryption of one vault (recovery or passphrase change).
+
+    Records re-encrypted under the new keys are staged in ``vault_rekey_records``
+    and swapped in, together with the new salts, KDF version and recovery
+    blob, by a single commit transaction. Until then the live vault is
+    untouched. ``base_digest``/``base_count`` snapshot the live record set at
+    begin so commit can refuse if it changed. At most one per identity.
+    """
+
+    __tablename__ = "vault_rekeys"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    identity_id: Mapped[int] = mapped_column(
+        ForeignKey("vault_identity.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    base_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    base_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[float] = mapped_column(Double, nullable=False)
+    expires_at: Mapped[float] = mapped_column(Double, nullable=False, index=True)
+
+
+class VaultRekeyRecord(Base):
+    """A record re-encrypted under the new keys, waiting for rekey commit.
+
+    ``old_blind_index`` names the live record it replaces, so commit can check
+    that every live record is replaced exactly once and carry over its public
+    ZK commitment. Ciphertext stays opaque to the server, as in ``records``.
+    """
+
+    __tablename__ = "vault_rekey_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rekey_id: Mapped[str] = mapped_column(
+        ForeignKey("vault_rekeys.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    blind_index: Mapped[str] = mapped_column(String(64), nullable=False)
+    old_blind_index: Mapped[str] = mapped_column(String(64), nullable=False)
+    sealed: Mapped[str] = mapped_column(Text, nullable=False)
+    bytes_len: Mapped[int] = mapped_column("bytes", Integer, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("rekey_id", "blind_index", name="uq_rekey_records_blind_index"),
+        UniqueConstraint("rekey_id", "old_blind_index", name="uq_rekey_records_old_blind_index"),
+    )

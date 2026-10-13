@@ -47,25 +47,33 @@ const UPLOAD_MAX_BYTES = 6 * 1024 * 1024;
 const UPLOAD_RATE_RETRIES = 3;
 const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function chunkSealedRecords(rows, maxRecords = UPLOAD_MAX_RECORDS, maxBytes = UPLOAD_MAX_BYTES) {
+const UPLOAD_FIELDS = ['blind_index', 'sealed'];
+
+// `fields` picks the properties sent per record; `extra` is merged into the
+// request body (e.g. the rekey id) and counted in the byte budget.
+function chunkSealedRecords(rows, maxRecords = UPLOAD_MAX_RECORDS, maxBytes = UPLOAD_MAX_BYTES,
+                            fields = UPLOAD_FIELDS, extra = {}) {
   const chunks = [];
   let current = [];
-  let bytes = 14;  // {"records":[]}
+  const wrapper = JSON.stringify({ ...extra, records: [] }).length;  // {"records":[]} is 14
+  let bytes = wrapper;
   for (const row of rows) {
-    const rowBytes = JSON.stringify({ blind_index: row.blind_index, sealed: row.sealed }).length + 1;
-    if (14 + rowBytes > maxBytes) throw new Error('A single record exceeds the upload size limit.');
+    const picked = {};
+    for (const f of fields) picked[f] = row[f];
+    const rowBytes = JSON.stringify(picked).length + 1;
+    if (wrapper + rowBytes > maxBytes) throw new Error('A single record exceeds the upload size limit.');
     if (current.length && (current.length >= maxRecords || bytes + rowBytes > maxBytes)) {
-      chunks.push(current); current = []; bytes = 14;
+      chunks.push(current); current = []; bytes = wrapper;
     }
-    current.push({ blind_index: row.blind_index, sealed: row.sealed });
+    current.push(picked);
     bytes += rowBytes;
   }
   if (current.length) chunks.push(current);
   return chunks;
 }
 
-async function uploadSealedRecords(rows, onProgress) {
-  const chunks = chunkSealedRecords(rows);
+async function uploadSealedRecords(rows, onProgress, { path = '/api/records', fields = UPLOAD_FIELDS, extra = {} } = {}) {
+  const chunks = chunkSealedRecords(rows, UPLOAD_MAX_RECORDS, UPLOAD_MAX_BYTES, fields, extra);
   let done = 0;
   for (const chunk of chunks) {
     // A very large bulk upload (more than 60 chunks, i.e. tens of thousands
@@ -74,10 +82,10 @@ async function uploadSealedRecords(rows, onProgress) {
     // UPLOAD_RATE_RETRIES times; any other error stops immediately.
     for (let attempt = 0; ; attempt++) {
       try {
-        await api('/api/records', {
+        await api(path, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ records: chunk }),
+          body: JSON.stringify({ ...extra, records: chunk }),
         });
         break;
       } catch (e) {
@@ -517,13 +525,14 @@ function checkPassphraseStrength(passphrase) {
   return { ok: true, entropy };
 }
 
-async function deriveKeys(passphrase, kdfVersion) {
+async function deriveKeys(passphrase, kdfVersion, saltsOverride = null) {
   const A = S.crypto_pwhash_ALG_ARGON2ID13;
   let params = kdfParams(kdfVersion || 1);
 
   // Per-identity salts from the server (not secret, just unique).
   // Falls back to localStorage for legacy vaults.
-  const salts = await getSalts();
+  // saltsOverride: fresh salts for a rekey, not yet stored on the server.
+  const salts = saltsOverride || await getSalts();
   const saltEnc = salts.enc;
   const saltIdx = salts.idx;
 
@@ -600,38 +609,74 @@ async function setupRecoveryKey() {
   return mnemonic;
 }
 
-async function recoverWithKey(mnemonic, newPassphrase) {
-  // Decode the mnemonic
-  const recoveryKey = decodeRecoveryKey(mnemonic);
-  
+// Fetch the encrypted recovery blob. The server requires a recent passkey
+// assertion (bug L); on 401 run the passkey ceremony once and retry.
+async function fetchRecoveryBlobWithStepUp(note) {
   try {
-    // Fetch the encrypted blob (requires passkey auth)
-    const data = await api('/api/recovery/blob');
-    const blob = S.from_hex(data.recovery_blob);
-    
-    // Split nonce and ciphertext
-    const nonce = blob.slice(0, S.crypto_secretbox_NONCEBYTES);
-    const ciphertext = blob.slice(S.crypto_secretbox_NONCEBYTES);
-    
-    // Decrypt the seed
-    const seed = S.crypto_secretbox_open_easy(ciphertext, nonce, recoveryKey);
-    if (!seed) throw new Error('Invalid recovery key or corrupted data');
-    
-    // Validate new passphrase strength (don't allow weak passphrases
-    // just because recovery is available)
-    const strength = checkPassphraseStrength(newPassphrase);
-    if (!strength.ok) {
-      throw new Error('New passphrase too weak: ' + strength.reason);
-    }
-    
-    // Generate new salts and derive keys with new passphrase
-    // (This will create a new vault; the old records are re-encrypted
-    //  using the recovered seed to derive the old keys)
-    // For now: return the seed so the caller can complete recovery
-    return seed;
-  } finally {
-    recoveryKey.fill(0);
+    return await api('/api/recovery/blob');
+  } catch (e) {
+    if (e.status === 409) throw new Error('A passkey is required to use the recovery key.');
+    if (e.status === 404) throw new Error('No recovery key is set up for this vault.');
+    if (e.status !== 401) throw e;
+    await authenticateWithPasskey(note);
+    return await api('/api/recovery/blob');
   }
+}
+
+// Unwrap the vault seed with the recovery key. Returns the seed; the caller
+// owns (and must wipe) it and the recovery key.
+async function recoverWithKey(recoveryKey, note) {
+  const data = await fetchRecoveryBlobWithStepUp(note);
+  const blob = S.from_hex(data.recovery_blob);
+  const nonce = blob.slice(0, S.crypto_secretbox_NONCEBYTES);
+  const ciphertext = blob.slice(S.crypto_secretbox_NONCEBYTES);
+  let seed;
+  try {
+    seed = S.crypto_secretbox_open_easy(ciphertext, nonce, recoveryKey);
+  } catch (e) {
+    seed = null;
+  }
+  if (!seed) throw new Error('Invalid recovery key or corrupted data');
+  return seed;
+}
+
+function wrapSeedWithRecoveryKey(seed, recoveryKey) {
+  const nonce = S.randombytes_buf(S.crypto_secretbox_NONCEBYTES);
+  const encryptedSeed = S.crypto_secretbox_easy(seed, nonce, recoveryKey);
+  const blob = new Uint8Array(nonce.length + encryptedSeed.length);
+  blob.set(nonce);
+  blob.set(encryptedSeed, nonce.length);
+  return S.to_hex(blob);
+}
+
+// Re-encrypt every record for new keys (bug K): each record is decrypted with
+// the old keypair and sealed for the new one, and its blind index is
+// recomputed from the record id under the NEW index key. Returns staged rows
+// {blind_index, old_blind_index, sealed}. Fails closed on any record it
+// cannot decrypt or that has no id, rather than dropping it.
+function reencryptForRekey(records, oldKp, newKeys) {
+  const out = [];
+  const seen = new Set();
+  for (const r of records) {
+    let padded;
+    try {
+      padded = S.crypto_box_seal_open(S.from_hex(r.sealed), oldKp.publicKey, oldKp.privateKey);
+    } catch (e) {
+      padded = null;
+    }
+    if (!padded) throw new Error(`Record ${r.blind_index.slice(0, 8)}... does not decrypt with the recovered key.`);
+    const obj = JSON.parse(S.to_string(unpadPlaintext(padded)));
+    if (typeof obj.id !== 'string' || !obj.id) {
+      throw new Error(`Record ${r.blind_index.slice(0, 8)}... has no id; cannot recompute its blind index.`);
+    }
+    const blind = S.to_hex(S.crypto_generichash(32, S.from_string(obj.id), newKeys.indexKey));
+    if (seen.has(blind)) throw new Error('Two records share an id; refusing to merge them.');
+    seen.add(blind);
+    const padNew = padPlaintext(S.from_string(JSON.stringify(obj)));
+    out.push({ blind_index: blind, old_blind_index: r.blind_index,
+               sealed: S.to_hex(S.crypto_box_seal(padNew, newKeys.publicKey)) });
+  }
+  return out;
 }
 
 // Domain-separated backup authentication key.
@@ -958,12 +1003,14 @@ async function unlock() {
   $('importBtn').hidden = false;
   $('gate').hidden = true;
   $('security').hidden = false;
+  $('recovery').hidden = false;
+  refreshRecoveryState();
   await refreshSecurity();
   $('unlockBtn').disabled = false;
 }
 
-async function load(duringUnlock = false) {
-  // Fetch all records with pagination (server limits to 5000 per request)
+// Fetch all records with pagination (server limits to 5000 per request).
+async function fetchAllRecords() {
   let allRecords = [];
   let offset = 0;
   const limit = 5000;
@@ -974,7 +1021,11 @@ async function load(duringUnlock = false) {
     if (records.length < limit || allRecords.length >= (data.total || 0)) break;
     offset += limit;
   }
-  const records = allRecords;
+  return allRecords;
+}
+
+async function load(duringUnlock = false) {
+  const records = await fetchAllRecords();
 
   if (!records.length) { if (!duringUnlock) $('empty').hidden = false; else $('empty').hidden = false; return; }
 
@@ -2333,7 +2384,7 @@ function lockVault() {
   Object.values(CHARTS).forEach((c) => c.destroy()); CHARTS = {};
   Object.values(CHAT_CHARTS).forEach((c) => c.destroy());
   $('ledgerBody').textContent = ''; $('accountList').textContent = ''; $('dashboardAccounts').textContent = ''; $('chatMessages').textContent = ''; $('rawBody').textContent = '';
-  ['dash','empty','serverview','security','stats','accounts','syncBtn','syncSimplefinBtn','addExpenseBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
+  ['dash','empty','serverview','security','recovery','stats','accounts','syncBtn','syncSimplefinBtn','addExpenseBtn','resetBtn','viewToggle'].forEach((id) => $(id).hidden = true);
   document.body.classList.remove('sv'); $('pass').value = ''; updatePassphraseEntropy(); $('lock').dataset.state = 'locked'; $('lockLabel').textContent = 'Locked';
   $('userGreeting').hidden = true;
   $('unlockBtn').disabled = false;
@@ -2351,6 +2402,145 @@ async function signOut() {
 async function disablePasskeys() {
   if (!confirm('Disable passkey protection and return to passphrase-only access?')) return;
   try { await api('/api/passkeys/disable', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm_unlocked: true }) }); PASSKEY_REQUIRED = false; PASSKEY_AUTHENTICATED = false; await refreshSecurity(); $('securityNote').textContent = 'Passkey protection disabled. Passphrase-only access is restored.'; } catch (e) { $('securityNote').textContent = e.message; }
+}
+
+/* ---------- recovery UI handlers ---------- */
+
+async function handleSetupRecovery() {
+  const note = $('recoveryNote');
+  try {
+    if (!KEYS) { note.textContent = 'Unlock your vault first.'; return; }
+    if (!confirm('Generate a recovery key? You will need to write down 32 words on paper.')) return;
+    
+    note.textContent = 'Generating recovery key...';
+    const mnemonic = await setupRecoveryKey();
+    
+    // Display the mnemonic ONE TIME
+    $('recoveryWords').textContent = mnemonic;
+    $('recoveryDisplay').hidden = false;
+    $('recoverForm').hidden = true;
+    note.textContent = '';
+    
+    // Clear mnemonic from JS memory after display (user must have written it down)
+    // Note: the DOM still contains it until they click Done
+  } catch (e) {
+    note.textContent = 'Error: ' + (e.message || 'Failed to generate recovery key');
+  }
+}
+
+async function handleRecoverVault() {
+  const note = $('recoverNote');
+  const mnemonic = $('recoverMnemonic').value.trim();
+  const newPass = $('recoverNewPass').value;
+
+  if (!mnemonic || !newPass) {
+    note.textContent = 'Enter both the recovery key and a new passphrase.';
+    return;
+  }
+  // Validate the new passphrase BEFORE starting; the recovery key never
+  // excuses a weak passphrase.
+  const strength = checkPassphraseStrength(newPass);
+  if (!strength.ok) {
+    note.textContent = 'New passphrase too weak: ' + strength.reason;
+    return;
+  }
+  if (!confirm('This will re-encrypt all your records with the new passphrase. Continue?')) return;
+
+  // Design: docs/RECOVERY.md "Re-encryption (rekey)". Nothing on the server
+  // changes until the final commit, which swaps records, salts, KDF version
+  // and recovery blob in one transaction. Any failure before that leaves the
+  // old vault intact and usable.
+  let recoveryKey = null, oldSeed = null, oldKp = null, newKeys = null, rekeyId = null;
+  $('doRecoverBtn').disabled = true;
+  try {
+    recoveryKey = decodeRecoveryKey(mnemonic);
+    note.textContent = 'Recovering vault key...';
+    oldSeed = await recoverWithKey(recoveryKey, note);
+    oldKp = S.crypto_box_seed_keypair(oldSeed);
+
+    note.textContent = 'Starting re-encryption...';
+    rekeyId = (await api('/api/vault/rekey/begin', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    })).rekey_id;
+
+    note.textContent = 'Fetching encrypted records...';
+    const records = await fetchAllRecords();
+
+    note.textContent = 'Deriving new keys (this takes a while)...';
+    const salts = { enc: S.randombytes_buf(16), idx: S.randombytes_buf(16) };
+    const kdfVersion = 3;
+    newKeys = await deriveKeys(newPass, kdfVersion, salts);
+
+    note.textContent = `Re-encrypting ${records.length} records...`;
+    const staged = reencryptForRekey(records, oldKp, newKeys);
+    await uploadSealedRecords(staged, (done, total) => {
+      note.textContent = `Uploading re-encrypted records... ${done}/${total}`;
+    }, { path: '/api/vault/rekey/records', fields: ['blind_index', 'old_blind_index', 'sealed'],
+         extra: { rekey_id: rekeyId } });
+
+    // Keep the same recovery key working: wrap the NEW seed with it.
+    note.textContent = 'Committing...';
+    await api('/api/vault/rekey/commit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rekey_id: rekeyId, salt_enc: S.to_hex(salts.enc), salt_idx: S.to_hex(salts.idx),
+        kdf_version: kdfVersion, recovery_blob: wrapSeedWithRecoveryKey(newKeys.seed, recoveryKey),
+      }),
+    });
+    rekeyId = null;
+    CACHED_SALTS = null;
+    $('recoverMnemonic').value = '';
+    $('recoverNewPass').value = '';
+    $('recoverForm').hidden = true;
+    lockVault();
+    $('gateNote').textContent = `Recovery complete: ${records.length} records re-encrypted. Unlock with your new passphrase. Your recovery key still works.`;
+  } catch (e) {
+    if (rekeyId) {
+      // Best effort: unblock writes now instead of waiting for the TTL. The
+      // live vault was never changed.
+      await api('/api/vault/rekey/abort', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+    }
+    note.textContent = 'Recovery failed: ' + (e.message || 'Unknown error') + ' Your vault was not changed.';
+    console.error('Recovery failed:', e);
+  } finally {
+    recoveryKey?.fill(0);
+    oldSeed?.fill(0);
+    oldKp?.privateKey?.fill(0);
+    if (newKeys) { newKeys.seed?.fill(0); newKeys.privateKey?.fill(0); newKeys.indexKey?.fill(0); }
+    $('doRecoverBtn').disabled = false;
+  }
+}
+
+async function handleDeleteRecovery() {
+  if (!confirm('Delete the recovery key? You will lose the ability to recover with the existing key.')) return;
+  try {
+    const del = () => api('/api/recovery/delete', { method: 'POST' });
+    try {
+      await del();
+    } catch (e) {
+      if (e.status !== 401) throw e;
+      await authenticateWithPasskey($('recoveryNote'));  // fresh passkey assertion (bug L)
+      await del();
+    }
+    $('recoveryNote').textContent = 'Recovery key deleted.';
+    refreshRecoveryState();
+  } catch (e) {
+    $('recoveryNote').textContent = 'Error: ' + (e.message || 'Failed to delete');
+  }
+}
+
+async function refreshRecoveryState() {
+  try {
+    const { set_up: setUp } = await api('/api/recovery/status');
+    if (!setUp) throw new Error('not set up');
+    $('recoveryState').textContent = 'Set up';
+    $('setupRecoveryBtn').hidden = true;
+    $('deleteRecoveryBtn').hidden = false;
+  } catch (e) {
+    $('recoveryState').textContent = 'Not set up';
+    $('setupRecoveryBtn').hidden = false;
+    $('deleteRecoveryBtn').hidden = true;
+  }
 }
 
 /* ---------- boot ---------- */
@@ -2425,171 +2615,19 @@ async function disablePasskeys() {
   $('addExpenseBtn').addEventListener('click', openAddTransactionDialog);
   $('addExpenseForm').addEventListener('submit', submitManualTransaction);
   document.querySelectorAll('input[name="addExpenseType"]').forEach((radio) => radio.addEventListener('change', updateManualCategoryOptions));
-/* ---------- recovery UI handlers ---------- */
-
-async function handleSetupRecovery() {
-  const note = $('recoveryNote');
-  try {
-    if (!KEYS) { note.textContent = 'Unlock your vault first.'; return; }
-    if (!confirm('Generate a recovery key? You will need to write down 32 words on paper.')) return;
-    
-    note.textContent = 'Generating recovery key...';
-    const mnemonic = await setupRecoveryKey();
-    
-    // Display the mnemonic ONE TIME
-    $('recoveryWords').textContent = mnemonic;
-    $('recoveryDisplay').hidden = false;
-    $('recoverForm').hidden = true;
-    note.textContent = '';
-    
-    // Clear mnemonic from JS memory after display (user must have written it down)
-    // Note: the DOM still contains it until they click Done
-  } catch (e) {
-    note.textContent = 'Error: ' + (e.message || 'Failed to generate recovery key');
-  }
-}
-
-async function handleRecoverVault() {
-  const note = $('recoverNote');
-  const mnemonic = $('recoverMnemonic').value.trim();
-  const newPass = $('recoverNewPass').value;
-  
-  if (!mnemonic || !newPass) {
-    note.textContent = 'Enter both the recovery key and a new passphrase.';
-    return;
-  }
-  
-  // Validate new passphrase strength BEFORE starting (don't leave vault
-  // in a half-migrated state due to a weak passphrase)
-  const strength = checkPassphraseStrength(newPass);
-  if (!strength.ok) {
-    note.textContent = 'New passphrase too weak: ' + strength.reason;
-    return;
-  }
-  
-  if (!confirm('This will re-encrypt all your records with the new passphrase. Continue?')) {
-    return;
-  }
-  
-  try {
-    note.textContent = 'Recovering seed...';
-    const oldSeed = await recoverWithKey(mnemonic, newPass);
-    
-    // Clear sensitive inputs immediately
-    $('recoverMnemonic').value = '';
-    $('recoverNewPass').value = '';
-    
-    // Reconstruct old keys from recovered seed
-    const oldKp = S.crypto_box_seed_keypair(oldSeed);
-    
-    // Fetch all encrypted records
-    note.textContent = 'Fetching encrypted records...';
-    const recordsData = await api('/api/records');
-    const records = recordsData.records || [];
-    
-    if (records.length === 0) {
-      note.textContent = 'No records to re-encrypt. Vault is empty.';
-      oldSeed.fill(0);
-      return;
-    }
-    
-    // Decrypt each record with old key
-    note.textContent = `Decrypting ${records.length} records...`;
-    const decrypted = [];
-    for (const r of records) {
-      try {
-        const padded = S.crypto_box_seal_open(
-          S.from_hex(r.sealed), oldKp.publicKey, oldKp.privateKey
-        );
-        if (!padded) throw new Error('Decryption failed');
-        const plaintext = unpadPlaintext(padded);
-        const obj = JSON.parse(S.to_string(plaintext));
-        decrypted.push({ blind_index: r.blind_index, data: obj });
-      } catch (e) {
-        throw new Error(`Failed to decrypt record ${r.blind_index.slice(0, 8)}...: ${e.message}`);
-      }
-    }
-    
-    // Clear old seed from memory
-    oldSeed.fill(0);
-    oldKp.privateKey.fill(0);
-    
-    // Generate new salts (this creates a new vault identity for the new passphrase)
-    note.textContent = 'Generating new vault...';
-    CACHED_SALTS = null;  // Force regeneration
-    const newSalts = await getSalts();
-    if (!newSalts.isNewVault) {
-      throw new Error('Expected new salts for re-encryption, got existing');
-    }
-    
-    // Derive new keys
-    note.textContent = 'Deriving new keys (this takes a while)...';
-    const newKeys = await deriveKeys(newPass, newSalts.kdf_version || 3);
-    
-    // Re-encrypt each record with new key (with padding)
-    note.textContent = `Re-encrypting ${decrypted.length} records...`;
-    const reencrypted = decrypted.map(({ blind_index, data }) => {
-      // Temporarily swap KEYS for seal()
-      const savedKeys = KEYS;
-      KEYS = newKeys;
-      try {
-        return { blind_index, sealed: seal(data) };
-      } finally {
-        KEYS = savedKeys;
-      }
-    });
-    
-    // Upload re-encrypted records (upsert by blind_index replaces old ciphertext)
-    note.textContent = `Uploading ${reencrypted.length} re-encrypted records...`;
-    await uploadSealedRecords(reencrypted, (done, total) => {
-      note.textContent = `Uploading... ${done}/${total}`;
-    });
-    
-    // Update KEYS to new keys and reload
-    KEYS = newKeys;
-    $('recoverForm').hidden = true;
-    note.textContent = `Recovery complete. ${reencrypted.length} records re-encrypted with new passphrase.`;
-    
-    // Clear new keys from temp variable (KEYS now holds them)
-    newKeys.seed?.fill(0);
-    
-    // Refresh the UI
-    await load(true);
-    
-  } catch (e) {
-    note.textContent = 'Recovery failed: ' + (e.message || 'Unknown error');
-    console.error('Recovery failed:', e);
-  }
-}
-
-async function handleDeleteRecovery() {
-  if (!confirm('Delete the recovery key? You will lose the ability to recover with the existing key.')) return;
-  try {
-    await api('/api/recovery/delete', { method: 'POST' });
-    $('recoveryNote').textContent = 'Recovery key deleted.';
-    refreshRecoveryState();
-  } catch (e) {
-    $('recoveryNote').textContent = 'Error: ' + (e.message || 'Failed to delete');
-  }
-}
-
-async function refreshRecoveryState() {
-  try {
-    await api('/api/recovery/blob');
-    $('recoveryState').textContent = 'Set up';
-    $('setupRecoveryBtn').hidden = true;
-    $('deleteRecoveryBtn').hidden = false;
-  } catch (e) {
-    $('recoveryState').textContent = 'Not set up';
-    $('setupRecoveryBtn').hidden = false;
-    $('deleteRecoveryBtn').hidden = true;
-  }
-}
 
   $('addExpenseCancel').addEventListener('click', () => $('addExpenseDialog').close());
   $('addExpenseCancelX').addEventListener('click', () => $('addExpenseDialog').close());
   // Recovery key UI
   $('setupRecoveryBtn').addEventListener('click', handleSetupRecovery);
+  // Forgot passphrase: recovery runs from the locked gate. The passkey
+  // session (not the passphrase) authorizes the blob fetch.
+  $('forgotPassBtn').addEventListener('click', () => {
+    $('recovery').hidden = false;
+    $('recoverForm').hidden = false;
+    $('recoveryDisplay').hidden = true;
+    $('recoverMnemonic').focus();
+  });
   $('recoverVaultBtn').addEventListener('click', () => {
     $('recoverForm').hidden = false;
     $('recoveryDisplay').hidden = true;

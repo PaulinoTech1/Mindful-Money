@@ -31,7 +31,7 @@
 | **SimpleFin** | Sees bank transactions | By design; user trusts SimpleFin with financial data. |
 | **Bank** | Sees own transactions | By design. |
 | **Thief (device)** | Physical access to unlocked device | Session timeouts and lock mitigate; unlocked browser = full access. |
-| **Thief (recovery key)** | Finds 32-word mnemonic | Can decrypt vault seed backup; still needs passkey for blob fetch. |
+| **Thief (recovery key)** | Finds 32-word mnemonic | Can decrypt vault seed backup; still needs a recent passkey assertion for blob fetch. The key survives a recovery unless deleted (see `docs/RECOVERY.md`). |
 | **Other app users** | Normal API access | Tenant isolation by `identity_id`; cannot access others' records. |
 
 ## Dominant residual risk
@@ -58,7 +58,8 @@ This is architectural, not a bug. The browser must trust the server to deliver c
 |------|-----------|--------|----------------------------------|----------|
 | Origin compromise → JS replacement → key exfiltration | Low (requires server or pipeline breach) | Catastrophic (full plaintext + passphrase) | SRI, manifest, CI checks, audit logging | **ACCEPTED. Dominant risk.** |
 | Weak passphrase → offline brute force | Medium (user behavior) | High (full vault decryption) | 60-bit entropy floor for new vaults, Argon2id v3 (5 ops, 256MB) | Reduced for new vaults; legacy vaults retain weaker params |
-| Recovery key theft | Low (physical/paper) | High (seed decryption) | Key is 256-bit; blob fetch requires passkey auth | Single point of failure; no threshold scheme |
+| Recovery key theft | Low (physical/paper) | High (seed decryption) | Key is 256-bit; blob fetch requires a recent passkey assertion | Single point of failure; no threshold scheme |
+| Interrupted or tampered rekey | Low | High (mixed keys or lost records) | Staging plus one commit transaction; commit checks every live record is replaced exactly once and the vault did not change; other sessions revoked | Writes blocked up to 15 min after a crashed rekey (`docs/RECOVERY.md`) |
 | Session hijacking | Low | Medium (API access, not plaintext) | `__Host-` prefix, HttpOnly, SameSite=Strict, server-side sessions, rotation | Session token theft via XSS is mitigated by CSP; no XSS found |
 | Database breach (Neon) | Low | Low (ciphertext only) | Bucket padding, sealed boxes, no plaintext at rest | Metadata leakage (record count, sizes, timestamps) |
 | SimpleFin credential theft | Medium (localStorage) | High (bank transaction access) | Server never sees URL; user responsible for device security | Bearer credential; anyone with the URL can fetch transactions |

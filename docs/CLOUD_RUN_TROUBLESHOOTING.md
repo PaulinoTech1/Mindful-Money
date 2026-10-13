@@ -1128,3 +1128,78 @@ upload limit);
 K hypothesis killed by a locally tested browser test. CI: see PR #8. Not
 production-verified. Confidence: J high (reproduced and fixed), I high, K
 high.
+
+### Fixed: bugs L, M and K, recovery works end to end (2026-10-13, later)
+
+History: the recovery feature arrived in one squashed commit (`28e3c9b`,
+2026-10-12) with `docs/RECOVERY.md`. Its stated intent: the server only
+stores the encrypted seed, blob access needs fresh passkey authentication,
+and recovery re-encrypts every record under the new passphrase. The code
+did not meet that intent in three ways (L, M, K). The design that now
+implements it is in `docs/RECOVERY.md` "Re-encryption (rekey)"; only the
+incident record is here.
+
+**L. Blob gate.** Fetch and delete now use the existing
+`require_destructive_management()` gate (passkey registered, passkey
+session, assertion within the 300 s step-up window). No session column or
+migration was needed for this: `authenticated_at` is already persisted and
+set only by a verified WebAuthn assertion. The browser re-runs the passkey
+ceremony on 401. A new `GET /api/recovery/status` (no blob) drives the UI
+state. Rejected: persisting a new `passkey_authenticated` flag (a second
+name for what `authenticated_at` already proves, plus a migration); a
+session-only gate (any old cookie could fetch the blob).
+
+**M and K. Atomic rekey.** New endpoints `POST /api/vault/rekey/begin`,
+`/records`, `/commit`, `/abort`; Alembic revision `a7b8c9d0e1f2` adds
+`vault_rekeys` and `vault_rekey_records` (staging). The client recomputes
+every blind index under the new index key (K) and the server swaps
+records, salts, KDF version and the rewrapped recovery blob in one
+transaction (M). Rejected approaches are listed in RECOVERY.md.
+
+**Also fixed while making the flow reachable:**
+- The Recovery card (`#recovery`) was never shown, so the recovery key could
+  not be set up from the UI. It now shows when unlocked; the locked gate
+  has "Forgot passphrase? Use recovery key".
+- The recovery handlers lived inside the boot IIFE, so `refreshRecoveryState`
+  was not callable from `unlock()`; they are now top level.
+- In `app.py`, the `if __name__ == "__main__"` block sat above the recovery
+  routes, so `python app.py` started the dev server before those routes were
+  registered. It is now at the end of the file.
+
+**Tests.** `test_recovery_rekey.py` (19): blob 409 without a passkey,
+401 signed out or with a stale assertion, 200 with a recent one; delete
+works and status follows; full rekey swap; begin needs a recent passkey;
+another identity cannot use a rekey id; validation; an incomplete or wrong
+staged set leaves the old state; a simulated crash inside the commit
+transaction leaves the old state and the rekey can then commit; normal
+upload and delete-all during a rekey get 409; a vault change after begin
+is detected; concurrent uploads and commit never leave old-key records;
+commit revokes other sessions; ZK commitments carried over; abort and TTL
+unblock writes; the worst-case staging chunk fits the request limit.
+`test_playwright_recovery.py` phase 5 (the test-only blob-serving stub is
+removed): real UI recovery from the locked gate, lock after recovery, reload
+and unlock with the new passphrase, identical records including the ~8 KB
+one, every blind index equals the keyed hash of its id under the new key,
+re-sync of the same transactions adds no records, the old passphrase fails,
+the same recovery key recovers again, and no recovery words or new
+passphrase leave the browser. The WebAuthn ceremony itself is bypassed by a
+minted session as in phases 2-4.
+
+**New issues found, NOT fixed:**
+- **N (medium):** `load()` sorts by `date` with `localeCompare`; a record
+  without a `date` throws, and `unlock()` reports it as "Incorrect vault
+  passphrase", so a valid passphrase looks wrong. Found because phase 4's
+  ~8 KB test record had no date (the test now gives it one).
+- **O (low, pre-existing drift):** `alembic` autogenerate against a fresh
+  `upgrade head` reports index `ix_audit_events_identity_occurred` exists in
+  the migrations but not in `models.py`. Unrelated to the new tables, which
+  show no diff.
+- **P (low):** an unfinished rekey blocks normal writes for up to 15 minutes
+  if the browser dies before it can call abort (documented trade-off in
+  RECOVERY.md; a new begin or the TTL clears it).
+
+**Verification:** implemented and locally tested in a clean env; migration
+verified on a fresh database (`alembic current` = `heads` =
+`a7b8c9d0e1f2`, downgrade and re-upgrade clean, columns and constraints
+match the models). CI: see PR #8. Not production-verified (needs
+`alembic upgrade head` on Neon at deploy). Confidence high.

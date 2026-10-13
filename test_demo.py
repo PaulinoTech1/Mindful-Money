@@ -89,6 +89,7 @@ TEST_DATABASE_URL = os.environ.get(
 _ALL_TABLES = (
     "records", "vault_identity", "passkey_credentials", "server_sessions",
     "webauthn_challenges", "zkp_challenges", "rate_limits", "audit_events",
+    "vault_rekeys", "vault_rekey_records",
 )
 
 

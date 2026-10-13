@@ -15,7 +15,7 @@ function extractFn(sig) {
   }
   return src.slice(start, i + 1);
 }
-const consts = ['UPLOAD_MAX_RECORDS', 'UPLOAD_MAX_BYTES', 'UPLOAD_RATE_RETRIES'].map(n => src.match(new RegExp('const ' + n + ' = [^;]+;'))[0]);
+const consts = ['UPLOAD_MAX_RECORDS', 'UPLOAD_MAX_BYTES', 'UPLOAD_RATE_RETRIES', 'UPLOAD_FIELDS'].map(n => src.match(new RegExp('const ' + n + ' = [^;]+;'))[0]);
 // Server limits, read from app.py defaults so the test tracks them.
 const py = fs.readFileSync(new URL('../app.py', import.meta.url), 'utf8');
 const SERVER_MAX_RECORDS = Number(py.match(/VAULT_MAX_RECORDS_PER_BATCH", "(\d+)"/)[1]);
@@ -30,6 +30,7 @@ const ctx = {
   JSON, Error, Math,
   sleepMs: async (ms) => { waits.push(ms); },
   apiFetch: async (path, opts) => {
+    if (ctx.override) return ctx.override(path, opts);
     if (fail429 > 0) {
       fail429--;
       const e = new Error('Request rate limit exceeded'); e.status = 429; e.retryAfter = 17; throw e;
@@ -81,4 +82,20 @@ await assert.rejects(uploadSealedRecords(small), /rate limit/);
 assert.equal(waits.length, ctx.f.UPLOAD_RATE_RETRIES);
 assert.equal(requests.length, 0);
 fail429 = 0;
+// 6. Rekey staging shape: extra body field and three fields per record, all
+//    counted in the byte budget; old_blind_index is sent, other keys are not.
+const rekeyCalls = [];
+ctx.override = async (path, opts) => {
+  rekeyCalls.push({ path, bytes: Buffer.byteLength(opts.body), body: JSON.parse(opts.body) });
+  return {};
+};
+const rekeyRows = Array.from({ length: 900 }, (_, i) => ({ blind_index: hex(i, 64), old_blind_index: hex(i + 7, 64),
+  sealed: hex(i, SERVER_MAX_HEX), extra_secret: 'must-not-be-sent' }));
+await uploadSealedRecords(rekeyRows, null, { path: '/api/vault/rekey/records',
+  fields: ['blind_index', 'old_blind_index', 'sealed'], extra: { rekey_id: 'r'.repeat(43) } });
+assert.ok(rekeyCalls.length >= 3);
+assert.ok(rekeyCalls.every(c => c.path === '/api/vault/rekey/records' && c.body.rekey_id === 'r'.repeat(43)
+  && c.bytes <= 6 * 1024 * 1024 && c.body.records.length <= SERVER_MAX_RECORDS
+  && c.body.records.every(r => Object.keys(r).join() === 'blind_index,old_blind_index,sealed')));
+assert.equal(rekeyCalls.flatMap(c => c.body.records).length, 900);
 console.log(`upload_chunking: 1200 near-max records in ${nChunks} chunks (largest ${maxBytes} bytes), count chunking ok, 429 retry ok`);

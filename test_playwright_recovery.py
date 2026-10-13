@@ -518,7 +518,7 @@ def main() -> int:
             # Bug E regression: a record in the largest bucket (8192 bytes
             # padded) seals to the server's max size and round-trips.
             big = page_d.evaluate("""async () => {
-                const obj = { id: 'big-record', merchant: 'M'.repeat(8100), amount: -1 };
+                const obj = { id: 'big-record', merchant: 'M'.repeat(8100), amount: -1, date: '2026-10-12' };
                 const sealed = seal(obj);
                 await api('/api/records', { method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -535,44 +535,82 @@ def main() -> int:
                   "~8 KB record plaintext never leaves the browser")
             check_no_plaintext_leak(check, req_d, base, "browser D")
 
-            # ---------- Phase 5: hypothesis K probe (recovery re-encryption) ----------
-            # Hypothesis K: re-encryption (handleRecoverVault, the only
-            # re-encryption path) re-uploads records under their OLD blind
-            # index, so a later sync under the new index key duplicates them.
-            # This phase runs the real flow on a vault with records and checks
-            # whether any re-encrypted record is ever uploaded.
-            print("\n\033[1mPhase 5: recovery re-encryption (hypothesis K)\033[0m")
-            before_k = page_d.evaluate(
-                "() => api('/api/records').then(r => r.records.map(x => x.blind_index + ':' + x.sealed).sort())")
+            # ---------- Phase 5: recovery with the recovery key (bugs L, M, K) ----------
+            # Vault D (identity 3) holds the restored records plus the ~8 KB
+            # record. Set up a recovery key, "forget" the passphrase, recover
+            # with the key and a new passphrase through the real UI, then
+            # check: reload + unlock with the new passphrase gives identical
+            # records, the old passphrase fails, re-syncing the same
+            # transactions creates no duplicates (K), and the same recovery
+            # key still works for a second recovery.
+            print("\n\033[1mPhase 5: recovery key -> new passphrase (bugs L, M, K)\033[0m")
+            NEW_PASS = "recovered-vault passphrase 2026 #one"
+            NEXT_PASS = "second-recovery passphrase 2026 #two"
+            page_d.evaluate("() => load()")  # include the ~8 KB record added above
+            before_k = sorted(page_d.evaluate("() => TXNS.map(t => [t.id, t.merchant.slice(0, 30), t.merchant.length, t.amount])"))
+            count_before = page_d.evaluate("() => api('/api/records').then(r => r.records.length)")
             mnemonic = page_d.evaluate("() => setupRecoveryKey()")
-            # Bug L: GET /api/recovery/blob requires session["passkey_authenticated"],
-            # which nothing sets and the server session store cannot persist,
-            # so the real flow always stops there with 403. Test-only probe:
-            # serve the stored (encrypted) blob from the DB to the page so the
-            # rest of the flow runs unchanged.
-            engine = create_engine(test_db_url, future=True)
-            with engine.connect() as conn:
-                blob_hex = conn.execute(text(
-                    "SELECT encode(recovery_blob, 'hex') FROM vault_identity WHERE id = 3")).scalar_one()
-            engine.dispose()
-            page_d.route("**/api/recovery/blob", lambda route: route.fulfill(
-                status=200, content_type="application/json",
-                body=json.dumps({"recovery_blob": blob_hex})))
-            check(isinstance(mnemonic, str) and len(mnemonic.split()) >= 12, "recovery key set up")
-            posts_before = len(req_d)
-            page_d.evaluate("""m => { $('recoverMnemonic').value = m;
-                $('recoverNewPass').value = 'a different long passphrase for recovery 2026'; }""", mnemonic)
-            page_d.once("dialog", lambda d: d.accept())
-            page_d.evaluate("() => { $('doRecoverBtn').click(); }")
-            page_d.wait_for_function("() => /(failed|complete)/i.test($('recoverNote').textContent)", timeout=120000)
-            note_k = page_d.inner_text("#recoverNote")
-            print(f"    recovery outcome: {note_k!r}")
-            after_k = page_d.evaluate(
-                "() => api('/api/records').then(r => r.records.map(x => x.blind_index + ':' + x.sealed).sort())")
-            uploads = [b for url, b in req_d[posts_before:] if url.endswith("/api/records") and b]
-            check(not uploads and after_k == before_k,
-                  "K: no re-encrypted record is uploaded, stored records unchanged",
-                  f"uploads={len(uploads)} note={note_k!r}")
+            check(isinstance(mnemonic, str) and len(mnemonic.split()) == 32, "recovery key set up (32 words)")
+
+            def recover_via_ui(page, words: str, new_pass: str, label: str) -> None:
+                # Simulates a fresh passkey sign-in (the WebAuthn ceremony is
+                # bypassed as in phases 2-4) so the blob gate's step-up
+                # window is satisfied, then uses the real locked-gate UI.
+                page.context.add_cookies([{**session_cookie_for_identity(3), "url": base}])
+                page.reload(wait_until="networkidle")
+                page.wait_for_selector("#gate:not([hidden])")
+                page.click("#forgotPassBtn")
+                page.fill("#recoverMnemonic", words)
+                page.fill("#recoverNewPass", new_pass)
+                page.once("dialog", lambda d: d.accept())
+                page.click("#doRecoverBtn")
+                page.wait_for_function(
+                    "() => /Recovery complete|Recovery failed/.test("
+                    "document.getElementById('gateNote').textContent + document.getElementById('recoverNote').textContent)",
+                    timeout=180000)
+                note = page.inner_text("#gateNote") + " | " + page.inner_text("#recoverNote")
+                check("Recovery complete" in note, f"{label}: recovery completes through the locked gate", note)
+
+            def unlock_with(page, passphrase: str) -> str:
+                page.reload(wait_until="networkidle")
+                page.wait_for_selector("#gate:not([hidden])")
+                page.fill("#pass", passphrase)
+                page.click("#unlockBtn")
+                page.wait_for_function(
+                    "() => document.getElementById('lock').dataset.state === 'open' || "
+                    "/Incorrect/.test(document.getElementById('gateNote').textContent)", timeout=120000)
+                return page.get_attribute("#lock", "data-state")
+
+            req_mark = len(req_d)
+            recover_via_ui(page_d, mnemonic, NEW_PASS, "first recovery")
+            check(page_d.evaluate("() => KEYS === null"), "vault is locked after recovery (no auto unlock)")
+            check(unlock_with(page_d, NEW_PASS) == "open", "reload + unlock with the NEW passphrase",
+                  page_d.inner_text("#gateNote"))
+            after_k = sorted(page_d.evaluate("() => TXNS.map(t => [t.id, t.merchant.slice(0, 30), t.merchant.length, t.amount])"))
+            check(after_k == before_k, f"all {len(before_k)} records identical after recovery", f"{after_k} vs {before_k}")
+            check(page_d.evaluate("() => api('/api/kdf/salts').then(r => r.kdf_version)") == 3, "kdf_version is 3")
+            # K: blind indexes match the NEW index key, so a re-sync upserts.
+            in_sync = page_d.evaluate("""async () => {
+                const { records } = await api('/api/records');
+                const want = new Set(TXNS.map(t => blindIndex(t.id)));
+                return records.length === want.size && records.every(r => want.has(r.blind_index));
+            }""")
+            check(in_sync, "K: every stored blind index equals HMAC(id) under the new index key")
+            page_d.evaluate(CREATE_RECORDS_JS, [[m, a] for m, a in EXPECTED])
+            count_after_sync = page_d.evaluate("() => api('/api/records').then(r => r.records.length)")
+            check(count_after_sync == count_before,
+                  "K: re-syncing the same transactions creates no duplicates",
+                  f"{count_before} -> {count_after_sync}")
+            check(unlock_with(page_d, PASSPHRASE) != "open"
+                  and "Incorrect" in page_d.inner_text("#gateNote"), "the OLD passphrase no longer unlocks")
+            recover_via_ui(page_d, mnemonic, NEXT_PASS, "same recovery key again")
+            check(unlock_with(page_d, NEXT_PASS) == "open"
+                  and sorted(page_d.evaluate("() => TXNS.map(t => [t.id, t.merchant.slice(0, 30), t.merchant.length, t.amount])")) == before_k,
+                  "the recovery key still works after a recovery (blob rewrapped to the new seed)")
+            leaked = [u for u, body in req_d[req_mark:] if mnemonic.split()[0] + " " + mnemonic.split()[1] in body
+                      or NEW_PASS in body or NEXT_PASS in body or NEW_PASS in u]
+            check(not leaked, "recovery words and new passphrases never leave the browser")
+            check_no_plaintext_leak(check, req_d, base, "browser D after recovery")
             ctx_d.close()
 
             browser.close()
