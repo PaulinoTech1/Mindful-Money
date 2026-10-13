@@ -203,8 +203,26 @@ client padding bucket is 8192 bytes and a NaCl sealed box adds 48
 (`crypto_box_SEALBYTES`: 32-byte ephemeral public key plus 16-byte MAC), so
 8240 bytes, 16480 hex. Raise it only together with `PAD_BUCKETS` in
 `static/app.js`. Defaults are an 8 MiB request
-and JSON limit, 1,000 records per batch, and 100,000 stored records per tenant.
+and JSON limit, 500 records per batch, and 100,000 stored records per tenant.
 Byte counts are computed from decoded hex on the server.
+
+500 records per batch is derived so that a worst-case batch always fits the
+8 MiB request limit. In compact JSON one record is
+`{"blind_index":"<64 hex>","sealed":"<16480 hex>"}` = 30 + 64 + 16480 =
+16574 bytes, plus 1 for the separating comma, and the wrapper
+`{"records":[]}` is 14 bytes. So N records take at most 14 + 16575 N bytes,
+and 14 + 16575 N <= 8,388,608 gives N <= 506. 500 leaves margin: 14 +
+500 x 16575 = 8,287,514 bytes. `test_kdf_migrate_and_limits.py` asserts this
+invariant against the configured values; if you raise any of these limits,
+keep it true. The browser (`uploadSealedRecords` in `static/app.js`) splits
+every bulk upload (connect, CSV import, backup restore, re-encryption) into
+chunks of at most 500 records and 6 MiB of body, so no client request can hit
+either limit. Each chunk is atomic, but a multi-chunk upload is not atomic as
+a whole: if a later chunk fails, earlier chunks stay stored. Uploads are
+upserts keyed by blind index, so retrying the same operation converges.
+`MAX_REQUEST_BYTES` is deliberately not raised: Cloud Run caps HTTP/1 request
+bodies at 32 MiB, and a larger limit only widens the memory and parsing DoS
+surface.
 
 Configuration overrides are `VAULT_SESSION_TTL`, `VAULT_SESSION_IDLE_TTL`,
 `VAULT_CHALLENGE_TTL`, `VAULT_MAX_REQUEST_BYTES`,

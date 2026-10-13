@@ -35,6 +35,47 @@ const apiFetch = async (url, options = {}) => {
 };
 const api = apiFetch;
 
+// Bulk record uploads are chunked by count AND body size so no request can
+// exceed the server limits (app.py MAX_RECORDS_PER_BATCH = 500 and
+// MAX_REQUEST_BYTES = 8 MiB; derivation in README "Ciphertext and resource limits").
+// 6 MiB leaves headroom under 8 MiB. Chunks are uploaded in order; a failure
+// stops at that chunk and throws (earlier chunks stay stored, which is safe:
+// uploads are idempotent upserts keyed by blind_index, so a retry converges).
+const UPLOAD_MAX_RECORDS = 500;
+const UPLOAD_MAX_BYTES = 6 * 1024 * 1024;
+
+function chunkSealedRecords(rows, maxRecords = UPLOAD_MAX_RECORDS, maxBytes = UPLOAD_MAX_BYTES) {
+  const chunks = [];
+  let current = [];
+  let bytes = 14;  // {"records":[]}
+  for (const row of rows) {
+    const rowBytes = JSON.stringify({ blind_index: row.blind_index, sealed: row.sealed }).length + 1;
+    if (14 + rowBytes > maxBytes) throw new Error('A single record exceeds the upload size limit.');
+    if (current.length && (current.length >= maxRecords || bytes + rowBytes > maxBytes)) {
+      chunks.push(current); current = []; bytes = 14;
+    }
+    current.push({ blind_index: row.blind_index, sealed: row.sealed });
+    bytes += rowBytes;
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+async function uploadSealedRecords(rows, onProgress) {
+  const chunks = chunkSealedRecords(rows);
+  let done = 0;
+  for (const chunk of chunks) {
+    await api('/api/records', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ records: chunk }),
+    });
+    done += chunk.length;
+    if (onProgress) onProgress(done, rows.length);
+  }
+  return chunks.length;
+}
+
 const b64ToBytes = (value) => Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((value.length + 3) % 4)), (c) => c.charCodeAt(0));
 const bytesToB64 = (value) => btoa(String.fromCharCode(...new Uint8Array(value))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -984,11 +1025,7 @@ async function connect(source = 'fakebank') {
       }, { ...t })),
     }));
 
-    await api('/api/records', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: sealedRows }),
-    });
+    await uploadSealedRecords(sealedRows);
 
     $('connectNote').textContent = '';
     await load();
@@ -1052,11 +1089,7 @@ async function handleCSVUpload(event) {
     }));
 
     // Server-side input validation happens in app.py (size limits, format checks)
-    await api('/api/records', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: sealedRows }),
-    });
+    await uploadSealedRecords(sealedRows);
 
     $('connectNote').textContent = `Imported ${transactions.length} transactions.`;
     await load();
@@ -2136,20 +2169,8 @@ async function importBackup(event) {
     }
 
     // Upload records in batches
-    const batchSize = 100;
     let uploaded = 0;
-    for (let i = 0; i < backup.records.length; i += batchSize) {
-      const batch = backup.records.slice(i, i + batchSize).map(r => ({
-        blind_index: r.blind_index,
-        sealed: r.sealed,
-      }));
-      await api('/api/records', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: batch }),
-      });
-      uploaded += batch.length;
-    }
+    await uploadSealedRecords(backup.records, (done) => { uploaded = done; });
 
     alert(`Restored ${uploaded} records from backup.`);
     await load();
@@ -2497,16 +2518,9 @@ async function handleRecoverVault() {
     
     // Upload re-encrypted records (upsert by blind_index replaces old ciphertext)
     note.textContent = `Uploading ${reencrypted.length} re-encrypted records...`;
-    const BATCH = 50;
-    for (let i = 0; i < reencrypted.length; i += BATCH) {
-      const batch = reencrypted.slice(i, i + BATCH);
-      await api('/api/records', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: batch }),
-      });
-      note.textContent = `Uploading... ${Math.min(i + BATCH, reencrypted.length)}/${reencrypted.length}`;
-    }
+    await uploadSealedRecords(reencrypted, (done, total) => {
+      note.textContent = `Uploading... ${done}/${total}`;
+    });
     
     // Update KEYS to new keys and reload
     KEYS = newKeys;

@@ -65,6 +65,7 @@ jobs:
         run: |
           node tests/kdf_no_fallback.test.mjs
           node tests/padding.test.mjs
+          node tests/upload_chunking.test.mjs
 
       - name: Run full test suite
         run: |

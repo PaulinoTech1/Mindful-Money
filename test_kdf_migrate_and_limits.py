@@ -90,3 +90,38 @@ class SealedSizeLimitTest(ServerCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BatchSizeInvariantTest(unittest.TestCase):
+    """Bug G: a worst-case batch must fit under the request limit by design.
+
+    Derivation: README "Ciphertext and resource limits".
+    """
+
+    def test_worst_case_batch_fits_request_limit(self):
+        import json
+        n = server_app.MAX_RECORDS_PER_BATCH
+        record = {"blind_index": "a" * 64, "sealed": "b" * server_app.MAX_SEALED_HEX_LENGTH}
+        body = json.dumps({"records": [record] * n}, separators=(",", ":"))
+        self.assertEqual(len(body), 14 + n * 16575 - 1)
+        self.assertLessEqual(len(body), server_app.MAX_REQUEST_BYTES)
+        self.assertLessEqual(len(body), server_app.MAX_JSON_OBJECT_BYTES)
+        # Default spacing (", " and ": ") must also fit.
+        self.assertLessEqual(len(json.dumps({"records": [record] * n})), server_app.MAX_REQUEST_BYTES)
+
+    def test_client_chunk_limits_within_server_limits(self):
+        src = open(os.path.join(os.path.dirname(__file__), "static", "app.js"), encoding="utf-8").read()
+        import re
+        recs = int(re.search(r"const UPLOAD_MAX_RECORDS = (\d+);", src).group(1))
+        mib = int(re.search(r"const UPLOAD_MAX_BYTES = (\d+) \* 1024 \* 1024;", src).group(1))
+        self.assertLessEqual(recs, server_app.MAX_RECORDS_PER_BATCH)
+        self.assertLess(mib * 1024 * 1024, server_app.MAX_REQUEST_BYTES)
+
+
+class WorstCaseBatchAcceptedTest(ServerCase):
+    def test_server_accepts_max_size_batch(self):
+        n = server_app.MAX_RECORDS_PER_BATCH
+        records = [{"blind_index": f"{i:064x}", "sealed": "ab" * (server_app.MAX_SEALED_HEX_LENGTH // 2)}
+                   for i in range(n)]
+        r = self.unsafe("post", "/api/records", json={"records": records})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True)[:200])

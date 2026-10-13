@@ -45,7 +45,9 @@ SESSION_TTL = int(os.environ.get("VAULT_SESSION_TTL", str(4 * 60 * 60)))
 SESSION_IDLE_TTL = int(os.environ.get("VAULT_SESSION_IDLE_TTL", "900"))
 # Strict: 15 minute idle timeout (was 30min). Reduces window for session hijacking.
 MAX_REQUEST_BYTES = int(os.environ.get("VAULT_MAX_REQUEST_BYTES", str(8 * 1024 * 1024)))
-MAX_RECORDS_PER_BATCH = int(os.environ.get("VAULT_MAX_RECORDS_PER_BATCH", "1000"))
+# 500 so the worst-case batch fits MAX_REQUEST_BYTES by construction:
+# 14 + 500 * 16575 = 8,287,514 <= 8,388,608 (derivation: README "Ciphertext and resource limits").
+MAX_RECORDS_PER_BATCH = int(os.environ.get("VAULT_MAX_RECORDS_PER_BATCH", "500"))
 MAX_TOTAL_RECORDS = int(os.environ.get("VAULT_MAX_TOTAL_RECORDS", "100000"))
 MIN_SEALED_HEX_LENGTH = int(os.environ.get("VAULT_MIN_SEALED_HEX_LENGTH", "96"))
 # Largest client bucket (static/app.js PAD_BUCKETS) is 8192 bytes; a NaCl
