@@ -19,7 +19,33 @@ if config.config_file_name is not None:
 
 # Same env var app.py/db.py read, so migrations always target whatever
 # database the app itself is currently pointed at -- dev, test, or prod.
-config.set_main_option("sqlalchemy.url", os.environ["VAULT_DATABASE_URL"])
+_db_url = os.environ.get("VAULT_DATABASE_URL", "").strip()
+if not _db_url:
+    # Fail fast and loudly. A missing or empty URL (for example a failed
+    # `gcloud secrets versions access` inside $(...)) must never let Alembic
+    # guess a target. The message never echoes the value.
+    raise SystemExit(
+        "VAULT_DATABASE_URL is empty or unset. Refusing to run migrations. "
+        "See docs/RUNBOOK.md 'Database migrations' (use the UNPOOLED Neon URL)."
+    )
+if "://" not in _db_url or not _db_url.startswith("postgresql+psycopg://"):
+    raise SystemExit(
+        "VAULT_DATABASE_URL must start with postgresql+psycopg:// (the image ships "
+        "psycopg 3 only). Value not shown. See docs/RUNBOOK.md 'Database migrations'."
+    )
+if _db_url.count("postgresql+psycopg://") != 1:
+    raise SystemExit(
+        "VAULT_DATABASE_URL contains the driver prefix more than once (see the "
+        "2026-10-13 incident in docs/CLOUD_RUN_TROUBLESHOOTING.md). Value not shown."
+    )
+from sqlalchemy.engine import make_url as _make_url
+if "-pooler" in (_make_url(_db_url).host or ""):
+    raise SystemExit(
+        "VAULT_DATABASE_URL points at the Neon pooler host. DDL must use the "
+        "UNPOOLED connection string. See docs/RUNBOOK.md 'Database migrations'."
+    )
+# configparser treats % as interpolation; escape so URL-encoded passwords survive.
+config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
 
 target_metadata = models.Base.metadata
 
