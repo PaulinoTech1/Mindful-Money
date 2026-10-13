@@ -23,8 +23,8 @@
       "sha256": "12980a3f75d14eea4f88b4f69bfa58b9289ce9f687e8a7b14c90a4bc0205dfdc"
     },
     "app.js": {
-      "sri": "sha384-cInths0tuya16SzjrfonUZj9uuoOEeJ4S/H4ZPwaAFCZOKpp3gvdDyH4W3tqfRYv",
-      "sha256": "33eca615fff0902a8bf94b5fad39d4ba8b6b747a5eb54629b0c4d1bf29589191"
+      "sri": "sha384-VMK9ogIHGAvHPQoMINNAYSSw+LtJKfvzsWMUZU6ZZurCTH0y3OtFxmqFoz6/4/X9",
+      "sha256": "0fafc427458a4b70fa39a10567261b080bbc45245ac013b4ff452ba54c303505"
     }
   }
 }

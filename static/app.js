@@ -595,34 +595,84 @@ function backupAuthKey() {
 const PAD_BUCKETS = [512, 1024, 2048, 4096, 8192];
 const PAD_MAX = 8192;  // 8KB max plaintext
 
+// Padding format v2 (2026-10-13). Layout of a padded plaintext of size B
+// (B is always one of PAD_BUCKETS, so length-hiding is unchanged):
+//   [data][0x00 fill][padLen: uint32 big-endian][0x02 version marker]
+// padLen counts every byte after the data (fill + 5-byte trailer), so
+// data = padded[0 .. B - padLen). Max data per record is PAD_MAX - 5.
+//
+// Legacy format v1 (before 2026-10-13) filled every pad byte with
+// padLen & 0xff. Pads of 256 bytes or more were stored modulo 256, so the
+// v1 reader stripped too little (docs/CLOUD_RUN_TROUBLESHOOTING.md "padding
+// length overflows one byte"). unpadPlaintext still reads v1, including
+// those broken records, when the true pad length is unambiguous.
+const PAD_VERSION = 0x02;
+const PAD_TRAILER = 5;
+
 function padPlaintext(data) {
-  if (data.length > PAD_MAX) {
-    throw new Error(`Record too large: ${data.length} bytes (max ${PAD_MAX})`);
+  if (data.length > PAD_MAX - PAD_TRAILER) {
+    throw new Error(`Record too large: ${data.length} bytes (max ${PAD_MAX - PAD_TRAILER})`);
   }
-  // Find the smallest bucket that fits
-  let bucket = PAD_BUCKETS[PAD_BUCKETS.length - 1];
+  let bucket = null;
   for (const b of PAD_BUCKETS) {
-    if (data.length <= b) { bucket = b; break; }
+    if (data.length + PAD_TRAILER <= b) { bucket = b; break; }
   }
-  // PKCS#7-style padding: pad with bytes indicating pad length
   const padLen = bucket - data.length;
-  const padded = new Uint8Array(bucket);
+  const padded = new Uint8Array(bucket);  // fill bytes are already 0x00
   padded.set(data);
-  padded.fill(padLen, data.length);
+  padded[bucket - 5] = (padLen >>> 24) & 0xff;
+  padded[bucket - 4] = (padLen >>> 16) & 0xff;
+  padded[bucket - 3] = (padLen >>> 8) & 0xff;
+  padded[bucket - 2] = padLen & 0xff;
+  padded[bucket - 1] = PAD_VERSION;
   return padded;
 }
 
+function _unpadV2(padded) {
+  const n = padded.length;
+  if (n < PAD_TRAILER || padded[n - 1] !== PAD_VERSION) return null;
+  const padLen = ((padded[n - 5] << 24) >>> 0) + (padded[n - 4] << 16) + (padded[n - 3] << 8) + padded[n - 2];
+  if (padLen < PAD_TRAILER || padLen > n) return null;
+  for (let i = n - padLen; i < n - PAD_TRAILER; i++) {
+    if (padded[i] !== 0) return null;
+  }
+  return padded.slice(0, n - padLen);
+}
+
+function _isCanonicalJson(bytes) {
+  // seal() always writes JSON.stringify output: valid UTF-8, valid JSON,
+  // no leading or trailing whitespace.
+  let text;
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch (_e) { return false; }
+  if (text.length === 0 || text.trim() !== text) return false;
+  try { JSON.parse(text); return true; } catch (_e) { return false; }
+}
+
+function _unpadLegacyV1(padded) {
+  const n = padded.length;
+  const v = padded[n - 1];
+  let run = 0;
+  while (run < n && padded[n - 1 - run] === v) run++;
+  // True pad length P satisfies P % 256 === v, 1 <= P <= run, or P === 0
+  // when the data filled the bucket exactly (the v1 writer added no pad).
+  const matches = [];
+  if (_isCanonicalJson(padded)) matches.push(padded.slice());
+  for (let P = (v === 0 ? 256 : v); P <= run; P += 256) {
+    const candidate = padded.slice(0, n - P);
+    if (_isCanonicalJson(candidate)) matches.push(candidate);
+  }
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) throw new Error('Ambiguous legacy padding');
+  throw new Error('Invalid padding');
+}
+
 function unpadPlaintext(padded) {
-  if (padded.length === 0) throw new Error('Empty padded data');
-  const padLen = padded[padded.length - 1];
-  if (padLen === 0 || padLen > padded.length) {
-    throw new Error('Invalid padding');
+  if (!(padded instanceof Uint8Array) || !PAD_BUCKETS.includes(padded.length)) {
+    throw new Error('Invalid padded length');
   }
-  // Verify all padding bytes match
-  for (let i = padded.length - padLen; i < padded.length; i++) {
-    if (padded[i] !== padLen) throw new Error('Invalid padding bytes');
-  }
-  return padded.slice(0, padded.length - padLen);
+  const v2 = _unpadV2(padded);
+  if (v2 !== null) return v2;
+  return _unpadLegacyV1(padded);
 }
 
 const seal = (obj) => {
@@ -1995,16 +2045,22 @@ async function importBackup(event) {
       pass = prompt('Enter your vault passphrase to verify the backup:');
       if (!pass) throw new Error('Passphrase required to restore backup.');
     }
+    // Backups made before KDF versioning carry no kdf_version: those vaults
+    // were v1 (matches the DB server_default). Anything else must be a
+    // known version; no fallback to another version (see deriveKeys).
+    const backupKdfVersion = checkKdfVersion(
+      backup.kdf.kdf_version === undefined ? 1 : backup.kdf.kdf_version);
     const candidateSalts = {
       enc: Uint8Array.from(backup.kdf.salt_enc.match(/../g).map(h => parseInt(h, 16))),
       idx: Uint8Array.from(backup.kdf.salt_idx.match(/../g).map(h => parseInt(h, 16))),
+      kdf_version: backupKdfVersion,
     };
     // Temporarily override salt cache to derive candidate keys
     const savedSalts = CACHED_SALTS;
     CACHED_SALTS = candidateSalts;
     let candidateKeys;
     try {
-      candidateKeys = await deriveKeys(pass, candidateSalts.kdf_version || 1);
+      candidateKeys = await deriveKeys(pass, backupKdfVersion);
     } finally {
       CACHED_SALTS = savedSalts;
     }
@@ -2022,15 +2078,19 @@ async function importBackup(event) {
     }
     const expectedHmac = S.crypto_auth_hmacsha256(
       S.from_string(verifyCanonical), candidateBackupKey);
-    if (S.crypto_verify_32(S.from_hex(S.to_hex(expectedHmac)),
-                            S.from_hex(backup.integrity)) !== 0) {
+    // Constant-time compare. crypto_verify_32 is not exported by the bundled
+    // libsodium-wrappers build; memcmp is (constant time, equal lengths).
+    const providedHmac = (typeof backup.integrity === 'string' && /^[0-9a-f]{64}$/.test(backup.integrity))
+      ? S.from_hex(backup.integrity) : null;
+    if (!providedHmac || !S.memcmp(expectedHmac, providedHmac)) {
       throw new Error('Integrity check failed (file corrupted or tampered)');
     }
 
     // Step 3: Verify canary decrypts with candidate keys
+    // The canary and records are written by seal(), so they are padded.
     const candidateOpen = (hex) =>
-      JSON.parse(S.to_string(
-        S.crypto_box_seal_open(S.from_hex(hex), candidateKeys.publicKey, candidateKeys.privateKey)));
+      JSON.parse(S.to_string(unpadPlaintext(
+        S.crypto_box_seal_open(S.from_hex(hex), candidateKeys.publicKey, candidateKeys.privateKey))));
     try {
       const canaryObj = candidateOpen(backup.canary);
       if (!canaryObj._backup_canary) throw new Error('Invalid canary');
@@ -2042,6 +2102,13 @@ async function importBackup(event) {
     try {
       const saltResp = await api('/api/kdf/salts');
       if (saltResp.salt_enc !== backup.kdf.salt_enc || saltResp.salt_idx !== backup.kdf.salt_idx) {
+        // /api/kdf/salts/migrate replaces salts but not kdf_version, so a
+        // version mismatch would make the next unlock derive different keys.
+        // Refuse loudly instead (docs/CLOUD_RUN_TROUBLESHOOTING.md, bug D).
+        if ((saltResp.kdf_version || 1) !== backupKdfVersion) {
+          throw new Error(`Backup uses KDF v${backupKdfVersion} but this vault uses v${saltResp.kdf_version || 1}. ` +
+            'Restore into a vault with the same KDF version.');
+        }
         await api('/api/kdf/salts/migrate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -2052,7 +2119,7 @@ async function importBackup(event) {
           }),
         });
         CACHED_SALTS = null;
-        KEYS = await deriveKeys(pass, backup.kdf.kdf_version || 1);
+        KEYS = await deriveKeys(pass, backupKdfVersion);
       }
     } catch (e) {
       if (e.status === 404 || (e.message && e.message.includes('not found'))) {
@@ -2065,7 +2132,7 @@ async function importBackup(event) {
           }),
         });
         CACHED_SALTS = null;
-        KEYS = await deriveKeys(pass, backup.kdf.kdf_version || 1);
+        KEYS = await deriveKeys(pass, backupKdfVersion);
       } else {
         throw e;
       }

@@ -62,7 +62,9 @@ jobs:
           "
 
       - name: KDF no-fallback unit test (JS)
-        run: node tests/kdf_no_fallback.test.mjs
+        run: |
+          node tests/kdf_no_fallback.test.mjs
+          node tests/padding.test.mjs
 
       - name: Run full test suite
         run: |
