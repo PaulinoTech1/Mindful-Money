@@ -136,6 +136,8 @@ def main() -> int:
             record_delete_statuses: list[int] = []
             page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
             page.on("pageerror", lambda e: errors.append(f"PAGEERROR: {e}"))
+            bad_responses: list[str] = []
+            page.on("response", lambda r: bad_responses.append(f"{r.status} {r.request.method} {r.url}") if r.status >= 400 else None)
             page.on("request", lambda r: (requests.append(r.url), request_bodies.append(r.post_data or "")))
             page.on("response", lambda r: record_delete_statuses.append(r.status)
                     if r.request.method == "DELETE" and r.url.endswith("/api/records") else None)
@@ -214,7 +216,11 @@ def main() -> int:
             # --- connect ------------------------------------------------
             print("\n  Connect and encrypt")
             page.click("#connectBtn")
-            page.wait_for_selector("#dash:not([hidden])", timeout=60000)
+            try:
+                page.wait_for_selector("#dash:not([hidden])", timeout=60000)
+            except Exception:
+                print("    connect error:", page.inner_text("#connectNote"), "; console:", "; ".join(errors[:3]), "; http:", "; ".join(bad_responses[-5:]))
+                raise
             page.wait_for_timeout(2500)
 
             records = int(page.inner_text("#statRecords"))

@@ -204,6 +204,37 @@ def do_bootstrap(page, check: Check) -> None:
                  {"authenticatorId": authenticator_id})
 
 
+def import_backup(page, passphrase: str) -> list:
+    """Drive the current import UI (static/app.js importBackup).
+
+    The unlock gate clears #pass after derivation, so importBackup asks for
+    the passphrase with prompt() and reports the outcome with alert()
+    ("Restored N records from backup." or "Restore failed: ...").
+    Returns every dialog as (type, message) in order.
+    """
+    seen: list = []
+
+    def on_dialog(dialog):
+        seen.append((dialog.type, dialog.message))
+        if dialog.type == "prompt":
+            dialog.accept(passphrase)
+        else:
+            dialog.accept()
+
+    page.on("dialog", on_dialog)
+    try:
+        page.set_input_files("#importFile", str(BACKUP_PATH))
+        page.wait_for_function(
+            "() => true", timeout=1000)  # let the change handler start
+        deadline = time.time() + 90
+        while time.time() < deadline and not any(
+                t == "alert" for t, _ in seen):
+            page.wait_for_timeout(250)
+    finally:
+        page.remove_listener("dialog", on_dialog)
+    return seen
+
+
 def passphrase_unlock(page) -> None:
     """Passphrase unlock through the real gate UI (gate must be visible)."""
     page.fill("#pass", PASSPHRASE)
@@ -346,11 +377,10 @@ def main() -> int:
             check(page_b.get_attribute("#lock", "data-state") == "open",
                   "browser B unlocked with the same passphrase")
 
-            with page_b.expect_event("dialog", timeout=60000) as dlg_info:
-                page_b.set_input_files("#importFile", str(BACKUP_PATH))
-            dialog = dlg_info.value
-            msg_b = dialog.message
-            dialog.accept()
+            dialogs_b = import_backup(page_b, PASSPHRASE)
+            check(dialogs_b[:1] and dialogs_b[0][0] == "prompt",
+                  "import asks for the vault passphrase (gate cleared #pass)", repr(dialogs_b))
+            msg_b = next((m for t, m in dialogs_b if t == "alert"), "")
             check(f"Restored {len(EXPECTED)} records" in msg_b,
                   "import reports all records restored", f"dialog said: {msg_b!r}")
 
@@ -398,31 +428,37 @@ def main() -> int:
             check(page_c.get_attribute("#lock", "data-state") == "open",
                   "browser C unlocked against the new vault")
 
-            with page_c.expect_event("dialog", timeout=60000) as dlg_info_c:
-                page_c.set_input_files("#importFile", str(BACKUP_PATH))
-            dialog_c = dlg_info_c.value
-            msg_c = dialog_c.message
-            dialog_c.accept()
+            # Security property under the current UI: a backup from another
+            # vault is only accepted with the passphrase that produced it.
+            # importBackup verifies the HMAC and canary with candidate keys
+            # BEFORE touching server salts, so a wrong passphrase must be
+            # rejected and must not change this vault's salts.
+            salts_before = page_c.evaluate("() => api('/api/kdf/salts')")
+            dialogs_bad = import_backup(page_c, "definitely-not-the-passphrase")
+            msg_bad = next((m for t, m in dialogs_bad if t == "alert"), "")
+            check(msg_bad.startswith("Restore failed:") and
+                  ("Integrity check failed" in msg_bad or "wrong passphrase" in msg_bad),
+                  "foreign backup with wrong passphrase is rejected", f"got: {msg_bad!r}")
+            salts_after = page_c.evaluate("() => api('/api/kdf/salts')")
+            check(salts_before == salts_after,
+                  "rejected restore leaves this vault's KDF salts unchanged")
+            check(page_c.evaluate("() => TXNS.length") == 0,
+                  "rejected restore imports nothing")
 
+            # With the right passphrase, cross-vault restore is the intended
+            # path (salts migrated after full validation).
+            dialogs_c = import_backup(page_c, PASSPHRASE)
+            msg_c = next((m for t, m in dialogs_c if t == "alert"), "")
+            check(f"Restored {len(EXPECTED)} records" in msg_c,
+                  "new-vault restore with the right passphrase succeeds", f"got: {msg_c!r}")
             if f"Restored {len(EXPECTED)} records" in msg_c:
-                print("    \033[32m✓\033[0m new-vault restore succeeds (P1 #3 defect is fixed)")
-                check(True, "new-vault restore succeeds")
                 page_c.wait_for_function(
                     f"() => TXNS && TXNS.length === {len(EXPECTED)}", timeout=60000)
                 recovered_c = page_c.evaluate(
                     "() => TXNS.map(t => [t.merchant, t.amount])"
                     ".sort((a, b) => a[0] < b[0] ? -1 : 1)")
                 check([tuple(r) for r in recovered_c] == EXPECTED,
-                      "new-vault recovery is byte-identical")
-            else:
-                print("    \033[33m!\033[0m KNOWN DEFECT (P1 #3) reproduced in a real browser:")
-                print(f"      dialog: {msg_c!r}")
-                print("      The backup carries KDF salts, but unlock auto-generated fresh")
-                print("      salts first, so importBackup sees a mismatch and the")
-                print("      /api/kdf/salts/migrate escape hatch is unreachable (409).")
-                check("Backup salts do not match" in msg_c,
-                      "new-vault restore fails with the predicted salt-mismatch signature",
-                      f"got: {msg_c!r}")
+                      "new-vault recovery is byte-identical", f"got {recovered_c}")
             check_no_plaintext_leak(check, req_c, base, "browser C")
             ctx_c.close()
 
