@@ -31,7 +31,7 @@ TEST_BOOTSTRAP_TOKEN = "test-only-bootstrap-token-not-a-secret"
 EXPECTED_BOOTSTRAP_409 = "Failed to load resource: the server responded with a status of 409 (CONFLICT)"
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 except ImportError:
     print("playwright not installed. Run:")
     print("  pip install playwright && python3 -m playwright install chromium")
@@ -104,6 +104,11 @@ def main() -> int:
         # "disable passkeys" step. Production refuses anything but "required".
         "VAULT_AUTH_POLICY": "optional",
         "VAULT_BOOTSTRAP_TOKEN": TEST_BOOTSTRAP_TOKEN,
+        # Test-only: this suite performs more than 10 record writes within
+        # 60 s on a fast machine, which tripped the production upload limit
+        # (10/60 s) intermittently. Production keeps the default; rate limiting
+        # itself is covered by test_demo.py. See TROUBLESHOOTING bug I.
+        "VAULT_RATE_UPLOAD": "100",
     })
     env_server = subprocess.Popen(
         [sys.executable, "-c", f"import app; app.app.run(port={port})"],
@@ -572,8 +577,20 @@ def main() -> int:
             # --- mobile --------------------------------------------------
             print("\n  Responsive")
             page.set_viewport_size({"width": 390, "height": 844})
-            page.wait_for_timeout(900)
+            # Condition-based wait (bug H): wait until the viewport has resized
+            # and layout has settled with no overflow, up to 10 s. On timeout
+            # the same assertion below is evaluated and fails normally.
+            try:
+                page.wait_for_function(
+                    "() => window.innerWidth === 390 && "
+                    "document.documentElement.scrollWidth <= window.innerWidth + 2",
+                    timeout=10_000,
+                )
+            except PlaywrightTimeoutError:
+                print("    (overflow did not settle within 10 s; scrollWidth=%s)" % page.evaluate(
+                    "document.documentElement.scrollWidth"))
             overflow = page.evaluate(
+                "window.innerWidth !== 390 || "
                 "document.documentElement.scrollWidth > window.innerWidth + 2"
             )
             check(not overflow, "no horizontal overflow at 390px")

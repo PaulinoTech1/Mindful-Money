@@ -984,3 +984,67 @@ CI: see PR #8. Not production-verified. Confidence high.
 - **H (low, flaky test):** `test_browser.py` "no horizontal overflow at
   390px" failed once locally and passed on the rerun; it waits a fixed 900 ms
   after resizing.
+
+### Fixed: bug G; bug H test fixed, which exposed bugs I and J (2026-10-13, later)
+
+**G. Bulk uploads cannot exceed the request limit by design.**
+- Server: default `VAULT_MAX_RECORDS_PER_BATCH` lowered from 1000 to 500 so
+  the worst-case batch (500 records at max sealed size) is 8,287,514 bytes,
+  under the 8 MiB `MAX_REQUEST_BYTES`. The derivation is stated once, in the
+  README section "Ciphertext and resource limits".
+- Client (`static/app.js`): new `chunkSealedRecords` / `uploadSealedRecords`
+  split every bulk upload by count (500) and by body size (6 MiB). Used by
+  all four bulk paths: connect / sync (demo and SimpleFin), CSV import,
+  backup restore (was fixed 100 per batch) and re-encryption (was 50).
+  Single-record writes (manual entry, edit, fraud status) are unchanged.
+  A single record over 6 MiB throws before any request (impossible with the
+  16480 hex cap). Non-atomicity across chunks: README, same section.
+- Rejected: raising `MAX_CONTENT_LENGTH` (Cloud Run caps request bodies at
+  32 MiB, and a larger limit widens the memory and parsing DoS surface for
+  no user benefit); chunking by count only (a count alone cannot bound bytes
+  if the per-record cap changes); chunking by bytes only (would let the
+  client exceed the server record count with small records).
+- Tests: `test_kdf_migrate_and_limits.py` asserts the worst-case compact and
+  default-spaced JSON batch at the configured limits fits
+  `MAX_REQUEST_BYTES` and `MAX_JSON_OBJECT_BYTES`, that the client chunk
+  limits in `app.js` are within the server limits, and that the server
+  accepts a real 500 x 16480-hex batch (200). `tests/upload_chunking.test.mjs`
+  (added to pr-verify) runs the real `app.js` functions: 1,200 max-size
+  records upload in 4 chunks (largest 6,281,938 bytes), every request under
+  the server byte and count limits, order and content preserved; 1,201 small
+  records split 500/500/201.
+- Integrity: manifest regenerated in the same commit; only the `app.js`
+  `integrity` attribute in `index.html` was changed.
+
+**H. 390px overflow check is now condition based.**
+- The fixed 900 ms wait was replaced by `wait_for_function` until
+  `innerWidth === 390` and `scrollWidth <= innerWidth + 2` (10 s timeout).
+  The assertion is unchanged except that it now also fails if the viewport
+  never reached 390 px (stricter, not looser).
+- Result: the failure was not a timing problem. Run 5 times locally, the
+  check failed in 3 runs even after 10 s. Diagnostics show bug J below.
+  H is therefore NOT stable yet; the test is now correctly reporting an app
+  bug instead of masking it with a sleep.
+
+**New issues found, NOT fixed:**
+- **I (medium, real users too):** the `upload` rate limit is 10 requests per
+  60 s and every single-record write (manual entry, edit, rename, fraud flag)
+  counts. `test_browser.py` hit 429 "Request rate limit exceeded" on the
+  double-submit step in 2 of 4 fast local runs (a pre-existing flake). A user
+  editing quickly will hit the same. Test-only mitigation:
+  `test_browser.py` sets `VAULT_RATE_UPLOAD=100` for its server process
+  (production default unchanged). Not decided: whether production should
+  raise the limit or separate single-record edits from bulk uploads.
+- **J (low, UI):** after the viewport shrinks to 390 px, Chart.js canvases
+  sometimes keep their desktop width (`#chMerchants` 1060 px, `#chBalance`
+  502 px) and cause horizontal overflow that does not settle within 10 s.
+  Both charts use `responsive: true, maintainAspectRatio: false`; a likely
+  cause is a chart container without a constrained width (e.g. a missing
+  `min-width: 0` on a grid item) so the ResizeObserver never sees it shrink.
+  Not investigated further.
+
+**Verification:** G implemented, locally tested (clean env: pytest 153
+passed; node tests 3/3 files pass; `test_playwright_recovery.py` 36/36);
+CI: see PR #8; not production-verified; confidence high. H implemented and
+locally tested; the check now fails intermittently because of bug J, so the
+browser suite is not stable; confidence high in the diagnosis.
