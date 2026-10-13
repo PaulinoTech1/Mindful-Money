@@ -733,3 +733,43 @@ too, so a frontend flow change cannot silently strand the E2E tests.
 
 **Status:** `json=` fix implemented and locally verified past line 145;
 browser suite still failing (pre-existing). Confidence high.
+
+### Update: passkey bootstrap in the browser tests (2026-10-13, later)
+
+Both browser tests now enroll the first passkey through the real bootstrap
+UI with a Chromium virtual authenticator (CDP `WebAuthn.enable` and
+`WebAuthn.addVirtualAuthenticator`: ctap2, internal, resident key, UV) and
+a test-only dummy `VAULT_BOOTSTRAP_TOKEN` set only in each test's server env.
+The test asserts the page origin equals `VAULT_ORIGIN` (`localhost`).
+
+Driving the real ceremony found two issues:
+
+1. **App bug (fixed, affects production enrollment):** `bootstrapPasskey()`
+   in `static/app.js` passed the server's JSON options straight to
+   `navigator.credentials.create()`. The challenge is base64url text, so the
+   browser rejects it ("The provided value is not of type ArrayBuffer").
+   Every other ceremony decodes with `publicKeyOptions()`; bootstrap now does
+   too. Without this fix the owner's pending first enrollment on production
+   would fail. Status: implemented, locally tested (ceremony succeeds in
+   headless Chromium); not production-verified. Confidence high.
+2. **By-design gap (not changed):** bootstrap verify rotates the session
+   without `authenticated_at` (only `login_verify` sets it), so right after
+   enrollment `/api/kdf/salts` returns 401 and the gate shows "Incorrect
+   vault passphrase". The tests now reload and complete a real passkey login
+   before unlocking. In production the owner will see the same misleading
+   message after enrolling; reloading and signing in with the passkey works.
+   Proposal (needs a decision, auth-semantics change): after bootstrap, have
+   the frontend run the login ceremony automatically instead of showing the
+   passphrase gate. Confidence high (reproduced locally).
+
+**Remaining failures (pre-existing, stale tests, not fixed: attempt limit):**
+- `test_browser.py`: everything through unlock passes; then
+  `page.wait_for_selector("#dash:not([hidden])")` times out after clicking
+  "Connect demo bank" (`connect('fakebank')`).
+- `test_playwright_recovery.py`: phase 1 (bootstrap, records, export) passes;
+  phase 2 fails with "Backup import failed: Error: Passphrase required to
+  restore backup." and phase 3's salt-mismatch expectation fails. The import
+  flow now asks for a passphrase that the test does not supply.
+
+Status: bootstrap path locally tested; both suites still red. Not
+CI-verified as passing.
