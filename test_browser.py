@@ -610,7 +610,12 @@ def main() -> int:
                   body: JSON.stringify({ records: [{ blind_index: blindIndex(bad.id), sealed: seal(bad) }] }) });
             }""")
             page.click("#lockVaultBtn")
-            page.fill("#pass", PASSPHRASE); page.click("#unlockBtn")
+            page.fill("#pass", PASSPHRASE)
+            # Wait for unlock's final POST too: the next section edits the
+            # session row directly, and an in-flight request would write its
+            # loaded copy back over that edit (flake seen in CI).
+            with page.expect_response(lambda r: r.url.endswith("/api/vault/unlocked"), timeout=30000):
+                page.click("#unlockBtn")
             page.wait_for_selector("#dash:not([hidden])", timeout=30000)
             check("Incorrect" not in page.inner_text("#gateNote"), "an undated record never reads as a wrong passphrase")
             check(page.is_visible("#recordWarning") and page.inner_text("#recordWarning").startswith("1 record could not be shown"),

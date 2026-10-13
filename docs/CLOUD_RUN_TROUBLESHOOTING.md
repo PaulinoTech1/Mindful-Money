@@ -1283,5 +1283,16 @@ while the commit lock is held, abort is scoped to the caller's identity).
   client `default=1`. Invisible to default autogenerate; raw SQL inserts
   behave differently on migrated (Neon) and `create_all` (test) databases.
 
+**Test flake found and fixed (test only):** the first CI run set of
+`076773e` passed browser-test 5 of 6 times. The failure was the step-up
+section: the stale delete got 200 at once instead of 401. The new bug N
+step ended with an unlock whose final `POST /api/vault/unlocked` was still
+in flight when the step-up section set `authenticated_at = 0` with raw SQL;
+that request's session save then wrote its loaded `authenticated_at` back.
+The test now waits for that response. Confidence medium-high (matches the
+log, not reproduced locally). The app behavior (every save writes back all
+session fields except the ceremony id) only matters for out-of-band edits
+of the session row, which the app does not make; noted, not changed.
+
 **Labels:** implemented and locally tested in a clean env (high); CI: see
 PR #8; not production-verified. No migration this round.
