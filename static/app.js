@@ -423,10 +423,26 @@ async function submitManualTransaction(event) {
       transaction_type: transactionType,
       category,
     };
-    await api('/api/records', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ records: [{ blind_index: blindIndex(manual.id), sealed: seal(manual) }] }),
-    });
+    // ZK path first; on an availability failure fall back to the standard
+    // sealed-box path, which is just as zero-knowledge but not validated by
+    // a proof, and say so (docs/ZKP_BINDING.md "UI behavior").
+    let zkpNote = '';
+    try {
+      await saveManualTransactionV4(manual, {
+        name, rawAmount: amountField.value.trim(), category, transactionType,
+      }, error);
+      manual.zkp = 'v4';
+      zkpNote = 'Saved with a zero-knowledge validity proof.';
+    } catch (zkpError) {
+      if (!zkpError.zkpFallback) throw zkpError;
+      await api('/api/records', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ records: [{ blind_index: blindIndex(manual.id), sealed: seal(manual) }] }),
+      });
+      zkpNote = `Saved encrypted without ZK validation (non-ZKP): ${zkpError.message}`;
+    }
+    $('connectNote').textContent = zkpNote;
+    error.textContent = '';
     TXNS.push({
       ...manual,
       notes: '', tags: [], splits: [], is_transfer: false, excluded: false, fraud_status: '',
@@ -657,18 +673,33 @@ function wrapSeedWithRecoveryKey(seed, recoveryKey) {
 // recomputed from the record id under the NEW index key. Returns staged rows
 // {blind_index, old_blind_index, sealed}. Fails closed on any record it
 // cannot decrypt or that has no id, rather than dropping it.
-function reencryptForRekey(records, oldKp, newKeys) {
+// v4 records (ZK proven, bound to the OLD key) are opened with the old
+// zk_root and re-sealed as standard sealed-box records; the server drops
+// their v4 tag at commit (docs/ZKP_BINDING.md "Rekey and recovery").
+async function reencryptForRekey(records, oldKp, newKeys) {
   const out = [];
   const seen = new Set();
+  let zk = null, oldRoot = null;
   for (const r of records) {
-    let padded;
-    try {
-      padded = S.crypto_box_seal_open(S.from_hex(r.sealed), oldKp.publicKey, oldKp.privateKey);
-    } catch (e) {
-      padded = null;
+    let obj;
+    if (isZkpV4Record(r)) {
+      if (!zk) { zk = await loadZkpProver(); oldRoot = zkRootFor(oldKp.privateKey, zk); }
+      try {
+        obj = await openZkpV4With(r.sealed, oldKp, oldRoot, zk);
+      } catch (e) {
+        throw new Error(`Record ${r.blind_index.slice(0, 8)}... does not decrypt with the recovered key.`);
+      }
+      delete obj.zkp;
+    } else {
+      let padded;
+      try {
+        padded = S.crypto_box_seal_open(S.from_hex(r.sealed), oldKp.publicKey, oldKp.privateKey);
+      } catch (e) {
+        padded = null;
+      }
+      if (!padded) throw new Error(`Record ${r.blind_index.slice(0, 8)}... does not decrypt with the recovered key.`);
+      obj = JSON.parse(S.to_string(unpadPlaintext(padded)));
     }
-    if (!padded) throw new Error(`Record ${r.blind_index.slice(0, 8)}... does not decrypt with the recovered key.`);
-    const obj = JSON.parse(S.to_string(unpadPlaintext(padded)));
     if (typeof obj.id !== 'string' || !obj.id) {
       throw new Error(`Record ${r.blind_index.slice(0, 8)}... has no id; cannot recompute its blind index.`);
     }
@@ -794,6 +825,168 @@ const open = (hex) => {
 
 const blindIndex = (id) =>
   S.to_hex(S.crypto_generichash(32, S.from_string(id), KEYS.indexKey));
+
+/* ---------- ZKP v4 manual transactions (docs/ZKP_BINDING.md "UI behavior") ----------
+   The ~17 MB prover (static/zkp/build/mm-zkp-v4.js) is loaded only when it
+   is needed: enrolling the key commitment, proving a manual transaction, or
+   opening a v4 record. It is cloned from <template id="zkpProverTemplate">
+   in index.html, so its SRI hash pins every byte it runs. zk_root and the
+   private key never leave this page; the server receives the key
+   commitment once, then proofs and their public inputs.
+
+   A stored v4 record is <proven part, 304 bytes> || <meta>, where meta is a
+   normal sealed box holding the fields the circuit does not cover (id, date,
+   account, pending, source). Name, amount, category and type are taken from
+   the proven part only. */
+const ZKP_CIRCUIT_V4 = 'manual-transaction-v4';
+const ZKP_PROVEN_HEX = 2 * (16 + 32 * 9);
+const ZKP_LOAD_TIMEOUT_MS = 120000;
+let ZKP_PROVER = null;       // Promise<window.MMZkpV4>
+let ZKP_ROOT = null;         // BigInt, derived from KEYS.privateKey, page memory only
+let ZKP_VERIFIER_UNAVAILABLE = false;  // set after a 503; skip the v4 path until re-unlock
+
+function loadZkpProver() {
+  if (window.MMZkpV4) return Promise.resolve(window.MMZkpV4);
+  if (ZKP_PROVER) return ZKP_PROVER;
+  ZKP_PROVER = new Promise((resolve, reject) => {
+    const template = $('zkpProverTemplate');
+    if (!template) { reject(new Error('The ZK prover is not available on this page.')); return; }
+    const fragment = document.importNode(template.content, true);
+    const script = fragment.querySelector('script');
+    const timer = setTimeout(() => reject(new Error('The ZK prover took too long to load.')), ZKP_LOAD_TIMEOUT_MS);
+    window.addEventListener('mm-zkp-v4-ready', () => { clearTimeout(timer); resolve(window.MMZkpV4); }, { once: true });
+    script.addEventListener('error', () => { clearTimeout(timer); reject(new Error('The ZK prover could not be loaded (network or integrity check failed).')); });
+    document.head.append(fragment);
+  }).catch((e) => { ZKP_PROVER = null; throw e; });
+  return ZKP_PROVER;
+}
+
+function zkRootFor(privateKey, zk) {
+  return zk.deriveZkRoot(privateKey, (n, m) => S.crypto_generichash(n, m));
+}
+
+async function currentZkRoot() {
+  const zk = await loadZkpProver();
+  if (ZKP_ROOT === null) ZKP_ROOT = zkRootFor(KEYS.privateKey, zk);
+  return ZKP_ROOT;
+}
+
+const isZkpV4Record = (r) => r && r.circuit_version === ZKP_CIRCUIT_V4;
+
+// Open a v4 record with an explicit keypair and zk_root (rekey uses the old
+// ones). Returns the same object shape as open().
+async function openZkpV4With(hex, keypair, root, zk) {
+  if (typeof hex !== 'string' || hex.length <= ZKP_PROVEN_HEX) throw new Error('Malformed v4 record.');
+  const proven = await zk.decryptManualTransactionV4(hex.slice(0, ZKP_PROVEN_HEX), root);
+  const padded = S.crypto_box_seal_open(S.from_hex(hex.slice(ZKP_PROVEN_HEX)), keypair.publicKey, keypair.privateKey);
+  if (!padded) throw new Error('Decryption failed');
+  const meta = JSON.parse(S.to_string(unpadPlaintext(padded)));
+  const cents = Number(proven.amount_cents);
+  return {
+    ...meta,
+    merchant: proven.name,
+    amount: (proven.transaction_type === 'income' ? -cents : cents) / 100,
+    transaction_type: proven.transaction_type,
+    category: proven.category || '',
+    source: 'manual',
+    zkp: 'v4',
+  };
+}
+
+async function openRecord(r) {
+  if (!isZkpV4Record(r)) return open(r.sealed);
+  const zk = await loadZkpProver();
+  return openZkpV4With(r.sealed, KEYS, await currentZkRoot(), zk);
+}
+
+// Enrollment needs a recent passkey assertion. interactive=false (unlock)
+// never prompts; interactive=true (manual entry) runs the ceremony once.
+// Returns 'registered' or throws an Error with .zkpFallback set.
+async function ensureZkpEnrollment(interactive, note) {
+  const fallback = (message) => Object.assign(new Error(message), { zkpFallback: true });
+  const state = await api('/api/zkp/key-commitment');
+  if (state.registered) return 'registered';
+  let zk;
+  try { zk = await loadZkpProver(); } catch (e) { throw fallback(e.message); }
+  if (!KEYS) throw fallback('The vault is locked.');
+  // A private copy: lockVault() zeroes KEYS.privateKey, and enrolling a
+  // commitment of a wiped key would lock this vault out of v4 proofs.
+  const privateKey = KEYS.privateKey.slice();
+  const attempt = () => zk.enrollKeyCommitment(api, privateKey, (n, m) => S.crypto_generichash(n, m));
+  try {
+    await attempt();
+  } catch (e) {
+    if (e.status === 409) throw fallback('ZK validation needs a passkey on this vault.');
+    if (e.status !== 401) throw fallback(`ZK enrollment failed: ${e.message}`);
+    if (!interactive) throw fallback('ZK validation is not set up yet (a recent passkey check is needed).');
+    await authenticateWithPasskey(note);
+    await attempt();
+  } finally {
+    privateKey.fill(0);
+  }
+  return 'registered';
+}
+
+// Best effort, after unlock: never prompts, never blocks the dashboard.
+async function refreshZkpAvailability() {
+  try {
+    const ready = await api('/ready');
+    ZKP_VERIFIER_UNAVAILABLE = ready.zkp !== 'available';
+  } catch (_e) {
+    // Leave the flag alone; the next challenge will decide.
+  }
+}
+
+function enrollZkpInBackground() {
+  refreshZkpAvailability().then(() => {
+    if (ZKP_VERIFIER_UNAVAILABLE) return;
+    return ensureZkpEnrollment(false);
+  }).catch((e) => {
+    console.info('ZK key commitment not enrolled at unlock:', e.message);
+  });
+}
+
+// Prove and store one manual transaction. Throws .zkpFallback errors for
+// availability problems (503, prover load failure, no enrollment, key
+// mismatch, a name over the 120-byte proof bound); any other error (for
+// example a rejected proof) is reported and nothing is saved.
+async function saveManualTransactionV4(manual, validated, note) {
+  const fallback = (message) => Object.assign(new Error(message), { zkpFallback: true });
+  if (ZKP_VERIFIER_UNAVAILABLE) throw fallback('ZK validation is unavailable on the server right now.');
+  if (new TextEncoder().encode(validated.name).length > 120) throw fallback('The name is longer than the 120-byte ZK proof bound.');
+  let zk;
+  try { zk = await loadZkpProver(); } catch (e) { throw fallback(e.message); }
+  await ensureZkpEnrollment(true, note);
+  let challenge;
+  try {
+    challenge = await api('/api/zkp/challenge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ purpose: 'manual_expense_create' }),
+    });
+  } catch (e) {
+    if (e.status === 503) { ZKP_VERIFIER_UNAVAILABLE = true; throw fallback('ZK validation is unavailable on the server right now.'); }
+    if (e.status === 409) throw fallback('ZK validation is unavailable on the server right now.');
+    throw e;
+  }
+  if (note) note.textContent = 'Generating zero-knowledge proof in this browser...';
+  let body;
+  try {
+    body = await zk.proveManualTransactionV4(challenge, validated, await currentZkRoot());
+  } catch (e) {
+    throw fallback(`The proof could not be generated here (${e.message}).`);
+  }
+  // Everything except the proven fields goes in the sealed meta part.
+  const { merchant: _m, amount: _a, category: _c, transaction_type: _t, ...meta } = manual;
+  try {
+    await api('/api/records/manual', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, blind_index: blindIndex(manual.id), meta: seal(meta) }),
+    });
+  } catch (e) {
+    if (e.status === 503) { ZKP_VERIFIER_UNAVAILABLE = true; throw fallback('ZK validation is unavailable on the server right now.'); }
+    throw e;
+  }
+}
 
 // Passphrase strength estimator. Runs entirely in the browser; no passphrase
 // data is stored or transmitted. This is a heuristic, not a cryptographic
@@ -984,10 +1177,11 @@ async function unlock() {
     await api('/api/vault/rekey/abort', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
     }).catch(() => {});
+    ZKP_ROOT = null; ZKP_VERIFIER_UNAVAILABLE = false;
     await load(true);
     await api('/api/vault/unlocked', { method: 'POST' });
   } catch (_error) {
-    KEYS = null; TXNS = [];
+    KEYS = null; TXNS = []; ZKP_ROOT = null;
     $('unlockBtn').disabled = false;
     const code = _error && _error.code;
     if (code === 'KDF_ALLOCATION_FAILED') $('gateNote').textContent = _error.message;
@@ -1023,6 +1217,7 @@ async function unlock() {
   refreshRecoveryState();
   await refreshSecurity();
   $('unlockBtn').disabled = false;
+  enrollZkpInBackground();
 }
 
 // Fetch all records with pagination (server limits to 5000 per request).
@@ -1082,7 +1277,23 @@ async function load(duringUnlock = false) {
   // or rendering problem and must NOT be reported as a wrong passphrase (bug N).
   let decrypted;
   try {
-    decrypted = records.map((r) => open(r.sealed));
+    decrypted = [];
+    for (const r of records) {
+      if (isZkpV4Record(r)) {
+        // Without the prover (blocked, failed its SRI check, offline) a v4
+        // record cannot be opened; show the rest and count it as not shown
+        // rather than failing the unlock. Its sealed meta part is a normal
+        // sealed box, so the candidate key is still verified here: a wrong
+        // passphrase fails the unlock even when every record is v4.
+        try { await loadZkpProver(); } catch (_e) {
+          const hex = typeof r.sealed === 'string' ? r.sealed : '';
+          if (hex.length <= ZKP_PROVEN_HEX) throw new Error('Malformed v4 record.');
+          open(hex.slice(ZKP_PROVEN_HEX));
+          decrypted.push(null); continue;
+        }
+      }
+      decrypted.push(await openRecord(r));
+    }
   } catch (e) {
     const err = new Error('Decryption failed');
     err.code = 'DECRYPT_FAILED';
@@ -2300,9 +2511,26 @@ async function importBackup(event) {
       }
     }
 
+    // v4 records go back through the normal upload, which cannot carry
+    // their proof tag, so restore them as standard sealed-box records
+    // (still client-encrypted; see docs/ZKP_BINDING.md "Backup and restore").
+    let restoreRows = backup.records;
+    if (restoreRows.some(isZkpV4Record)) {
+      const zk = await loadZkpProver();
+      const root = zkRootFor(candidateKeys.privateKey, zk);
+      restoreRows = [];
+      for (const r of backup.records) {
+        if (!isZkpV4Record(r)) { restoreRows.push(r); continue; }
+        const obj = await openZkpV4With(r.sealed, candidateKeys, root, zk);
+        delete obj.zkp;
+        restoreRows.push({ blind_index: r.blind_index,
+          sealed: S.to_hex(S.crypto_box_seal(padPlaintext(S.from_string(JSON.stringify(obj))), candidateKeys.publicKey)) });
+      }
+    }
+
     // Upload records in batches
     let uploaded = 0;
-    await uploadSealedRecords(backup.records, (done) => { uploaded = done; });
+    await uploadSealedRecords(restoreRows, (done) => { uploaded = done; });
 
     alert(`Restored ${uploaded} records from backup.`);
     await load();
@@ -2318,7 +2546,7 @@ async function resetPassphrase() {
   $('resetPassphraseBtn').disabled = true;
   try {
     await deleteAllRecordsWithStepUp(note);
-    KEYS = null; TXNS = [];
+    KEYS = null; TXNS = []; ZKP_ROOT = null; ZKP_VERIFIER_UNAVAILABLE = false;
     $('pass').value = '';
     updatePassphraseEntropy();
     $('gate').querySelector('h1').textContent = 'Set a new passphrase';
@@ -2437,7 +2665,7 @@ async function refreshSecurity() {
 
 function lockVault() {
   if (KEYS) { KEYS.privateKey?.fill(0); KEYS.indexKey?.fill(0); KEYS.publicKey?.fill(0); }
-  KEYS = null; TXNS = [];
+  KEYS = null; TXNS = []; ZKP_ROOT = null; ZKP_VERIFIER_UNAVAILABLE = false;
   CHAT_CONTEXT = { pending: '', lastTopic: '', projectionHorizon: 1 };
   Object.values(CHARTS).forEach((c) => c.destroy()); CHARTS = {};
   Object.values(CHAT_CHARTS).forEach((c) => c.destroy());
@@ -2530,7 +2758,15 @@ async function handleRecoverVault() {
     newKeys = await deriveKeys(newPass, kdfVersion, salts);
 
     note.textContent = `Re-encrypting ${records.length} records...`;
-    const staged = reencryptForRekey(records, oldKp, newKeys);
+    const staged = await reencryptForRekey(records, oldKp, newKeys);
+    // A registered ZK key commitment must be replaced in the same commit
+    // (same server salt, new key).
+    const zkpState = await api('/api/zkp/key-commitment');
+    let zkpCommitment = null;
+    if (zkpState.registered) {
+      const zk = await loadZkpProver();
+      zkpCommitment = await zk.keyCommitmentHex(zkRootFor(newKeys.privateKey, zk), zkpState.vault_salt);
+    }
     await uploadSealedRecords(staged, (done, total) => {
       note.textContent = `Uploading re-encrypted records... ${done}/${total}`;
     }, { path: '/api/vault/rekey/records', fields: ['blind_index', 'old_blind_index', 'sealed'],
@@ -2543,6 +2779,7 @@ async function handleRecoverVault() {
       body: JSON.stringify({
         rekey_id: rekeyId, salt_enc: S.to_hex(salts.enc), salt_idx: S.to_hex(salts.idx),
         kdf_version: kdfVersion, recovery_blob: wrapSeedWithRecoveryKey(newKeys.seed, recoveryKey),
+        ...(zkpCommitment ? { zkp_key_commitment: zkpCommitment } : {}),
       }),
     });
     rekeyId = null;

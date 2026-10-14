@@ -171,6 +171,10 @@ def expected_server_inputs(*, challenge: bytes, record_id: bytes, key_commitment
     )
 
 
+# Hex length of the proven part of a stored v4 record (see below).
+PROVEN_RECORD_HEX = 2 * (RECORD_ID_BYTES + 32 * 9)
+
+
 def sealed_from_outputs(record_id: bytes, public_inputs: tuple[str, ...]) -> str:
     """Stored v4 record, built by the server from the VERIFIED proof outputs:
     record_id (16 bytes) || ciphertext (8 x 32) || mac (32), lowercase hex.

@@ -1298,9 +1298,11 @@ def put_records():
             {"identity_id": owner_id, "blind_index": blind, "sealed": sealed, "bytes": nbytes, "stored_at": today}
             for blind, sealed, nbytes in validated
         ])
+        # A record rewritten through this path is a plain sealed box, so any
+        # ZK proof tag on the old row no longer describes it: clear it.
         stmt = stmt.on_conflict_do_update(
             index_elements=["identity_id", "blind_index"],
-            set_=dict(sealed=stmt.excluded.sealed, bytes=stmt.excluded.bytes),
+            set_=dict(sealed=stmt.excluded.sealed, bytes=stmt.excluded.bytes, commitment=None, circuit_version=None),
         )
         conn.execute(stmt)
     conn.commit()
@@ -1395,8 +1397,9 @@ def zkp_key_commitment_status():
 
 @app.post("/api/zkp/key-commitment/salt")
 def zkp_key_commitment_salt():
-    """Step 1 of enrollment (step-up gated): issue a fresh server-generated
-    salt. Refused once a commitment exists; only rekey commit replaces it."""
+    """Step 1 of enrollment (step-up gated): issue a server-generated salt,
+    reusing a pending one. Refused once a commitment exists; only rekey
+    commit replaces it."""
     denied = require_destructive_management()
     if denied: return denied
     payload, error = _json_object()
@@ -1410,6 +1413,14 @@ def zkp_key_commitment_salt():
         conn.rollback(); return api_error("Vault not found", 404)
     if row.zkp_key_commitment is not None:
         conn.rollback(); return api_error("A ZK key commitment is already registered", 409)
+    # Idempotent while no commitment exists: a pending salt is reused, so two
+    # concurrent enrollments (two tabs, or background enrollment racing a
+    # manual entry) compute their commitment over the same salt and the
+    # stored commitment always matches the stored salt. The salt is public.
+    current = conn.execute(select(ident.c.zkp_vault_salt).where(ident.c.id == owner_id)).scalar()
+    if current is not None:
+        conn.commit()
+        return jsonify({"vault_salt": bytes(current).hex()})
     # 31 bytes: strictly below the BN254 modulus, so it is a field element as is.
     salt = secrets.token_bytes(31)
     conn.execute(update(ident).where(ident.c.id == owner_id).values(zkp_vault_salt=salt, updated_at=func.now()))
@@ -1499,10 +1510,19 @@ def create_manual_expense_zkp():
     owner_id = current_identity_id()
     payload, error = _json_object()
     if error: return error
-    if set(payload) != {"challenge_id", "blind_index", "proof", "public_inputs"}:
+    required = {"challenge_id", "blind_index", "proof", "public_inputs"}
+    if not required <= set(payload) <= required | {"meta"}:
         return api_error("Invalid manual transaction submission", 400)
     challenge_id, blind, proof_hex, public_inputs = (
         payload["challenge_id"], payload["blind_index"], payload["proof"], payload["public_inputs"])
+    # Optional client sealed box with the fields the circuit does not cover
+    # (id, date, account). Opaque to the server and NOT proven; stored
+    # after the proven part. See docs/ZKP_BINDING.md "UI behavior".
+    meta_hex = payload.get("meta", "")
+    if not isinstance(meta_hex, str) or (meta_hex and (
+            not MIN_SEALED_HEX_LENGTH <= len(meta_hex) <= MAX_SEALED_HEX_LENGTH - zkp_verifier.PROVEN_RECORD_HEX
+            or len(meta_hex) % 2 or not _is_lower_hex(meta_hex))):
+        return api_error("Invalid record", 400)
     if not isinstance(challenge_id, str) or not challenge_id or len(challenge_id) > 128:
         return api_error("Invalid manual transaction submission", 400)
     if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind):
@@ -1556,7 +1576,7 @@ def create_manual_expense_zkp():
         )
         return api_error("Unable to validate the encrypted record.", 400)
 
-    sealed = zkp_verifier.sealed_from_outputs(bytes(claimed["record_id"]), public_inputs)
+    sealed = zkp_verifier.sealed_from_outputs(bytes(claimed["record_id"]), public_inputs) + meta_hex
     commitment = zkp_verifier.commitment_from_outputs(public_inputs)
     table = models.Record.__table__
     conn = db()
@@ -1632,7 +1652,13 @@ def reset():
     conn=db()
     blocked = _vault_write_guard(conn, owner_id)
     if blocked: return blocked
-    conn.execute(delete(table).where(table.c.identity_id == owner_id)); conn.commit()
+    conn.execute(delete(table).where(table.c.identity_id == owner_id))
+    # The reset is followed by a new passphrase, i.e. a new vault key, so the
+    # old key's ZK commitment would lock the vault out of v4 proofs. Clear it
+    # (and its salt); the new key re-enrolls with a fresh step-up.
+    ident = models.VaultIdentity.__table__
+    conn.execute(update(ident).where(ident.c.id == owner_id).values(zkp_key_commitment=None, zkp_vault_salt=None))
+    conn.commit()
     LOG.info('event="vault_records_deleted" client="%s"', _client_log_id())
     return jsonify({"reset":True})
 
@@ -2166,13 +2192,14 @@ def migrate_kdf_salts():
                 "Cannot overwrite salts: records exist. This would make them unreadable.", 409
             )
         LOG.warning('event="kdf_salts_force_overwritten" client="%s"', _client_log_id())
-    
-    conn.execute(
-        update(table)
-        .where(table.c.id == identity_id)
-        .values(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, kdf_version=kdf_version,
-                updated_at=func.now())
-    )
+
+    values = dict(kdf_salt_enc=salt_enc, kdf_salt_idx=salt_idx, kdf_version=kdf_version, updated_at=func.now())
+    if row.kdf_salt_enc is not None and force:
+        # New salts on an empty vault mean a new vault key; the old key's ZK
+        # commitment is stale. Clearing it only disables v4 proofs until the
+        # new key re-enrolls (which needs a passkey step-up).
+        values.update(zkp_key_commitment=None, zkp_vault_salt=None)
+    conn.execute(update(table).where(table.c.id == identity_id).values(**values))
     conn.commit()
     LOG.info('event="kdf_salts_migrated" kdf_version=%d client="%s"', kdf_version, _client_log_id())
     return jsonify({"migrated": True})
