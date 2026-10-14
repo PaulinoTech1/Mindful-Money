@@ -1,7 +1,8 @@
 /* Manual-transaction ZK proof v4 browser client (key-bound).
  *
- * STATUS: implemented and tested in Node (tests/zkp_v4_client.test.mjs) with
- * the real compiled circuit; NOT wired into static/app.js yet. The server
+ * STATUS: tested in Node (v4_client.test.mjs) with the real compiled
+ * circuit and wired into static/app.js through the lazy loaded browser
+ * bundle built from manual_expense_v4_browser.js. The server
  * accepts v4 proofs only from vaults that enrolled a key commitment. See
  * docs/ZKP_BINDING.md.
  *
@@ -29,12 +30,33 @@ export { CIRCUIT_VERSION_V4, deriveZkRoot } from './manual_expense_v4_core.js';
 
 let wasmReady = null;
 function ensureWasmReady() {
-  if (!wasmReady) wasmReady = Promise.all([initACVM(fetch(acvmWasmUrl)), initNoirC(fetch(noircWasmUrl))]);
+  if (!wasmReady) wasmReady = wasmInit();
   return wasmReady;
 }
 let bbInstance = null;
+let bbFactory = () => Barretenberg.new();
+// Library-mode builds inline these as data: URLs. Decode them in page
+// instead of fetch(), which CSP connect-src would refuse for data: URLs.
+function wasmSource(url) {
+  if (!url.startsWith('data:')) return fetch(url);
+  const bin = atob(url.slice(url.indexOf(',') + 1));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+  return out;
+}
+let wasmInit = () => Promise.all([initACVM(wasmSource(acvmWasmUrl)), initNoirC(wasmSource(noircWasmUrl))]);
+/**
+ * Override how Barretenberg and the Noir wasm modules are created. The
+ * browser bundle (manual_expense_v4_browser.js) uses this to run single
+ * threaded, worker free, with every wasm and CRS byte inlined so the one
+ * SRI-pinned file covers all of it.
+ */
+export function configureRuntime({ barretenberg, noirWasm } = {}) {
+  if (barretenberg) bbFactory = barretenberg;
+  if (noirWasm) wasmInit = noirWasm;
+}
 async function getBarretenberg() {
-  if (!bbInstance) bbInstance = await Barretenberg.new();
+  if (!bbInstance) bbInstance = bbFactory();
   return bbInstance;
 }
 
@@ -52,7 +74,7 @@ export async function enrollKeyCommitment(apiFetch, privateKey, generichash = (n
   const p2 = poseidon2From(await getBarretenberg());
   const { vault_salt: salt } = await apiFetch('/api/zkp/key-commitment/salt', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   const root = deriveZkRoot(privateKey, generichash);
-  const commitment = await keyCommitment(p2, root, BigInt(salt));
+  const commitment = await keyCommitment(p2, root, BigInt(`0x${salt}`));
   return apiFetch('/api/zkp/key-commitment', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ key_commitment: fieldHex(commitment).slice(2) }),
@@ -98,6 +120,12 @@ export async function proveManualTransactionV4(challenge, validated, zkRoot) {
     proof: Array.from(proof.proof, (b) => b.toString(16).padStart(2, '0')).join(''),
     public_inputs: proof.publicInputs.map(fieldHex),
   };
+}
+
+/** Key commitment (hex, no 0x) for a zk_root and the vault's salt (hex). Used by rekey. */
+export async function keyCommitmentHex(zkRoot, saltHex) {
+  const p2 = poseidon2From(await getBarretenberg());
+  return fieldHex(await keyCommitment(p2, zkRoot, BigInt(`0x${saltHex}`))).slice(2);
 }
 
 /** Decrypt a stored v4 record (`sealed` from GET /api/records). */

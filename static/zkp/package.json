@@ -6,7 +6,8 @@
   "scripts": {
     "build": "vite build --configLoader runner",
     "smoke": "node smoke_prove.mjs",
-    "test:v4": "node v4_client.test.mjs"
+    "test:v4": "node v4_client.test.mjs",
+    "build:browser": "vite build --configLoader runner -c vite.browser.config.js && node -e \"require('fs').rmSync('build/assets',{recursive:true,force:true})\""
   },
   "dependencies": {
     "@aztec/bb.js": "5.1.0",
