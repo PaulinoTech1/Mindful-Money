@@ -220,6 +220,8 @@ jobs:
     # Real browser + real bb verifier: enroll, prove, store, decrypt,
     # fallbacks, recovery rekey, network capture, proving-time numbers.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs: verify
     services:
       postgres:

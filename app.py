@@ -1511,8 +1511,8 @@ def create_manual_expense_zkp():
     # after the proven part. See docs/ZKP_BINDING.md "UI behavior".
     meta_hex = payload.get("meta", "")
     if not isinstance(meta_hex, str) or (meta_hex and (
-            not _LOWER_HEX.fullmatch(meta_hex) or len(meta_hex) % 2
-            or not MIN_SEALED_HEX_LENGTH <= len(meta_hex) <= MAX_SEALED_HEX_LENGTH - zkp_verifier.PROVEN_RECORD_HEX)):
+            not MIN_SEALED_HEX_LENGTH <= len(meta_hex) <= MAX_SEALED_HEX_LENGTH - zkp_verifier.PROVEN_RECORD_HEX
+            or len(meta_hex) % 2 or not _is_lower_hex(meta_hex))):
         return api_error("Invalid record", 400)
     if not isinstance(challenge_id, str) or not challenge_id or len(challenge_id) > 128:
         return api_error("Invalid manual transaction submission", 400)
