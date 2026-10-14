@@ -1,4 +1,4 @@
-# Hardening Proposals (not implemented)
+# Hardening Proposals and Roadmap
 
 **Date:** 2026-10-13
 **Status:** proposals. P1 is implemented (see below); everything else is not. Each item
@@ -82,6 +82,11 @@ removes any doubt. Disable first (reversible), destroy after a week.
 ## P4. Remove the bootstrap token after first passkey enrollment (infra)
 
 See `docs/THREAT_MODEL.md` risk register and `docs/BOOTSTRAP_TOKEN.md`.
+**Status (2026-10-13):** approved. The first production passkey is enrolled
+(`/api/passkeys/status` reports `bootstrap_needed: false`). The token is not
+set by `deploy.yml`, so it is a live Cloud Run binding; removal needs
+`gcloud` with project access (commands in `docs/BOOTSTRAP_TOKEN.md`). Not
+yet done.
 
 ## P5. Run migrations as a gated deploy step (CI/infra)
 
@@ -96,3 +101,97 @@ unpooled-URL secret that runs `alembic upgrade head` before
 coupling, `docs/THREAT_MODEL.md`). With P1 in place the failure becomes
 visible. Optionally add a distinct `event="rate_limit_db_error"` so alerts
 can tell "limiter down" from "route down". Keep fail-closed.
+
+## Roadmap: ASVS-aligned assurance items (2026-10-13)
+
+Verification framework: OWASP ASVS 5.0; current status per requirement in
+[ASVS.md](ASVS.md). Each item names the threat it addresses and a priority
+(the owner's). None is implemented yet. The residual risk each one reduces
+is stated in its primary doc and only linked here.
+
+### R1. Independent-origin production hash verification
+
+**Threat:** origin compromise ([THREAT_MODEL.md](THREAT_MODEL.md#dominant-residual-risk)).
+**Priority:** Low.
+Today the deploy workflow checks served JS hashes right after deploy, from
+the same pipeline that shipped it ([JS_INTEGRITY.md](JS_INTEGRITY.md)). Proposal:
+a scheduled job outside the deploy path (a separate GitHub Actions workflow
+on a cron, or an external monitor) fetches the served `app.js`,
+`simplefin-client.js`, `recovery-words.js` and vendored libraries from the
+canonical host and compares them with the manifest at the tagged commit in
+git, alerting on mismatch. Detects later tampering at the origin; cannot
+stop a simultaneous repo and pipeline compromise. ASVS: supports 3.6.1 and
+the V15 inventory items.
+
+### R2. GitHub and Cloud Run deployment authorization hardening
+
+**Threat:** origin compromise via the pipeline
+([THREAT_MODEL.md](THREAT_MODEL.md#actors), "Malicious deploy pipeline").
+**Priority:** Low-Medium.
+Proposal: branch protection on `main` with required checks (verify,
+browser-test, CodeQL) and a required review; a protected GitHub
+environment for the deploy job; Workload Identity Federation scoped to this
+repo and branch; a deploy service account limited to Cloud Run deploy and
+the two secrets; audit of who holds Owner/Editor on the project; pinned
+action versions by commit SHA. ASVS: 13.3.2 (least-privilege secret
+access). Needs project IAM access; owner decision.
+
+### R3. Explicit zeroization and automatic vault locking
+
+**Threat:** endpoint compromise or an unattended unlocked browser.
+**Priority:** Low.
+Today `lockVault()` zeroes the private, index and public key buffers and
+clears decrypted transactions; recovery wipes its key material. Gaps: no
+idle or tab-hidden auto-lock; derived seeds and intermediate buffers are
+not all wiped; JavaScript strings (decrypted JSON) cannot be zeroed. Proposal:
+auto-lock after a configurable idle period (default 10 min) and optionally
+when the tab is hidden; wipe every `Uint8Array` that held key material
+after use; document the string limitation. ASVS: 14.3.1; 11.7.1 stays out
+of reach for a browser app.
+
+### R4. Malicious-JavaScript and plaintext-leak regression tests
+
+**Threat:** verification gap (a future change that sends plaintext,
+keys or the passphrase to the server or elsewhere would not be caught
+everywhere).
+**Priority:** Medium.
+Today the browser tests assert that the passphrase never appears in request
+bodies and that edits reach the server only as ciphertext. Proposal: a
+Playwright suite that records every request (all hosts, headers, bodies,
+URLs) through a full session (connect, edit, manual entry, CSV import,
+recovery, rekey) and fails on any plaintext marker, key bytes or passphrase;
+plus a negative test that injects a deliberately leaking script and
+confirms CSP and the tests catch it. ASVS: supports 14.2.3 and 3.4.3.
+
+### R5. Focused external code review
+
+**Threat:** lack of independent assurance.
+**Priority:** Moderate.
+Scope already drafted in [AUDIT_SCOPE.md](AUDIT_SCOPE.md): sealing and
+padding, KDF and salts, recovery and rekey, session and step-up, tenant
+isolation. Deliverable: findings mapped to [ASVS.md](ASVS.md) requirement
+IDs, after which rows move to "reviewed". Needs budget; owner decision.
+
+### R6. Versioned security verification report
+
+**Threat:** verification drift (claims in docs going stale).
+**Priority:** Low.
+Proposal: a dated, versioned report per release (`docs/verification/`)
+generated from [ASVS.md](ASVS.md), recording the commit, CI run IDs,
+production header and smoke results, open gaps, a cryptographic inventory
+(ASVS 11.1.2), a dependency inventory or SBOM (15.1.2) and written
+remediation time frames (15.1.1).
+
+### R7. Restrict unnecessary browser network destinations
+
+**Threat:** partial JavaScript compromise (an injected script exfiltrating
+to an arbitrary host). The risk itself is the `connect-src` row of the
+[THREAT_MODEL.md](THREAT_MODEL.md#risk-register) risk register.
+**Priority:** not assigned by the owner.
+Today CSP allows `connect-src 'self' https:` because the SimpleFin bridge
+host is user-supplied. Proposal: narrow to `'self'` plus the SimpleFin
+bridge hosts (for example `https://bridge.simplefin.org` and
+`https://beta-bridge.simplefin.org`), with the client refusing other hosts
+and a clear error; document every destination (ASVS 13.1.1). Not changed in
+this round: it would break any self-hosted or alternative bridge, which is
+a product decision. Zero-knowledge is unaffected either way.
