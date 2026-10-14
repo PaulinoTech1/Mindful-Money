@@ -45,6 +45,9 @@ JS_FILES = [
     "simplefin-client.js",
     "recovery-words.js",
     "app.js",
+    # Lazy-loaded ZKP v4 prover (one self-contained module, ~17 MB). Its tag
+    # lives in <template id="zkpProverTemplate"> and app.js clones it in.
+    "zkp/build/mm-zkp-v4.js",
 ]
 
 
@@ -89,9 +92,11 @@ def update_html(manifest: dict) -> None:
 
         def replacer(m):
             attrs = m.group(1)
-            # Remove existing integrity attribute if present
-            attrs = re.sub(r'\s+integrity="[^"]*"', '', attrs)
-            # Add new integrity attribute
+            # Drop every existing integrity and crossorigin attribute, then
+            # add exactly one of each. Earlier versions kept the old
+            # crossorigin and appended another, so every run added a
+            # duplicate; this form is idempotent.
+            attrs = re.sub(r'\s+(?:integrity|crossorigin)(?:="[^"]*")?', '', attrs)
             return f'<script src="/static/{rel}"{attrs} integrity="{sri}" crossorigin="anonymous">'
 
         new_html, count = re.subn(pattern, replacer, html)
@@ -101,7 +106,8 @@ def update_html(manifest: dict) -> None:
         else:
             print(f"  WARNING: no script tag found for {rel}", file=sys.stderr)
 
-    html_path.write_text(html)
+    if html != html_path.read_text():
+        html_path.write_text(html)
 
 
 def check_manifest() -> bool:
