@@ -23,8 +23,12 @@
       "sha256": "12980a3f75d14eea4f88b4f69bfa58b9289ce9f687e8a7b14c90a4bc0205dfdc"
     },
     "app.js": {
-      "sri": "sha384-j1/QFNc6ADONW4ydShYde+b9Blpka91iOwO7J4NtOQnAyDdf7M0HTvm50+EFDLno",
-      "sha256": "e2d6ac71b819d1294b0536f7b44d64e9669d8ac017114f7f33abf3ae61fa6a73"
+      "sri": "sha384-ibVqqoDTjiOFqzLz6MhOiak1H3PthghZa35eyy41uOVPBAZ/2lZK0lbjL6GiINju",
+      "sha256": "3035d9b083a13b20a99d1856eb4f8e893148aa74c098b9dc2c2a620af02315ff"
+    },
+    "zkp/build/mm-zkp-v4.js": {
+      "sri": "sha384-OUlH6lUUGJz3U2MAKTsYiaJYiGoPNWGk+4ZCDqFZfO8aQp84I1Pb/W6TC2D4cyH3",
+      "sha256": "a5819a216c5c0ebf02fa8aff35bce5ecc03c17ce712f6e5e7566aebb4bd22964"
     }
   }
 }
