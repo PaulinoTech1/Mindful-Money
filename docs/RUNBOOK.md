@@ -106,10 +106,13 @@ before merging PR #8). PR #8 deployed to Cloud Run as `dee30a5`.
 
 ### ZKP v4 migration (`b8c9d0e1f2a3`, branch `zkp/v4-key-commitment`)
 
-Additive only: two nullable columns on `vault_identity`
-(`zkp_key_commitment`, `zkp_vault_salt`). Run it BEFORE merging the PR, so
-the new code never meets an old schema; the old code ignores the columns.
-Same rules as above, but check out the PR branch instead of `main`:
+Applied to Neon before merging PR #12 (production is at this head). The
+columns are additive and nullable on `vault_identity`
+(`zkp_key_commitment`, `zkp_vault_salt`). Kept here as the record of how
+it was run. The follow-on UI wiring (branch `zkp/v4-ui-wiring`) needs no
+schema change: see `docs/ZKP_BINDING.md` "UI behavior".
+
+Original instructions (check out the PR branch instead of `main`):
 
 ```bash
 # Cloud Shell

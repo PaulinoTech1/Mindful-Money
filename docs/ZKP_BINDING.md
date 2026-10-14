@@ -10,7 +10,7 @@ third party.
 |---|---|---|
 | `manual-transaction-v2` (`zkp/manual_expense`) | No (read-only) | Validates a private witness and returns a commitment; does not bind the stored ciphertext. Existing v2 records stay readable. |
 | `manual-transaction-v3` | Never | Removed. It bound the ciphertext to the proof, but its encryption key was a free witness: a proof made with any random key verified (reproduced locally on 2026-10-14 with nargo 1.0.0-beta.26 and bb 5.1.0). It was never wired to the server and never reached production. |
-| `manual-transaction-v4` (`zkp/manual_expense_v4`) | Yes, once the vault enrolls | Binds the key to a per-vault commitment registered at enrollment. Implemented, locally tested; CI-verified once the PR checks pass; not production-verified. |
+| `manual-transaction-v4` (`zkp/manual_expense_v4`) | Yes, once the vault enrolls | Binds the key to a per-vault commitment registered at enrollment. Wired into `static/app.js` (this PR). Implemented, locally tested; CI-verified once the PR checks pass; not production-verified. |
 
 Earlier versions of this document said v2 proofs "continue to verify" and
 implied v3 was in use. Neither was true in production: the image shipped no
@@ -95,10 +95,12 @@ cheaper. Cost figures: `docs/OFFLINE_ATTACK_COST.md`. Confidence: high.
 2. `POST /api/zkp/challenge`: 503 if the verifier is unavailable, 409 if
    the vault has no commitment; otherwise returns the challenge, record
    id, and the vault's own commitment and salt.
-3. `POST /api/records/manual` takes only `challenge_id`, `blind_index`,
-   `proof`, `public_inputs`. The first five public inputs must equal the
-   server-built values; v2 and v3 challenges are refused. On success the
-   record is built from the proof outputs.
+3. `POST /api/records/manual` takes `challenge_id`, `blind_index`,
+   `proof`, `public_inputs`, and an optional opaque `meta` hex string.
+   The first five public inputs must equal the server-built values; v2
+   and v3 challenges are refused. On success the proven part
+   (`record_id || ciphertext || mac`, 304 bytes) is built from the proof
+   outputs and `meta` (if present) is concatenated after it.
 4. Rekey (`/api/vault/rekey/commit`) must carry a new `zkp_key_commitment`
    exactly when one is registered and replaces it in the same transaction
    as the salts and records (same salt, new key). The v4 tag is not carried
@@ -125,9 +127,15 @@ cheaper. Cost figures: `docs/OFFLINE_ATTACK_COST.md`. Confidence: high.
   undone and the client gets 503, so an outage does not burn challenges.
   An invalid proof still spends its challenge.
 - **Costs (locally measured, 8 threads, native bb).** 21,826 gates; prove
-  about 0.24 s; verify about 10 ms; proof 14,656 bytes. Browser bundle for
-  the prover is about 18 MB (about 9.6 MB gzip), dominated by the Noir and
-  Barretenberg WASM; browser proving time is not measured.
+  about 0.24 s; verify about 10 ms; proof 14,656 bytes.
+- **Browser bundle and proving time (locally tested, headless Chromium
+  1243, Playwright 1.63.0, this box on 2026-10-14).** One self-contained
+  ES module (`static/zkp/build/mm-zkp-v4.js`): about 20.2 MB raw, about
+  10.8 MB gzip (bb.js Wasm, Noir ACVM and ABI wasm, the compiled circuit,
+  and the first 2^17 compressed BN254 CRS points, all inlined). Cold load
+  about 0.27 s, warm load about 0.26 s; first prove about 7.1 s, warm prove
+  about 3.7 to 5.0 s. CI job `browser-zkp-v4` prints the same numbers for
+  the runner. Numbers are labeled locally tested, not production-verified.
 
 ## What v4 does NOT guarantee
 
@@ -136,12 +144,73 @@ cheaper. Cost figures: `docs/OFFLINE_ATTACK_COST.md`. Confidence: high.
   client that registers garbage only harms its own vault.
 - Anything about records that did not go through this path (SimpleFin,
   CSV, plain manual entry use NaCl sealed boxes).
-- UI integration: `static/app.js` does not call the v4 client yet. Until it
-  does, no production records use v4 and the app's normal decrypt path
-  would not open a v4 record. Wiring it in is the next step.
+- Anything about production traffic: this PR is not merged or deployed.
 
 The residual risk for this feature is recorded once, in
 `docs/THREAT_MODEL.md` (risk register, "ZKP proof gate").
+
+## UI behavior
+
+`static/app.js` (this PR). The private key and `zk_root` stay in the page.
+
+**Lazy load.** The prover is not in the initial page. `index.html` holds a
+`<template id="zkpProverTemplate">` with one `<script type="module"
+integrity=... crossorigin>` pointing at `static/zkp/build/mm-zkp-v4.js`.
+`app.js` clones that tag in when enrollment, proving or opening a v4
+record needs it. The integrity hash pins every byte the prover runs
+(wasm, CRS and circuit are all inlined). The page already ships
+`Cross-Origin-Embedder-Policy: require-corp` and
+`Cross-Origin-Opener-Policy: same-origin` for SharedArrayBuffer; the
+prover itself is forced single-threaded and worker-free, so it does not
+need SharedArrayBuffer. CSP already allows `'wasm-unsafe-eval'` under
+`script-src` (required by the Barretenberg and Noir wasm compilers) and
+`worker-src 'self'` (kept; unused by this bundle). Decision: keep
+`wasm-unsafe-eval`; no other CSP change.
+
+**Enrollment.** After unlock, `enrollZkpInBackground` tries enrollment
+without prompting. If there is no passkey, or the passkey assertion is
+stale, it stops quietly. The next manual entry that wants a v4 proof
+retries with one passkey ceremony (`authenticateWithPasskey`). Both salt
+and commitment endpoints stay step-up gated.
+
+**Manual entry.** `submitManualTransaction` tries the v4 path first
+(challenge, prove in the browser, submit with a sealed `meta` for id,
+date, account and the other non-proven fields). Proven fields (name,
+amount, category, type) come only from the decrypted proven part when
+the record is opened. Fallback, chosen and kept zero-knowledge: if the
+prover fails to load (network or SRI), the verifier is unavailable
+(503), the vault has no usable enrollment (409 / stale step-up with no
+passkey), or a proof cannot be generated in page, the form saves a
+standard NaCl sealed-box record through `POST /api/records` and the UI
+says so (`Saved encrypted without ZK validation (non-ZKP): ...`). A
+rejected proof (400) is not a fallback: nothing is saved and the error
+is shown. Confidence: high for the privacy of both paths; medium for
+the UX of the fallback message.
+
+**Decrypt.** `load` opens each row through `openRecord`: sealed boxes as
+before, v4 rows through the prover's `decryptManualTransactionV4` plus
+the sealed meta. If the prover cannot load, a v4 row is counted as "not
+shown" (same warning as a malformed record) rather than failing the
+whole unlock.
+
+**Rekey and recovery.** `reencryptForRekey` opens v4 rows with the old
+`zk_root`, re-seals them as standard sealed boxes under the new key, and
+sends a new `zkp_key_commitment` (same salt, new key) with the rekey
+commit. The server already drops the v4 tag on those rows.
+
+**Backup and restore.** Export already carries `commitment` /
+`circuit_version`. Import of a v4 row on a vault that cannot prove
+re-seals it as a standard sealed box before upload (the normal upsert
+cannot carry the proof tag, and clears any leftover tag).
+
+**Editing a v4 record.** The normal editor still uses `POST /api/records`.
+That path now clears `commitment` and `circuit_version` on conflict, so
+an edited former v4 record is no longer tagged as proven. Residual risk
+of a stale tag without this clear is recorded here and nowhere else.
+
+**Vault reset and force-overwrite of KDF salts.** Both clear the
+commitment and salt, because the next passphrase is a new vault key. The
+new key re-enrolls with a passkey step-up.
 
 ## Tests
 
@@ -150,14 +219,21 @@ The residual risk for this feature is recorded once, in
 | `nargo test` in `zkp/manual_expense_v4` | honest passes; random key, wrong salt, wrong record id, nonce mismatch, zero amount, wrong schema fail with the expected assertion | locally tested; CI job `zkp-v4` |
 | `scripts/zkp_v4_e2e.sh` | rebuild equals committed circuit and VK; honest bb proof verifies; a random-key proof checked against the registered commitment exits nonzero; a record id swap exits nonzero | locally tested; CI job `zkp-v4` |
 | `static/zkp/v4_client.test.mjs` | BLAKE2b root derivation, bb.js Poseidon2 equals Noir, honest bb.js proof has 15 public inputs in order, stored record decrypts, random key cannot produce a witness, tampering fails | locally tested; CI job `zkp-v4` |
-| `test_zkp_server.py` | enrollment, challenge, submission, refund, readiness, verifier module, real bb check of a committed proof fixture | locally tested; CI `verify` and `zkp-v4` |
+| `test_zkp_server.py` | enrollment, challenge, submission, refund, readiness, verifier module, meta append, tag clear on upsert, reset and force-overwrite clear the commitment | locally tested; CI `verify` |
 | `test_recovery_rekey.py` (ZKP cases) | commitment replaced atomically at rekey, refused when absent, v4 tag not carried | locally tested; CI `verify` |
+| `test_integrity_script.py` | `generate_integrity.py` is idempotent (no duplicate crossorigin); committed HTML and manifest match files including the prover; inlined CRS matches the pinned hashes | locally tested; CI `verify` |
+| `test_playwright_zkp_v4.py` | real Chromium: enroll, prove, store, decrypt into the ledger, random-key rejection, 503 and SRI fallbacks labeled non-ZKP, recovery rekey with a v4 record, no plaintext / private key / zk_root / third-party CRS in the network capture, proving-time numbers | locally tested; CI job `browser-zkp-v4` |
 | `docker-zkp` CI job | image builds with pinned downloads; fixture proof verifies inside the container with no network | CI only |
+| `zkp-v4` CI "rebuild equals committed" | `npm run build:browser` reproduces `static/zkp/build/mm-zkp-v4.js` | CI only |
 
 ## Files
 
 - `zkp/manual_expense_v4/` circuit, tests, compiled artifact, `vk`, `vk_hash`
-- `static/zkp/manual_expense_v4_core.js`, `manual_expense_v4_client.js`, `v4_client.test.mjs`
+- `static/zkp/manual_expense_v4_core.js`, `manual_expense_v4_client.js`,
+  `manual_expense_v4_browser.js`, `vite.browser.config.js`,
+  `build/mm-zkp-v4.js` (committed, SRI-pinned), `v4_client.test.mjs`
+- `zkp/browser_crs/` first 2^17 compressed G1 points and G2 (sha256-pinned;
+  inlined into the browser bundle, not shipped in the Docker image)
 - `zkp_verifier.py`, `app.py` (endpoints above), `models.py`,
   `migrations/versions/b8c9d0e1f2a3_add_zkp_key_commitment.py`
 - `scripts/zkp_v4_e2e.sh`, `scripts/fetch_zkp_runtime.py`, `Dockerfile`
