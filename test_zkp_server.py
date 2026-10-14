@@ -345,6 +345,59 @@ class TestZkpSubmission(ZkpCase):
         self.assertEqual(stored[0]["circuit_version"], "manual-transaction-v2")
 
 
+class TestUiWiringServer(ZkpCase):
+    """Server side of the v4 UI wiring (docs/ZKP_BINDING.md "UI behavior")."""
+
+    def setUp(self):
+        super().setUp()
+        _set_vault_key(self)
+
+    def valid_with(self, values, **body):
+        with patch.object(zkp_verifier, "verify_proof",
+                          return_value=zkp_verifier.VerificationResult(valid=True, duration_seconds=0.001)):
+            return self.submit(values["challenge_id"], public_inputs=_public_inputs(values), **body)
+
+    def test_meta_is_appended_after_the_proven_part(self):
+        values = _force_issue_challenge(self)
+        meta = "ab" * 100
+        self.assertEqual(self.valid_with(values, meta=meta).status_code, 200)
+        stored = self.client.get("/api/records").get_json()["records"][0]
+        self.assertEqual(len(stored["sealed"]), zkp_verifier.PROVEN_RECORD_HEX + len(meta))
+        self.assertTrue(stored["sealed"].endswith(meta))
+        self.assertEqual(stored["circuit_version"], "manual-transaction-v4")
+
+    def test_malformed_meta_is_refused_before_claiming(self):
+        too_long = "ab" * ((server_app.MAX_SEALED_HEX_LENGTH - zkp_verifier.PROVEN_RECORD_HEX) // 2 + 1)
+        for bad in ["AB" * 60, "abc" * 41, "ab", too_long, 5]:
+            values = _force_issue_challenge(self)
+            self.assertEqual(self.valid_with(values, meta=bad).status_code, 400, str(bad)[:8])
+            self.assertIsNone(_consumed_at(self, values["challenge_id"]))
+
+    def test_normal_upsert_clears_a_stale_v4_tag(self):
+        values = _force_issue_challenge(self)
+        self.assertEqual(self.valid_with(values, meta="ab" * 100).status_code, 200)
+        resp = self.unsafe("post", "/api/records", json={"records": [{"blind_index": "a" * 64, "sealed": "cd" * 100}]})
+        self.assertEqual(resp.status_code, 200)
+        stored = self.client.get("/api/records").get_json()["records"][0]
+        self.assertEqual(stored["sealed"], "cd" * 100)
+        self.assertNotIn("circuit_version", stored)
+        self.assertNotIn("commitment", stored)
+
+    def test_vault_reset_clears_the_key_commitment(self):
+        self.add_passkey(); self.set_auth_age(1)
+        self.assertEqual(self.unsafe("delete", "/api/records").status_code, 200)
+        self.assertEqual(self.vault_key(), (None, None))
+
+    def test_forced_salt_overwrite_on_empty_vault_clears_the_key_commitment(self):
+        with self._engine.begin() as conn:
+            conn.execute(text("UPDATE vault_identity SET kdf_salt_enc = :e, kdf_salt_idx = :i WHERE id = 1"),
+                         {"e": b"\x01" * 16, "i": b"\x02" * 16})
+        resp = self.unsafe("post", "/api/kdf/salts/migrate", json={
+            "salt_enc": "03" * 16, "salt_idx": "04" * 16, "kdf_version": 3, "force": True})
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        self.assertEqual(self.vault_key(), (None, None))
+
+
 class TestReadiness(ZkpCase):
     def test_ready_reports_zkp_without_failing(self):
         resp = self.client.get("/ready")
