@@ -281,6 +281,56 @@ class RekeyTest(RecoveryCase):
                                {"b": bi(0, "b")}).one()
         self.assertEqual(tuple(row), ("ee" * 32, "v1"))
 
+    def _zkp(self, commitment=None):
+        with self._engine.begin() as conn:
+            if commitment is not None:
+                conn.execute(text("UPDATE vault_identity SET zkp_key_commitment = :c, zkp_vault_salt = :s WHERE id = 1"),
+                             {"c": bytes.fromhex(commitment), "s": b"\x07" * 31})
+        with self.raw_conn() as conn:
+            return conn.execute(text("SELECT encode(zkp_key_commitment,'hex'), encode(zkp_vault_salt,'hex') "
+                                     "FROM vault_identity WHERE id = 1")).one()
+
+    def test_zkp_commitment_required_and_replaced_atomically_with_salt_kept(self):
+        old, new = "0a" * 32, "0b" * 32
+        self._zkp(old)
+        rid = self.begin()
+        self.stage(rid, self.new_rows())
+        self.assertEqual(self.commit(rid).status_code, 400)  # missing while registered
+        self.assertEqual(self.commit(rid, zkp_key_commitment="ff" * 32).status_code, 400)  # not a field element
+        self.assertEqual(tuple(self._zkp()), (old, "07" * 31))
+        self.assertEqual(self.state(), self.before)
+        r = self.commit(rid, zkp_key_commitment=new)
+        self.assertEqual(r.status_code, 200, r.get_json())
+        self.assertEqual(tuple(self._zkp()), (new, "07" * 31))
+
+    def test_zkp_commitment_refused_when_none_registered(self):
+        rid = self.begin()
+        self.stage(rid, self.new_rows())
+        self.assertEqual(self.commit(rid, zkp_key_commitment="0b" * 32).status_code, 400)
+        self.assertEqual(tuple(self._zkp()), (None, None))
+        self.assertEqual(self.commit(rid).status_code, 200)
+
+    def test_zkp_commitment_unchanged_when_commit_refused(self):
+        self._zkp("0a" * 32)
+        rid = self.begin()
+        self.stage(rid, self.new_rows([0, 1]))  # incomplete set
+        self.assertEqual(self.commit(rid, zkp_key_commitment="0b" * 32).status_code, 409)
+        self.assertEqual(self._zkp()[0], "0a" * 32)
+
+    def test_v4_tag_not_carried_but_v2_is(self):
+        with self._engine.begin() as conn:
+            conn.execute(text("UPDATE records SET commitment = :c, circuit_version = 'manual-transaction-v4' WHERE blind_index = :b"),
+                         {"c": "ee" * 32, "b": bi(0)})
+            conn.execute(text("UPDATE records SET commitment = :c, circuit_version = 'manual-transaction-v2' WHERE blind_index = :b"),
+                         {"c": "dd" * 32, "b": bi(1)})
+        rid = self.begin()
+        self.stage(rid, self.new_rows())
+        self.assertEqual(self.commit(rid).status_code, 200)
+        with self.raw_conn() as conn:
+            rows = dict(conn.execute(text("SELECT blind_index, circuit_version FROM records")).all())
+        self.assertIsNone(rows[bi(0, "b")])
+        self.assertEqual(rows[bi(1, "b")], "manual-transaction-v2")
+
     def test_abort_unblocks_writes_and_keeps_vault(self):
         self.begin()
         self.assertEqual(self.post("/api/vault/rekey/abort").get_json(), {"aborted": True})
