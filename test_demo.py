@@ -198,13 +198,13 @@ class TestBrowserCrypto(unittest.TestCase):
 
     def test_seal_open_round_trip(self):
         sim = BrowserSim("hunter2")
-        txn = {"id": "x1", "merchant": "Blue Bottle Coffee", "amount": 6.75}
+        txn = {"id": "x1", "merchant": "Starbucks", "amount": 6.75}
         self.assertEqual(sim.open(sim.seal(txn)), txn)
 
     def test_ciphertext_leaks_no_plaintext(self):
         sim = BrowserSim("hunter2")
-        sealed = sim.seal({"merchant": "Stuyvesant Town Rent", "amount": 2150.0})
-        self.assertNotIn("Stuyvesant", bytes.fromhex(sealed).decode("latin-1"))
+        sealed = sim.seal({"merchant": "Rocket Mortgage", "amount": 2640.0})
+        self.assertNotIn("Rocket Mortgage", bytes.fromhex(sealed).decode("latin-1"))
 
     def test_wrong_passphrase_cannot_open(self):
         good, bad = BrowserSim("right one"), BrowserSim("wrong one")

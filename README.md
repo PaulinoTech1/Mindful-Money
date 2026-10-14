@@ -127,8 +127,8 @@ credential to its owning identity before rotating the session.
 Migration `9c1e4a7b2d10` assigns all pre-migration records to identity 1 without
 rewriting their blind indexes or ciphertext. Identity 1 remains the local
 demo's compatibility tenant. New identities must be deliberately provisioned;
-public signup, invitations, recovery, and account deletion are not implemented
-yet. Production must continue to use `VAULT_AUTH_POLICY=required`.
+public signup, invitations, and account deletion are not implemented yet
+(passphrase recovery with a recovery key is: [docs/RECOVERY.md](docs/RECOVERY.md)). Production must continue to use `VAULT_AUTH_POLICY=required`.
 
 A counter regression (an authenticator reporting a `signCount` that isn't
 greater than what's on file, one signal of possible credential cloning) is
@@ -257,11 +257,12 @@ challenge tables. Existing record rows and ciphertext are never rewritten by
 a migration. `passkey_required` changes to true only in the same transaction
 that commits a successfully verified credential.
 
-Set any passphrase, click **Connect demo bank**. Six months of transactions get
-generated across a checking account, an IRA and a 401(k), encrypted in your
-browser, and stored as ciphertext. The demo banks are Scammers Inc, Wells
-Foreclosure and DC Unc. The checking feed includes a fixed $423.23 monthly
-Fans Only subscription charge.
+Set any passphrase, click **Connect demo bank**. Twelve months of
+transactions for a fictional dual-income household (the Carters, see
+[docs/DEMO_DATASET.md](docs/DEMO_DATASET.md)) get generated across joint
+checking, a rewards credit card, an emergency fund, a 401(k), a Roth IRA and a
+brokerage account, encrypted in your browser, and stored as ciphertext. The
+financial institutions are fictional; merchants are mainstream brands.
 
 No *external* network access required — PostgreSQL is a local (or
 operator-controlled) service, not a third party. Chart.js and libsodium are
@@ -400,7 +401,7 @@ is precise and cannot flake. A test you learn to ignore is worse than no test.
 
 ```bash
 psql postgresql://vault:vault_dev_only_password@localhost:5432/vault_dev \
-    -At -c "SELECT sealed FROM records" | grep -c "Blue Bottle"     # 0
+    -At -c "SELECT sealed FROM records" | grep -c "Harris Teeter"   # 0
 psql postgresql://vault:vault_dev_only_password@localhost:5432/vault_dev \
     -At -c "SELECT blind_index, sealed FROM records" | grep -v '^[0-9a-f,]*$' | head
 ```
@@ -432,11 +433,11 @@ Visible in the server view, because pretending otherwise would be dishonest:
 
 - how many records exist
 - when each was written (coarsened to the day)
-- ciphertext length, which hints at merchant-name length
+- ciphertext length, rounded up to a padding bucket
 
-That last one is a real leak. Padding blobs to fixed 256-byte buckets closes
-it and is about ten lines in the client. Left open deliberately so the server
-view has something true to show.
+Records are padded in the browser before encryption, so the server sees only
+the bucket size. Format, buckets and the remaining metadata risk:
+[docs/TRUST_BOUNDARIES.md](docs/TRUST_BOUNDARIES.md#what-the-server-can-see).
 
 It cannot recover any merchant, amount, date or category.
 
@@ -494,63 +495,35 @@ context, projections, and results never leave the browser.
 | File | Role |
 |---|---|
 | `static/app.js` | Key derivation, sealing, categorization, all chart math |
-| `app.py` | Blob store and relay. No crypto, no keys |
+| `app.py` | Blob store and API. No vault crypto, no keys |
 | `models.py` | SQLAlchemy models for the PostgreSQL schema |
 | `db.py` | Request-scoped engine/session lifecycle |
 | `migrations/` | Alembic migrations (`alembic upgrade head`) |
-| `fakebank.py` | Stand-in for the bank feed. Swap in the Plaid adapter here |
-| `simplefin.py` | SimpleFin Protocol adapter — normalizes a real (or demo) linked bridge into the same transaction shape as `fakebank.generate()` |
+| `static/simplefin-client.js` | Browser-side SimpleFin client, CSV parser and the demo dataset ([docs/DEMO_DATASET.md](docs/DEMO_DATASET.md)) |
 | `static/style.css` | Ledger aesthetic — Georgia's old-style figures, no webfonts |
 
 ## Connecting a real feed with SimpleFin
 
-Set `SIMPLEFIN_ACCESS_URL` to a claimed SimpleFin access URL
-(`https://<user>:<pass>@bridge.simplefin.org/simplefin`) to enable a second
-**Connect via SimpleFin** button alongside the demo bank. `GET
-/api/relay/sources` reports whether it is configured; the browser hides the
-button when it is not. `POST /api/relay` accepts an optional
-`{"source": "simplefin"}` body — omitted or `"fakebank"` keeps the existing
-generated demo feed, `"simplefin"` fetches the last 90 days (SimpleFin's
-range cap) from every linked account.
-
-SimpleFin's amount sign convention is inflow-positive; `simplefin.py` negates
-it on the way in so it matches this app's spend-positive, income-negative
-convention documented in `fakebank.py`. Basic-auth credentials embedded in the
-access URL are extracted and sent as an `Authorization` header — Python's
-`urllib` does not parse userinfo out of the URL itself the way curl does.
-Cloudflare, which fronts the SimpleFin bridge, also blocks the default
-`urllib` User-Agent as bot traffic, so requests send a custom one.
-
-The access URL is a bearer credential for a real (or demo) linked bridge; keep
-it out of version control (`.env` is already gitignored) and treat it the way
-you would any other aggregator token.
-
-The environment-based SimpleFin credential is legacy identity 1's connection
-only. Other identities receive "not configured" and cannot use or discover
-that feed. A multi-user alpha still needs a per-identity connection table,
-KMS-wrapped access URLs, and an explicit claim/revoke lifecycle before real
-bank connections can be offered to those users.
+**Connect via SimpleFin** prompts for a SimpleFin access URL in the browser,
+fetches the last 90 days there, and encrypts the transactions before upload
+(`static/simplefin-client.js`). The access URL is never stored or sent to this
+server. Provider trust: [docs/TRUST_BOUNDARIES.md](docs/TRUST_BOUNDARIES.md#provider-trust-simplefin-and-banks).
 
 ## Demo shortcuts to remove
 
-1. **Fixed salts** in `app.js` (`DEMO_SALT_ENC`, `DEMO_SALT_IDX`) so a reload
-   re-derives the same key without a signup flow. Real builds generate random
-   salts per user and store them next to the public key.
-2. **Optional authentication.** Until passkey protection is explicitly enabled,
+1. **Optional authentication.** Until passkey protection is explicitly enabled,
    any browser reaching the local demo can fetch compatibility tenant 1's
    ciphertext and metadata. Optional mode preserves backwards compatibility;
    it does not protect users who have not enabled it, and is deliberately
    restricted to loopback development.
-3. **No recovery.** Forget the passphrase, lose the data. That's the honest
-   consequence of the design; a real build adds a 24-word recovery phrase
-   wrapping a second copy of the private key.
-4. **Aggregator tokens aren't wrapped.** `SIMPLEFIN_ACCESS_URL` sits in plain
-   process environment / `.env`. A real build seals it under a KMS key instead.
-5. **Flask dev server.** Obviously.
+2. **No recovery without a recovery key.** Forget the passphrase without
+   having set up a recovery key and the data is lost. With one, recovery
+   works end to end ([docs/RECOVERY.md](docs/RECOVERY.md)).
+3. **Flask dev server** for local runs. Production runs Gunicorn on Cloud Run.
 
 Additional threat-model limits remain: database queries are tenant-isolated,
-but there is no public account onboarding, invitation flow, account recovery,
-per-user encryption salt provisioning, or per-user bank-connection lifecycle;
+but there is no public account onboarding, invitation flow, or recovery of a
+lost passkey without a backup passkey;
 a compromised origin can replace the JavaScript and steal the passphrase or
 plaintext; XSS runs with the user's session; ciphertext count, timing, and
 length remain visible to the server once authenticated (and for compatibility

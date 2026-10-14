@@ -199,17 +199,20 @@ function getOrCreateSalt(storageKey) {
 
 /* ---------- categorization: on the device, never on the server ---------- */
 
+// Fallback rules for imported records without a category (the demo feed
+// sets its own). Mainstream merchants only.
 const RULES = [
-  [/payroll|deposit/i,                                  'Income'],
-  [/rent|stuyvesant/i,                                  'Housing'],
-  [/trader joe|whole foods/i,                           'Groceries'],
-  [/blue bottle|sweetgreen|lucali/i,                    'Dining'],
-  [/mta|omny|uber|citi bike|enterprise|delta air/i,     'Transport'],
-  [/con edison|verizon/i,                               'Utilities'],
-  [/spotify|netflix|fans only/i,                        'Subscriptions'],
-  [/amazon|apple store|rough trade|paragon|warby/i,     'Shopping'],
-  [/duane reade|weill cornell|equinox|state farm/i,     'Health & insurance'],
-  [/ira contribution|401\(k\)|employee deferral|employer match/i, 'Investing'],
+  [/payroll|deposit|bonus/i,                            'Income'],
+  [/tax refund/i,                                       'Refund'],
+  [/rent|mortgage/i,                                    'Housing'],
+  [/trader joe|whole foods|harris teeter|costco|kroger|publix/i, 'Groceries'],
+  [/starbucks|chipotle|panera|doordash|olive garden|sweetgreen/i, 'Dining'],
+  [/uber|lyft|shell|exxon|chevron|delta air|toyota financial|auto care/i, 'Transport'],
+  [/energy|natural gas|water|spectrum|verizon|comcast|xfinity/i, 'Utilities'],
+  [/spotify|netflix|disney\+|prime|icloud|peloton/i,     'Subscriptions'],
+  [/amazon|target|home depot|best buy|apple store/i,    'Shopping'],
+  [/cvs|walgreens|health|state farm|mutual life|insurance/i, 'Health & insurance'],
+  [/ira|401\(k\)|brokerage|employee deferral|employer match|529/i, 'Investing'],
 ];
 
 const CAT_COLOR = {
@@ -1393,7 +1396,7 @@ function renderAccounts() {
   $('accounts').hidden = false;
   $('accountList').innerHTML = [...groups.entries()].map(([id, rows]) => {
     const meta = accountMeta(id, rows);
-    const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
+    const net = rows.filter((t) => !t.excluded).reduce((sum, t) => sum - t.amount, 0);
     return `<div class="accountItem">
       <div class="accountBank">${escapeHtml(meta.bank)}</div>
       <div class="accountLabel">${escapeHtml(meta.type)} · ${escapeHtml(meta.label)}<span>${rows.length} records</span></div>
@@ -1401,12 +1404,16 @@ function renderAccounts() {
     </div>`;
   }).join('');
 
-  const totalVisible = [...groups.values()].reduce((sum, rows) => sum + rows.filter(reportable).reduce((inner, t) => inner + (t.amount < 0 ? -t.amount : 0), 0), 0);
+  // Account cards show money moved into each account, transfers included:
+  // a contribution from checking to an IRA is a transfer for spending and
+  // income totals, but it is exactly what the account card should show.
+  const counted = (t) => !t.excluded;
+  const totalVisible = [...groups.values()].reduce((sum, rows) => sum + rows.filter(counted).reduce((inner, t) => inner + (t.amount < 0 ? -t.amount : 0), 0), 0);
   $('dashboardAccounts').innerHTML = [...groups.entries()].map(([id, rows]) => {
     const meta = accountMeta(id, rows);
-    const contributions = rows.filter(reportable).reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
-    const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
-    const retirement = ['IRA', '401(k)'].includes(meta.type);
+    const contributions = rows.filter(counted).reduce((sum, t) => sum + (t.amount < 0 ? -t.amount : 0), 0);
+    const net = rows.filter(counted).reduce((sum, t) => sum - t.amount, 0);
+    const retirement = ['IRA', '401(k)', 'Savings', 'Brokerage'].includes(meta.type);
     const amount = retirement ? contributions : net;
     const amountLabel = retirement ? 'Contributed' : 'Net flow';
     const width = totalVisible ? Math.max(5, Math.round((contributions / totalVisible) * 100)) : 5;
@@ -1415,7 +1422,7 @@ function renderAccounts() {
       <div class="accountCardBank">${escapeHtml(meta.bank)}</div>
       <div class="accountCardLabel">${escapeHtml(meta.label)}</div>
       <div class="accountCardAmount"><small>${amountLabel}</small>${money(amount, true)}</div>
-      <div class="accountCardMeta">${retirement ? 'Retirement contributions' : 'Everyday account movement'}</div>
+      <div class="accountCardMeta">${['IRA', '401(k)'].includes(meta.type) ? 'Retirement contributions' : retirement ? 'Savings and investments' : 'Everyday account movement'}</div>
       <progress class="accountBar" aria-label="${width}% of deposits" max="100" value="${width}"></progress>
     </article>`;
   }).join('');
@@ -1441,7 +1448,7 @@ function localMonthReport(key, phrase) {
   const totals = localTotals(localMonthRows(key));
   const net = totals.in - totals.out;
   return `${phrase || localMonthLabel(key)}: income ${money(totals.in)}, spending ${money(totals.out)}, net ${money(net, true)}. ` +
-    (net >= 0 ? 'The math behaved for once.' : 'Spending won this round.');
+    (net >= 0 ? 'Income covered spending.' : 'Spending exceeded income.');
 }
 
 function localSummary() {
@@ -1454,23 +1461,23 @@ function localSummary() {
   const accountCount = new Set(TXNS.map((t) => t.account)).size;
   const pieces = [
     `Across ${months.length} months, ${TXNS.length} transactions, and ${accountCount} accounts, income was ${money(totals.in)} and spending was ${money(totals.out)}.`,
-    `Net cash flow was ${money(net, true)} — ${net >= 0 ? 'a respectable escape from the red.' : 'the red carpet has been rolled out for spending.'}`,
+    `Net cash flow was ${money(net, true)}: ${net >= 0 ? 'income exceeded spending over the period.' : 'spending exceeded income over the period.'}`,
   ];
   if (cats.length) {
     const share = localShare(cats[0][1], totals.out);
-    pieces.push(`Your largest spending category was ${cats[0][0]} at ${money(cats[0][1])} (${share}% of spending) — ${share >= 40 ? 'spectacularly over the top.' : 'the largest slice, though not exactly subtle.'}`);
+    pieces.push(`Your largest spending category was ${cats[0][0]} at ${money(cats[0][1])} (${share}% of spending)${share >= 40 ? ', a large concentration worth reviewing.' : '.'}`);
   }
-  if (frequent) pieces.push(`Your most frequent merchant was ${frequent[0]} with ${frequent[1].n} visits — an eccentric little recurring character.`);
+  if (frequent) pieces.push(`Your most frequent merchant was ${frequent[0]} with ${frequent[1].n} visits.`);
   if (latest) pieces.push(localMonthReport(latest[0], `For ${localMonthLabel(latest[0])}`));
   return pieces.join(' ');
 }
 
 function localAccountReport() {
   const groups = accountGroups();
-  return 'Accounts — three banks, three distinct financial personalities:\n' + [...groups.entries()].map(([id, rows]) => {
+  return 'Accounts:\n' + [...groups.entries()].map(([id, rows]) => {
     const meta = accountMeta(id, rows);
     const net = rows.filter(reportable).reduce((sum, t) => sum - t.amount, 0);
-    return `${meta.type} at ${meta.bank} — ${rows.length} records, net flow ${money(net, true)}`;
+    return `${meta.type} at ${meta.bank}: ${rows.length} records, net flow ${money(net, true)}`;
   }).join('\n');
 }
 
@@ -1480,24 +1487,24 @@ let LAST_ATTITUDE = -1;
 let CHAT_CONTEXT = { pending: '', lastTopic: '', projectionHorizon: 1 };
 
 const CHAT_ATTITUDE = [
-  'I did the arithmetic. You supplied the plot twist.',
-  'The numbers are being more honest with you than you have been with them.',
-  'I can explain the result; making it look innocent is outside my mandate.',
-  'Consider this the receipt your optimism conveniently misplaced.',
-  'No judgment. Fine, a measured amount of judgment.',
-  'The spreadsheet has declined to participate in your denial.',
-  'You asked for insight. Unfortunately, the transactions kept evidence.',
-  'I remain on your side, though your spending has mounted a persuasive counterargument.',
+  'All figures are computed in this browser from your decrypted transactions.',
+  'Totals exclude transfers between your own accounts and items you excluded from reports.',
+  'You can refine these figures by editing categories in Recent activity.',
+  'Ask for a projection to see where current patterns lead.',
+  'Nothing in this conversation is sent to the server.',
+  'Figures reflect the transactions currently stored in your vault.',
+  'Ask about a specific merchant or category for more detail.',
+  'These figures are a starting point for a conversation with your financial advisor.',
 ];
 
 function chatAttitude(question) {
   const q = question.toLowerCase();
   const contextual = q.includes('spend') || q.includes('expense')
-    ? ['Your wallet would like to be included in future decision-making.', 'Bold spending strategy. The numbers have filed a dissent.']
+    ? ['Ask for a category breakdown to see where spending is concentrated.', 'Ask for monthly patterns to compare with earlier months.']
     : q.includes('income') || q.includes('pay')
-      ? ['Income arrived heroically; what happened afterward was less distinguished.']
+      ? ['Income includes every deposit not marked as a transfer.']
       : q.includes('chart') || q.includes('graph')
-        ? ['I made it visual in case the digits were too subtle.']
+        ? ['Hover over the chart to see exact amounts.']
         : [];
   const choices = CHAT_ATTITUDE.concat(contextual);
   const random = new Uint32Array(1);
@@ -1532,7 +1539,7 @@ const futureMonthLabel = (offset) => {
 
 function localProjectionReport(horizon = 1, scope = 'cashflow') {
   const complete = localCompleteMonths();
-  if (complete.length < 3) return { text: 'I need at least three complete months before making a projection. Even I have standards.', followUps: [] };
+  if (complete.length < 3) return { text: 'A projection needs at least three complete months of data.', followUps: [] };
   const months = complete.slice(-12);
   if (scope === 'category') {
     const categories = byCategory().slice(0, 3).map(([name]) => name);
@@ -1544,7 +1551,7 @@ function localProjectionReport(horizon = 1, scope = 'cashflow') {
       const forecast = theilSenForecast(values, 1)[0];
       return `${category}: ${money(forecast.estimate)} (historical-variability range ${money(forecast.low)}–${money(forecast.high)})`;
     });
-    return { text: `Next-month category projection from ${months.length} complete months:\n${lines.join('\n')}\nThis is a habit-based estimate, not a promise from the universe.`, followUps: [
+    return { text: `Next-month category projection from ${months.length} complete months:\n${lines.join('\n')}\nThis is an estimate based on past patterns, not a guarantee.`, followUps: [
       { label: 'Project cash flow', prompt: 'Project my cash flow for the next 3 months' },
       { label: 'Show category chart', prompt: 'Chart my spending by category' },
     ] };
@@ -1566,7 +1573,7 @@ function conversationalAnswer(question) {
   const affirmative = /^(yes|yeah|yep|sure|please|do it)\b/.test(q);
   if (CHAT_CONTEXT.pending === 'summary_followup' && affirmative) {
     CHAT_CONTEXT.pending = 'projection_horizon';
-    return { text: 'Fine. How far ahead—next month or the next three months?', noAttitude: true, followUps: [
+    return { text: 'How far ahead should I project: next month or the next three months?', noAttitude: true, followUps: [
       { label: 'Next month', prompt: 'Project next month' }, { label: 'Next 3 months', prompt: 'Project the next 3 months' },
     ] };
   }
@@ -1614,8 +1621,7 @@ function localMathReport() {
   const share = top ? localShare(top[1], totals.out) : 0;
   return `Mathematical analysis: ${expenses.length} expenses totaling ${money(totals.out)}. ` +
     `Average charge ${money(mean)}; median charge ${money(median)}; largest charge ${money(largest)}. ` +
-    (top ? `${top[0]} accounts for ${share}% of spending.` : 'No spending categories found.') +
-    ' The arithmetic is sound; the spending choices remain under review.';
+    (top ? `${top[0]} accounts for ${share}% of spending.` : 'No spending categories found.');
 }
 
 function localGraphicAnswer(question) {
@@ -1632,7 +1638,7 @@ function localGraphicAnswer(question) {
   if (q.includes('category') || q.includes('where') || q.includes('goes')) {
     const data = byCategory().slice(0, 8);
     return {
-      text: 'A spending-by-category chart, because apparently the budget wanted a pie chart before admitting what happened.',
+      text: 'Spending by category, computed in this browser.',
       chart: {
         id,
         config: {
@@ -1657,7 +1663,7 @@ function localGraphicAnswer(question) {
       return { label: `${meta.type} · ${meta.bank}`, total };
     });
     return {
-      text: 'Account flows, rendered locally. Retirement gets the contribution spotlight; checking gets the net-flow reality check.',
+      text: 'Account flows, computed in this browser. Retirement accounts show contributions; other accounts show net flow.',
       chart: {
         id,
         config: {
@@ -1684,7 +1690,7 @@ function localGraphicAnswer(question) {
   if (!spendingOnly) datasets.push({ label: 'Income', data: rows.map(([, values]) => values.in), backgroundColor: '#18784e', borderRadius: 3 });
   if (!incomeOnly) datasets.push({ label: 'Spending', data: rows.map(([, values]) => values.out), backgroundColor: '#ae3c42', borderRadius: 3 });
   return {
-    text: 'Monthly cash flow, rendered locally. The bars are factual; the financial decisions remain gloriously eccentric.',
+    text: 'Monthly income and spending, computed in this browser.',
     chart: {
       id,
       config: {
@@ -1704,10 +1710,10 @@ function localAssistantAnswer(question) {
   const q = question.toLowerCase().trim();
   if (!TXNS.length) return 'Your vault has no decrypted transactions yet. Connect the demo bank first.';
   if (/^(hi|hello|hey|thanks|thank you)\b/.test(q)) {
-    return 'Hello. I can summarize spending, income, categories, merchants, monthly patterns, and net cash flow. I bring arithmetic, opinions, and absolutely no chill. Everything stays in this browser.';
+    return 'Hello. I can summarize spending, income, categories, merchants, monthly patterns, and net cash flow. Everything stays in this browser.';
   }
   if (q.includes('help') || q.includes('what can')) {
-    return 'Try “give me a summary,” “where did most of my money go?”, “project my cash flow,” “how much did I spend last month?”, or “who are my most frequent merchants?” I have numbers, not clairvoyance.';
+    return 'Try “give me a summary,” “where did most of my money go?”, “project my cash flow,” “how much did I spend last month?”, or “who are my most frequent merchants?”';
   }
   if (/(chart|graph|plot|visuali[sz]|trend|doughnut|bar graph)/.test(q)) {
     return localGraphicAnswer(question);
@@ -1723,7 +1729,7 @@ function localAssistantAnswer(question) {
   }
   if (q.includes('top') || q.includes('frequent') || q.includes('merchant')) {
     const tops = topMerchants(5);
-    return 'Most frequent merchants — an eccentric little cast of characters:\n' + tops.map(([name, v], i) => `${i + 1}. ${name} — ${v.n} visits, ${money(v.sum)} total`).join('\n');
+    return 'Most frequent merchants:\n' + tops.map(([name, v], i) => `${i + 1}. ${name}: ${v.n} visits, ${money(v.sum)} total`).join('\n');
   }
 
   const merchantNames = [...new Set(TXNS.map((t) => t.merchant))].sort((a, b) => b.length - a.length);
@@ -1738,7 +1744,7 @@ function localAssistantAnswer(question) {
       rows = rows.filter((t) => t.date.startsWith(localCurrentMonth()));
       period = localMonthLabel(localCurrentMonth());
     }
-    return `${merchant}: ${money(rows.reduce((sum, t) => sum + t.amount, 0))} across ${rows.length} charge${rows.length === 1 ? '' : 's'} in ${period}. A factual report, not an intervention.`;
+    return `${merchant}: ${money(rows.reduce((sum, t) => sum + t.amount, 0))} across ${rows.length} charge${rows.length === 1 ? '' : 's'} in ${period}.`;
   }
 
   const category = Object.keys(CAT_COLOR).find((name) => q.includes(name.toLowerCase()));
@@ -1746,11 +1752,11 @@ function localAssistantAnswer(question) {
     const rows = TXNS.filter((t) => reportable(t) && t.category === category && t.amount > 0);
     const amount = rows.reduce((sum, t) => sum + t.amount, 0);
     const share = localShare(amount, localTotals(TXNS).out);
-    return `${category}: ${money(amount)} across ${rows.length} transaction${rows.length === 1 ? '' : 's'} (${share}% of spending). ${share >= 40 ? 'That is objectively over the top.' : 'Not a scandal, merely the largest available slice.'}`;
+    return `${category}: ${money(amount)} across ${rows.length} transaction${rows.length === 1 ? '' : 's'} (${share}% of spending).${share >= 40 ? ' This is a large share of total spending.' : ''}`;
   }
   if (q.includes('category') || q.includes('where') || q.includes('goes') || q.includes('went')) {
     const cats = byCategory().slice(0, 5);
-    return 'Spending by category — the fiscal personality test:\n' + cats.map(([name, amount], i) => `${i + 1}. ${name} — ${money(amount)}`).join('\n');
+    return 'Spending by category:\n' + cats.map(([name, amount], i) => `${i + 1}. ${name}: ${money(amount)}`).join('\n');
   }
   if (q.includes('last month')) {
     const complete = localCompleteMonths();
@@ -1758,25 +1764,25 @@ function localAssistantAnswer(question) {
   }
   if (q.includes('this month')) return localMonthReport(localCurrentMonth(), `This month (${localMonthLabel(localCurrentMonth())})`);
   if (q.includes('month') || q.includes('monthly')) {
-    return monthly().map(([key, values]) => `${localMonthLabel(key)} — income ${money(values.in)}, spending ${money(values.out)}, net ${money(values.in - values.out, true)}`).join('\n');
+    return monthly().map(([key, values]) => `${localMonthLabel(key)}: income ${money(values.in)}, spending ${money(values.out)}, net ${money(values.in - values.out, true)}`).join('\n');
   }
   if (q.includes('income') || q.includes('earned') || q.includes('pay')) {
     const income = localTotals(TXNS).in;
-    return `Income across the available data was ${money(income)} from ${TXNS.filter((t) => reportable(t) && t.amount < 0).length} income transactions. Good: money arrived. The eccentric part is how quickly it found somewhere else to be.`;
+    return `Income across the available data was ${money(income)} from ${TXNS.filter((t) => reportable(t) && t.amount < 0).length} income transactions.`;
   }
   if (q.includes('balance') || q.includes('net cash') || q.includes('cash flow')) {
     const totals = localTotals(TXNS);
     const net = totals.in - totals.out;
-    return `Net cash flow across the available data was ${money(net, true)}: ${money(totals.in)} in and ${money(totals.out)} out. ${net >= 0 ? 'Miraculously, the inflow won.' : 'Spending remains undefeated.'}`;
+    return `Net cash flow across the available data was ${money(net, true)}: ${money(totals.in)} in and ${money(totals.out)} out. ${net >= 0 ? 'Income exceeded spending.' : 'Spending exceeded income.'}`;
   }
   if (q.includes('largest') || q.includes('biggest') || q.includes('expensive')) {
     const largest = TXNS.filter((t) => reportable(t) && t.amount > 0).sort((a, b) => b.amount - a.amount)[0];
-    return largest ? `The largest single expense was ${money(largest.amount)} at ${largest.merchant} on ${largest.date}. Over the top? Possibly. Confirmed by the arithmetic? Absolutely.` : 'There are no expenses in the available data.';
+    return largest ? `The largest single expense was ${money(largest.amount)} at ${largest.merchant} on ${largest.date}.` : 'There are no expenses in the available data.';
   }
   if (q.includes('recent')) {
-    return 'Recent activity — the latest evidence:\n' + TXNS.filter(reportable).slice(-5).reverse().map((t) => `${t.date} — ${t.merchant}, ${t.amount < 0 ? 'income ' + money(-t.amount) : 'spent ' + money(t.amount)}`).join('\n');
+    return 'Recent activity:\n' + TXNS.filter(reportable).slice(-5).reverse().map((t) => `${t.date}: ${t.merchant}, ${t.amount < 0 ? 'income ' + money(-t.amount) : 'spent ' + money(t.amount)}`).join('\n');
   }
-  return 'I can answer questions about your summary, spending, income, categories, merchants, monthly patterns, largest expenses, and net cash flow. Try asking for a summary. I promise to be accurate and only mildly judgmental.';
+  return 'I can answer questions about your summary, spending, income, categories, merchants, monthly patterns, largest expenses, and net cash flow. Try asking for a summary.';
 }
 
 function appendChatMessage(role, text) {

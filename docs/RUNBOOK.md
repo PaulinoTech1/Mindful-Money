@@ -101,7 +101,8 @@ Then verify columns, not just tables (see the 2026-10-13 schema-drift entry
 in `docs/CLOUD_RUN_TROUBLESHOOTING.md`), and check
 `curl -s -o /dev/null -w "%{http_code}" https://mindful-money-k23ukkh5cq-uc.a.run.app/ready`.
 
-Current state (2026-10-13): 8 revisions, head `f1a2b3c4d5e6`.
+Current state (2026-10-13): 9 revisions, head `a7b8c9d0e1f2` (applied to Neon
+before merging PR #8). PR #8 deployed to Cloud Run as `dee30a5`.
 
 ```bash
 # Roll back one migration (dangerous: take a Neon branch/backup first,
