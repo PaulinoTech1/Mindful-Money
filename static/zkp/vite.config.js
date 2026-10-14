@@ -11,9 +11,11 @@ export default defineConfig({
   build: {
     target: 'es2022',
     lib: {
-      entry: 'manual_expense_client.js',
+      entry: {
+        manual_expense_prover: 'manual_expense_client.js',
+        manual_expense_v4_prover: 'manual_expense_v4_client.js',
+      },
       formats: ['es'],
-      fileName: 'manual_expense_prover',
     },
     outDir: 'dist',
     emptyOutDir: true,

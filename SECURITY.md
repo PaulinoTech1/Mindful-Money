@@ -36,7 +36,7 @@ Instead, email the maintainer directly. Include:
 - Dependency vulnerabilities with working exploits
 
 **Out of scope:**
-- The ZKP ciphertext consistency limitation (documented in `zkp/README.md`)
+- The ZKP proof gate limitations (documented in `docs/ZKP_BINDING.md`)
 - The JavaScript delivery trust issue (documented in `docs/TRUST_BOUNDARIES.md`)
 - SimpleFin or bank security (third-party services)
 - Social engineering

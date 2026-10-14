@@ -12,7 +12,7 @@ The following controls were implemented (see individual docs for residual limita
 - Bucketed padding of sealed records
 - `__Host-` cookie prefix (production)
 - Recovery key mechanism (`docs/RECOVERY.md`)
-- ZKP v3 encryption binding (`docs/ZKP_BINDING.md`)
+- ZKP v4 key and encryption binding, not yet deployed or wired to the UI (`docs/ZKP_BINDING.md`)
 - JS integrity layer: SRI attributes, manifest, CI hash checks (`docs/JS_INTEGRITY.md`)
 - Prototype status banner and supporting docs
 

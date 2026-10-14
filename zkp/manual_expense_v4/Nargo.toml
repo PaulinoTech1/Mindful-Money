@@ -1,0 +1,9 @@
+[package]
+name = "manual_expense_v4"
+type = "bin"
+authors = [""]
+# Toolchain pinned by scripts/build_zkp_v4.sh (nargo 1.0.0-beta.26, bb 5.1.0;
+# see zkp/upstream/pins.json). Nargo rejects prerelease compiler_version.
+
+[dependencies]
+poseidon = { path = "../vendor/poseidon-v0.2.6-beta26" }

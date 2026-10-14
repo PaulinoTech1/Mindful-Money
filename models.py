@@ -59,6 +59,13 @@ class VaultIdentity(Base):
     # The server never sees the recovery key. Null if recovery not set up.
     recovery_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     recovery_created_at: Mapped[dt.datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    # ZK proof v4 key binding (see docs/ZKP_BINDING.md). Both public, never
+    # secret. zkp_vault_salt is server-generated (31 random bytes, a BN254
+    # field element); zkp_key_commitment = Poseidon2(DS_KEY, zk_root, salt)
+    # is supplied once by the browser at step-up-gated enrollment and is
+    # replaced only by rekey commit. NULL until the vault enrolls.
+    zkp_key_commitment: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    zkp_vault_salt: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at: Mapped[dt.datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
 

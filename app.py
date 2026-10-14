@@ -1190,7 +1190,10 @@ def ready():
         # Check database connectivity
         conn = db()
         conn.execute(text("SELECT 1"))
-        return jsonify({"status": "ready", "database": "ok"})
+        # ZKP is an optional feature: report the verifier state, never fail
+        # readiness on it (docs/ZKP_BINDING.md, "Availability").
+        return jsonify({"status": "ready", "database": "ok",
+                        "zkp": "available" if zkp_verifier.artifacts_available() else "unavailable"})
     except Exception as e:
         info = _redact_db_detail(e, limit=100)
         LOG.warning('event="readiness_failed" class="%s" orig_class="%s" sqlstate="%s" detail="%s"',
@@ -1320,6 +1323,9 @@ def zkp_challenge():
     if not zkp_verifier.artifacts_available():
         LOG.warning('event="zkp_challenge_unavailable" client="%s"', _client_log_id())
         return api_error("Encrypted-record validation is temporarily unavailable", 503)
+    key = _zkp_vault_key(db(), current_identity_id())
+    if key is None:
+        return api_error("This vault has no registered ZK key commitment", 409)
 
     challenge_id = secrets.token_urlsafe(32)
     # 31 bytes, not 32: kept strictly below the BN254 scalar field modulus
@@ -1347,17 +1353,120 @@ def zkp_challenge():
         "circuit_version": zkp_verifier.CIRCUIT_VERSION,
         "expires_in": ZKP_CHALLENGE_TTL,
         "categories": list(zkp_verifier.CATEGORY_IDS),
+        "key_commitment": key[0].hex(),
+        "vault_salt": key[1].hex(),
     })
+
+
+def _zkp_vault_key(conn, identity_id, for_update=False):
+    """(key_commitment, vault_salt) bytes for this vault, or None when it has
+    not enrolled. Always read from the database, never from the request."""
+    ident = models.VaultIdentity.__table__
+    stmt = select(ident.c.zkp_key_commitment, ident.c.zkp_vault_salt).where(ident.c.id == identity_id)
+    if for_update: stmt = stmt.with_for_update()
+    row = conn.execute(stmt).first()
+    if not row or row.zkp_key_commitment is None or row.zkp_vault_salt is None:
+        return None
+    return bytes(row.zkp_key_commitment), bytes(row.zkp_vault_salt)
+
+
+def _parse_zkp_key_commitment(value):
+    """64 lowercase hex chars naming a canonical, nonzero BN254 field element."""
+    if not isinstance(value, str) or not _LOWER_HEX_64.fullmatch(value): return None
+    integer = int(value, 16)
+    if not 0 < integer < zkp_verifier.BN254_SCALAR_MODULUS: return None
+    return bytes.fromhex(value)
+
+
+@app.get("/api/zkp/key-commitment")
+def zkp_key_commitment_status():
+    """Whether this vault has enrolled its v4 key commitment, and its public
+    salt (the browser needs it to recompute the commitment, e.g. at rekey)."""
+    denied = require_access()
+    if denied: return denied
+    ident = models.VaultIdentity.__table__
+    row = db().execute(select(ident.c.zkp_key_commitment, ident.c.zkp_vault_salt)
+                       .where(ident.c.id == current_identity_id())).first()
+    return jsonify({
+        "registered": bool(row and row.zkp_key_commitment is not None),
+        "vault_salt": bytes(row.zkp_vault_salt).hex() if row and row.zkp_vault_salt is not None else None,
+    })
+
+
+@app.post("/api/zkp/key-commitment/salt")
+def zkp_key_commitment_salt():
+    """Step 1 of enrollment (step-up gated): issue a fresh server-generated
+    salt. Refused once a commitment exists; only rekey commit replaces it."""
+    denied = require_destructive_management()
+    if denied: return denied
+    payload, error = _json_object()
+    if error: return error
+    if payload: return api_error("Body must be empty", 400)
+    conn = db()
+    ident = models.VaultIdentity.__table__
+    owner_id = current_identity_id()
+    row = conn.execute(select(ident.c.zkp_key_commitment).where(ident.c.id == owner_id).with_for_update()).first()
+    if not row:
+        conn.rollback(); return api_error("Vault not found", 404)
+    if row.zkp_key_commitment is not None:
+        conn.rollback(); return api_error("A ZK key commitment is already registered", 409)
+    # 31 bytes: strictly below the BN254 modulus, so it is a field element as is.
+    salt = secrets.token_bytes(31)
+    conn.execute(update(ident).where(ident.c.id == owner_id).values(zkp_vault_salt=salt, updated_at=func.now()))
+    conn.commit()
+    return jsonify({"vault_salt": salt.hex()})
+
+
+@app.post("/api/zkp/key-commitment")
+def zkp_key_commitment_enroll():
+    """Step 2 of enrollment (step-up gated): store the browser-computed
+    Poseidon2(DS_KEY, zk_root, vault_salt). The server cannot check it
+    against the key (that would need the key); a wrong value only locks
+    this vault out of its own v4 proofs. See docs/ZKP_BINDING.md."""
+    denied = require_destructive_management()
+    if denied: return denied
+    payload, error = _json_object()
+    if error: return error
+    if set(payload) != {"key_commitment"}: return api_error("Body must contain only key_commitment", 400)
+    commitment = _parse_zkp_key_commitment(payload["key_commitment"])
+    if commitment is None: return api_error("Invalid key_commitment", 400)
+    conn = db()
+    ident = models.VaultIdentity.__table__
+    owner_id = current_identity_id()
+    row = conn.execute(select(ident.c.zkp_key_commitment, ident.c.zkp_vault_salt)
+                       .where(ident.c.id == owner_id).with_for_update()).first()
+    if not row:
+        conn.rollback(); return api_error("Vault not found", 404)
+    if row.zkp_key_commitment is not None:
+        conn.rollback(); return api_error("A ZK key commitment is already registered", 409)
+    if row.zkp_vault_salt is None:
+        conn.rollback(); return api_error("Request a salt first", 409)
+    conn.execute(update(ident).where(ident.c.id == owner_id).values(zkp_key_commitment=commitment, updated_at=func.now()))
+    conn.commit()
+    LOG.info('event="zkp_key_commitment_enrolled" client="%s"', _client_log_id())
+    return jsonify({"registered": True})
+
+
+def _refund_zkp_challenge(challenge_id, identity_id):
+    """Undo a claim when the verifier itself was unavailable (missing
+    artifacts or timeout), so the user is not charged a challenge for a
+    server-side outage. Only ever called after this request claimed it."""
+    table = models.ZkpChallenge.__table__
+    conn = db()
+    conn.execute(update(table).where(
+        (table.c.challenge_id == challenge_id) & (table.c.identity_id == identity_id)
+        & (table.c.session_id_hash == _sid_hash(session.sid))
+    ).values(consumed_at=None))
+    conn.commit()
+
 
 def _claim_zkp_challenge(challenge_id, identity_id):
     """Atomically claim a challenge (single UPDATE ... RETURNING, matching
     _take_challenge()'s existing pattern above): consumed exactly once,
     with no SELECT-then-UPDATE race between two concurrent submissions of
-    the same challenge_id. Consuming happens BEFORE proof verification,
-    not after: a wasted challenge on an invalid/failed proof is cheap
-    (the client just requests another one) and this keeps single-use
-    genuinely race-free, which matters more here than being lenient about
-    failed attempts. See zkp/README.md."""
+    the same challenge_id. Consuming happens BEFORE proof verification so
+    single use stays race-free; an invalid proof spends the challenge, but
+    a verifier outage refunds it (_refund_zkp_challenge)."""
     now = time.time()
     table = models.ZkpChallenge.__table__
     conn = db()
@@ -1377,35 +1486,26 @@ def _claim_zkp_challenge(challenge_id, identity_id):
 
 @app.post("/api/records/manual")
 def create_manual_expense_zkp():
-    """ZK-proof-gated manual transaction creation. See zkp/README.md for the
-    full design and its documented limitation: a valid proof here does NOT
-    prove the ciphertext in this same request contains the record the
-    proof was computed over -- Flask cannot decrypt `sealed` to check that.
-    See that document's "What this circuit does and does not prove"."""
+    """ZK-proof-gated manual transaction creation, circuit v4 only.
+
+    The proof's statement is filled from server rows (challenge, record id,
+    schema, this vault's key commitment and salt), and the stored record is
+    built from the proof's own ciphertext/mac outputs, so the ciphertext is
+    exactly the proven one and was produced under the vault's registered
+    key. v2 records remain readable; v2 and v3 submissions are refused.
+    See docs/ZKP_BINDING.md."""
     denied = require_access()
     if denied: return denied
     owner_id = current_identity_id()
     payload, error = _json_object()
     if error: return error
-    expected = {"challenge_id", "blind_index", "sealed", "commitment", "proof", "public_inputs"}
-    if set(payload) != expected: return api_error("Invalid manual transaction submission", 400)
-
-    challenge_id, blind, sealed, commitment, proof_hex, public_inputs = (
-        payload["challenge_id"], payload["blind_index"], payload["sealed"],
-        payload["commitment"], payload["proof"], payload["public_inputs"],
-    )
+    if set(payload) != {"challenge_id", "blind_index", "proof", "public_inputs"}:
+        return api_error("Invalid manual transaction submission", 400)
+    challenge_id, blind, proof_hex, public_inputs = (
+        payload["challenge_id"], payload["blind_index"], payload["proof"], payload["public_inputs"])
     if not isinstance(challenge_id, str) or not challenge_id or len(challenge_id) > 128:
         return api_error("Invalid manual transaction submission", 400)
     if not isinstance(blind, str) or not _LOWER_HEX_64.fullmatch(blind):
-        return api_error("Invalid record", 400)
-    if not isinstance(sealed, str) or not _LOWER_HEX.fullmatch(sealed) or len(sealed) % 2 \
-            or not MIN_SEALED_HEX_LENGTH <= len(sealed) <= MAX_SEALED_HEX_LENGTH:
-        return api_error("Invalid record", 400)
-    if not isinstance(commitment, str) or not _LOWER_HEX_64.fullmatch(commitment):
-        return api_error("Invalid record", 400)
-    try:
-        commitment_field = zkp_verifier.canonical_field_hex(commitment)
-    except zkp_verifier.ZkpVerificationError:
         return api_error("Invalid record", 400)
     if not isinstance(proof_hex, str) or not _LOWER_HEX.fullmatch(proof_hex) or len(proof_hex) % 2:
         return api_error("Unable to validate the encrypted record.", 400)
@@ -1414,37 +1514,38 @@ def create_manual_expense_zkp():
     except zkp_verifier.ZkpVerificationError:
         return api_error("Unable to validate the encrypted record.", 400)
 
+    # Checked before claiming, so a vault that never enrolled does not burn
+    # challenges.
+    key = _zkp_vault_key(db(), owner_id)
+    db().commit()
+    if key is None:
+        return api_error("This vault has no registered ZK key commitment", 409)
+
     claimed = _claim_zkp_challenge(challenge_id, owner_id)
     if claimed is None:
         LOG.warning('event="zkp_challenge_rejected" client="%s"', _client_log_id())
         return api_error("Unable to validate the encrypted record.", 400)
+    if claimed["circuit_version"] != zkp_verifier.CIRCUIT_VERSION or claimed["schema_version"] != zkp_verifier.SCHEMA_VERSION:
+        LOG.warning('event="zkp_context_mismatch" client="%s"', _client_log_id())
+        return api_error("Unable to validate the encrypted record.", 400)
 
-    # Independently reconstruct the complete public statement from
-    # server-owned challenge data plus the separately validated
-    # commitment. Public parameters appear in Noir declaration order and
-    # the public return value follows them. Never let the client relabel,
-    # omit, reorder, or append fields.
-    expected_public_inputs = zkp_verifier.expected_public_inputs(
-        challenge=bytes(claimed["challenge"]),
-        record_id=bytes(claimed["record_id"]),
-        schema_version=claimed["schema_version"],
-        commitment=commitment_field,
-    )
-    if public_inputs != expected_public_inputs or claimed["circuit_version"] != zkp_verifier.CIRCUIT_VERSION:
+    # The client never chooses the statement: the first five public inputs
+    # must equal what the server builds from its own rows.
+    expected = zkp_verifier.expected_server_inputs(
+        challenge=bytes(claimed["challenge"]), record_id=bytes(claimed["record_id"]),
+        key_commitment=key[0], vault_salt=key[1])
+    if public_inputs[:zkp_verifier.SERVER_INPUT_COUNT] != expected:
         LOG.warning('event="zkp_context_mismatch" client="%s"', _client_log_id())
         return api_error("Unable to validate the encrypted record.", 400)
 
     try:
         proof_bytes = bytes.fromhex(proof_hex)
-    except ValueError:
-        return api_error("Unable to validate the encrypted record.", 400)
-
-    try:
         result = zkp_verifier.verify_proof(proof_bytes, public_inputs)
     except zkp_verifier.CircuitArtifactsUnavailable:
+        _refund_zkp_challenge(challenge_id, owner_id)
         LOG.warning('event="zkp_verifier_unavailable" client="%s"', _client_log_id())
-        return api_error("Unable to validate the encrypted record.", 503)
-    except zkp_verifier.ZkpVerificationError:
+        return api_error("Encrypted-record validation is temporarily unavailable", 503)
+    except (zkp_verifier.ZkpVerificationError, ValueError):
         LOG.warning('event="zkp_proof_malformed" client="%s"', _client_log_id())
         return api_error("Unable to validate the encrypted record.", 400)
 
@@ -1455,13 +1556,14 @@ def create_manual_expense_zkp():
         )
         return api_error("Unable to validate the encrypted record.", 400)
 
+    sealed = zkp_verifier.sealed_from_outputs(bytes(claimed["record_id"]), public_inputs)
+    commitment = zkp_verifier.commitment_from_outputs(public_inputs)
     table = models.Record.__table__
     conn = db()
     blocked = _vault_write_guard(conn, owner_id)
     if blocked: return blocked
-    today = date.today()
     stmt = pg_insert(table).values(
-        identity_id=owner_id, blind_index=blind, sealed=sealed, bytes=len(bytes.fromhex(sealed)), stored_at=today,
+        identity_id=owner_id, blind_index=blind, sealed=sealed, bytes=len(sealed) // 2, stored_at=date.today(),
         commitment=commitment, circuit_version=zkp_verifier.CIRCUIT_VERSION,
     )
     stmt = stmt.on_conflict_do_update(index_elements=["identity_id", "blind_index"], set_=dict(
@@ -2362,7 +2464,7 @@ def rekey_commit():
     payload, error = _json_object()
     if error: return error
     keys = set(payload)
-    if not {"rekey_id", "salt_enc", "salt_idx", "kdf_version"} <= keys or keys - {"rekey_id", "salt_enc", "salt_idx", "kdf_version", "recovery_blob"}:
+    if not {"rekey_id", "salt_enc", "salt_idx", "kdf_version"} <= keys or keys - {"rekey_id", "salt_enc", "salt_idx", "kdf_version", "recovery_blob", "zkp_key_commitment"}:
         return api_error("Invalid rekey commit", 400)
     salt_enc, salt_idx, version = payload["salt_enc"], payload["salt_idx"], payload["kdf_version"]
     for salt in (salt_enc, salt_idx):
@@ -2374,12 +2476,23 @@ def rekey_commit():
     if blob_hex is not None:
         if not isinstance(blob_hex, str) or not 64 <= len(blob_hex) <= 2048 or len(blob_hex) % 2 or not _is_lower_hex(blob_hex):
             return api_error("Invalid recovery_blob", 400)
+    new_zkp_commitment = None
+    if "zkp_key_commitment" in payload:
+        new_zkp_commitment = _parse_zkp_key_commitment(payload["zkp_key_commitment"])
+        if new_zkp_commitment is None: return api_error("Invalid zkp_key_commitment", 400)
     conn = db()
     ident = models.VaultIdentity.__table__
-    row = conn.execute(select(ident.c.recovery_blob, ident.c.kdf_salt_enc).where(ident.c.id == owner_id).with_for_update()).first()
+    row = conn.execute(select(ident.c.recovery_blob, ident.c.kdf_salt_enc, ident.c.zkp_key_commitment)
+                       .where(ident.c.id == owner_id).with_for_update()).first()
     rk = _active_rekey(conn, owner_id, payload["rekey_id"])
     if not row or not rk:
         conn.rollback(); return api_error("No active rekey with this id", 404)
+    # The ZK key commitment is derived from the vault key, so a rekey must
+    # replace it in this same transaction (same salt, new key), exactly when
+    # one is registered.
+    if (row.zkp_key_commitment is None) != (new_zkp_commitment is None):
+        conn.rollback()
+        return api_error("zkp_key_commitment is required exactly when the vault has a registered ZK key commitment", 400)
     if (row.recovery_blob is None) != (blob_hex is None):
         conn.rollback()
         return api_error("recovery_blob is required exactly when the vault has a recovery key", 400)
@@ -2400,7 +2513,11 @@ def rekey_commit():
     # Public ZK commitments (not secrets) follow their record to its new index.
     carried = conn.execute(select(staged.c.blind_index, records.c.commitment, records.c.circuit_version).select_from(
         staged.join(records, (records.c.identity_id == owner_id) & (records.c.blind_index == staged.c.old_blind_index))
-    ).where((staged.c.rekey_id == rk["id"]) & records.c.commitment.is_not(None))).all()
+    ).where((staged.c.rekey_id == rk["id"]) & records.c.commitment.is_not(None)
+            # A v4 record's ciphertext was bound to the OLD key; once the
+            # browser re-seals it under the new key the v4 tag no longer
+            # describes it, so it is not carried over.
+            & (records.c.circuit_version != zkp_verifier.CIRCUIT_VERSION))).all()
     conn.execute(delete(records).where(records.c.identity_id == owner_id))
     conn.execute(insert(records).from_select(
         ["identity_id", "blind_index", "sealed", "bytes", "stored_at"],
@@ -2413,6 +2530,8 @@ def rekey_commit():
                   kdf_version=version, updated_at=func.now())
     if blob_hex is not None:
         values.update(recovery_blob=bytes.fromhex(blob_hex), recovery_created_at=func.now())
+    if new_zkp_commitment is not None:
+        values.update(zkp_key_commitment=new_zkp_commitment)
     conn.execute(update(ident).where(ident.c.id == owner_id).values(**values))
     conn.execute(delete(rekeys).where(rekeys.c.id == rk["id"]))
     sessions = models.ServerSession.__table__

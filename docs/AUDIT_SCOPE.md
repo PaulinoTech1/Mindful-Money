@@ -46,11 +46,12 @@
   - Is there a session fixation or revocation race condition?
   - Is step-up authentication enforced for destructive actions?
 
-### 5. ZKP binding (v3)
+### 5. ZKP binding (v4)
 
-- **Files:** `zkp/manual_expense_sealed/src/main.nr`, `static/zkp/manual_expense_sealed_client.js`, `zkp_verifier.py`
+- **Files:** `zkp/manual_expense_v4/src/main.nr`, `static/zkp/manual_expense_v4_core.js`, `static/zkp/manual_expense_v4_client.js`, `zkp_verifier.py`, ZKP endpoints in `app.py`
 - **Questions:**
-  - Does the circuit actually bind the validated plaintext to the stored ciphertext?
+  - Does the circuit bind the key to the registered commitment, and the validated plaintext to the stored ciphertext?
+  - Is the key schedule (`zk_root`, per-record key and nonce) sound, and does the commitment leak anything beyond the documented Argon2id-bound guessing oracle?
   - Is the Poseidon2 AEAD construction sound?
   - Can a prover substitute a different ciphertext than what was proven?
   - Are the proving/verification keys generated securely?

@@ -17,8 +17,14 @@ Returns 200 if the app can serve traffic (database is reachable).
 Returns 503 if the database is unreachable.
 
 ```json
-{"status": "ready", "database": "ok"}
+{"status": "ready", "database": "ok", "zkp": "available"}
 ```
+
+`zkp` is informational and never affects the status code: `available` means
+the bb binary, baked CRS and v4 verification key are present
+(`zkp_verifier.artifacts_available()`); `unavailable` means proof
+submissions return 503 while the rest of the app works. See
+`docs/ZKP_BINDING.md` "Availability".
 
 Used by Cloud Run to determine if the container should receive traffic.
 A container that fails readiness is removed from the load balancer rotation

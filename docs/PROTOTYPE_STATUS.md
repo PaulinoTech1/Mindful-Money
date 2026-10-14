@@ -29,7 +29,7 @@ Mindful Money is an experimental privacy-focused finance tracker. Hardening land
 - [x] 60-bit minimum passphrase entropy enforced for new vaults
 - [x] Sealed record padding to bucketed lengths
 - [x] `__Host-` cookie prefix in production
-- [x] ZKP v3 circuit that binds validated plaintext to stored ciphertext
+- [ ] ZKP v4 circuit binding key and ciphertext (implemented and locally tested on branch `zkp/v4-key-commitment`; v3 was flawed and is removed, see `docs/ZKP_BINDING.md`)
 - [x] Encrypted recovery key with automatic re-encryption
 - [x] JS integrity: SRI + manifest + CI smoke-test verification (fails deploy on mismatch)
 - [x] Session revocation race condition fixed
