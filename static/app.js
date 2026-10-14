@@ -843,6 +843,7 @@ const ZKP_PROVEN_HEX = 2 * (16 + 32 * 9);
 const ZKP_LOAD_TIMEOUT_MS = 120000;
 let ZKP_PROVER = null;       // Promise<window.MMZkpV4>
 let ZKP_ROOT = null;         // BigInt, derived from KEYS.privateKey, page memory only
+let ZKP_VERIFIER_UNAVAILABLE = false;  // set after a 503; skip the v4 path until re-unlock
 
 function loadZkpProver() {
   if (window.MMZkpV4) return Promise.resolve(window.MMZkpV4);
@@ -927,8 +928,20 @@ async function ensureZkpEnrollment(interactive, note) {
 }
 
 // Best effort, after unlock: never prompts, never blocks the dashboard.
+async function refreshZkpAvailability() {
+  try {
+    const ready = await api('/ready');
+    ZKP_VERIFIER_UNAVAILABLE = ready.zkp !== 'available';
+  } catch (_e) {
+    // Leave the flag alone; the next challenge will decide.
+  }
+}
+
 function enrollZkpInBackground() {
-  ensureZkpEnrollment(false).catch((e) => {
+  refreshZkpAvailability().then(() => {
+    if (ZKP_VERIFIER_UNAVAILABLE) return;
+    return ensureZkpEnrollment(false);
+  }).catch((e) => {
     console.info('ZK key commitment not enrolled at unlock:', e.message);
   });
 }
@@ -939,6 +952,7 @@ function enrollZkpInBackground() {
 // example a rejected proof) is reported and nothing is saved.
 async function saveManualTransactionV4(manual, validated, note) {
   const fallback = (message) => Object.assign(new Error(message), { zkpFallback: true });
+  if (ZKP_VERIFIER_UNAVAILABLE) throw fallback('ZK validation is unavailable on the server right now.');
   if (new TextEncoder().encode(validated.name).length > 120) throw fallback('The name is longer than the 120-byte ZK proof bound.');
   let zk;
   try { zk = await loadZkpProver(); } catch (e) { throw fallback(e.message); }
@@ -950,7 +964,8 @@ async function saveManualTransactionV4(manual, validated, note) {
       body: JSON.stringify({ purpose: 'manual_expense_create' }),
     });
   } catch (e) {
-    if (e.status === 503 || e.status === 409) throw fallback('ZK validation is unavailable on the server right now.');
+    if (e.status === 503) { ZKP_VERIFIER_UNAVAILABLE = true; throw fallback('ZK validation is unavailable on the server right now.'); }
+    if (e.status === 409) throw fallback('ZK validation is unavailable on the server right now.');
     throw e;
   }
   if (note) note.textContent = 'Generating zero-knowledge proof in this browser...';
@@ -968,7 +983,7 @@ async function saveManualTransactionV4(manual, validated, note) {
       body: JSON.stringify({ ...body, blind_index: blindIndex(manual.id), meta: seal(meta) }),
     });
   } catch (e) {
-    if (e.status === 503) throw fallback('ZK validation is unavailable on the server right now.');
+    if (e.status === 503) { ZKP_VERIFIER_UNAVAILABLE = true; throw fallback('ZK validation is unavailable on the server right now.'); }
     throw e;
   }
 }
@@ -1162,7 +1177,7 @@ async function unlock() {
     await api('/api/vault/rekey/abort', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
     }).catch(() => {});
-    ZKP_ROOT = null;
+    ZKP_ROOT = null; ZKP_VERIFIER_UNAVAILABLE = false;
     await load(true);
     await api('/api/vault/unlocked', { method: 'POST' });
   } catch (_error) {
@@ -2524,7 +2539,7 @@ async function resetPassphrase() {
   $('resetPassphraseBtn').disabled = true;
   try {
     await deleteAllRecordsWithStepUp(note);
-    KEYS = null; TXNS = []; ZKP_ROOT = null;
+    KEYS = null; TXNS = []; ZKP_ROOT = null; ZKP_VERIFIER_UNAVAILABLE = false;
     $('pass').value = '';
     updatePassphraseEntropy();
     $('gate').querySelector('h1').textContent = 'Set a new passphrase';
@@ -2643,7 +2658,7 @@ async function refreshSecurity() {
 
 function lockVault() {
   if (KEYS) { KEYS.privateKey?.fill(0); KEYS.indexKey?.fill(0); KEYS.publicKey?.fill(0); }
-  KEYS = null; TXNS = []; ZKP_ROOT = null;
+  KEYS = null; TXNS = []; ZKP_ROOT = null; ZKP_VERIFIER_UNAVAILABLE = false;
   CHAT_CONTEXT = { pending: '', lastTopic: '', projectionHorizon: 1 };
   Object.values(CHARTS).forEach((c) => c.destroy()); CHARTS = {};
   Object.values(CHAT_CHARTS).forEach((c) => c.destroy());

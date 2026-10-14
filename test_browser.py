@@ -655,6 +655,14 @@ def main() -> int:
             expected_stepup_error = "Failed to load resource: the server responded with a status of 401 (UNAUTHORIZED)"
             if record_delete_statuses == [401, 200] and expected_stepup_error in errors:
                 errors.remove(expected_stepup_error)
+            # Without a bb verifier (this job does not install one) /ready
+            # reports zkp unavailable and the UI skips the v4 path. If a
+            # stray challenge still fires, Chromium logs the 503 like the
+            # intended kdf-salts 404 above; drop those expected ones.
+            expected_zkp_503 = "Failed to load resource: the server responded with a status of 503 (SERVICE UNAVAILABLE)"
+            while expected_zkp_503 in errors and any(
+                    r.startswith("503 POST") and "/api/zkp/" in r for r in bad_responses):
+                errors.remove(expected_zkp_503)
 
             page.once("dialog", lambda dialog: dialog.accept())
             page.click("#disablePasskeyBtn")
