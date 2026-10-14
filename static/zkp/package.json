@@ -5,7 +5,8 @@
   "description": "Browser-side Noir 1.0.0-beta.26 and Barretenberg 5.1.0 proving for the manual-expense ZK-proof feature.",
   "scripts": {
     "build": "vite build --configLoader runner",
-    "smoke": "node smoke_prove.mjs"
+    "smoke": "node smoke_prove.mjs",
+    "test:v4": "node v4_client.test.mjs"
   },
   "dependencies": {
     "@aztec/bb.js": "5.1.0",
