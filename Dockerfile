@@ -2,6 +2,15 @@
 # Pinned by multi-arch index digest (resolved 2026-10-13 from registry-1.docker.io).
 # The tag is kept for readability; Docker uses the digest. Dependabot (docker
 # ecosystem) proposes digest bumps weekly.
+# ---- ZK verifier runtime (build stage) ----
+# Fetches bb 5.1.0 and a truncated BN254 CRS over HTTPS, every file pinned by
+# sha256, and checks the committed v4 VK against the committed circuit. See
+# scripts/fetch_zkp_runtime.py and docs/ZKP_BINDING.md "Availability".
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS zkp-runtime
+COPY zkp/manual_expense_v4/target/manual_expense_v4.json zkp/manual_expense_v4/target/vk zkp/manual_expense_v4/target/vk_hash /build/v4/
+COPY scripts/fetch_zkp_runtime.py /build/
+RUN python /build/fetch_zkp_runtime.py /opt/zkp /build/v4
+
 FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
 
 # Build args for version tracking (set by CI)
@@ -23,6 +32,15 @@ COPY --chown=appuser:appuser app.py db.py models.py zkp_verifier.py alembic.ini 
 COPY --chown=appuser:appuser static/ ./static/
 COPY --chown=appuser:appuser migrations/ ./migrations/
 COPY --chown=appuser:appuser geoip/ ./geoip/
+
+# ZK verifier: bb binary, baked CRS (no request-time download) and the v4
+# VK. Root-owned and read-only for appuser. About 40 MB (bb is 38 MB).
+COPY --from=zkp-runtime /opt/zkp/bb /usr/local/bin/bb
+COPY --from=zkp-runtime /opt/zkp/crs/ /opt/zkp/crs/
+COPY --from=zkp-runtime /opt/zkp/vk /opt/zkp/v4/vk
+ENV ZKP_BB_EXECUTABLE=/usr/local/bin/bb \
+    ZKP_CRS_DIR=/opt/zkp/crs \
+    ZKP_V4_VK_PATH=/opt/zkp/v4/vk
 
 # Cloud Run sets PORT env var; gunicorn listens on it.
 # Bounded worker timeout: a hung request is killed and logged by gunicorn

@@ -2,7 +2,18 @@
 .git/
 .github/
 screenshots/
-zkp/
+# Only the compiled v4 circuit, VK and VK hash enter the build context
+# (zkp-runtime stage); sources, older circuits and vendored libs stay out.
+zkp/*
+!zkp/manual_expense_v4/
+zkp/manual_expense_v4/*
+!zkp/manual_expense_v4/target/
+zkp/manual_expense_v4/target/*
+!zkp/manual_expense_v4/target/manual_expense_v4.json
+!zkp/manual_expense_v4/target/vk
+!zkp/manual_expense_v4/target/vk_hash
+static/zkp/node_modules/
+static/zkp/dist/
 deploy/
 docker-compose.yml
 test_*.py

@@ -151,3 +151,91 @@ jobs:
         env:
           VAULT_ENV: test
           VAULT_TEST_DATABASE_URL: postgresql+psycopg://vault:vault_test_password@localhost:5432/vault_test
+
+  zkp-v4:
+    # Circuit tests, rebuild-equals-committed check, real bb prove/verify
+    # (honest verifies, random-key proof rejected), browser client test.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache pinned ZK runtime (bb, CRS)
+        id: zkp-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/zkp
+          key: zkp-runtime-${{ hashFiles('scripts/fetch_zkp_runtime.py', 'zkp/manual_expense_v4/target/vk') }}
+
+      - name: Fetch bb and CRS (sha256 pinned)
+        if: steps.zkp-cache.outputs.cache-hit != 'true'
+        run: python scripts/fetch_zkp_runtime.py "$RUNNER_TEMP/zkp" zkp/manual_expense_v4/target
+
+      - name: Install nargo 1.0.0-beta.26 (sha256 pinned)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/nargo.tgz" https://github.com/noir-lang/noir/releases/download/v1.0.0-beta.26/nargo-x86_64-unknown-linux-gnu.tar.gz
+          echo "64048040befd55a987158b11137d8f38f9688f696db4d84910dd1bcf0442fb80  $RUNNER_TEMP/nargo.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin" && tar xzf "$RUNNER_TEMP/nargo.tgz" -C "$RUNNER_TEMP/bin" nargo
+          cp "$RUNNER_TEMP/zkp/bb" "$RUNNER_TEMP/bin/bb"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Circuit tests and bb end-to-end
+        run: |
+          cp -r "$RUNNER_TEMP/zkp/crs" "$RUNNER_TEMP/crs-work"
+          ZKP_CRS_DIR="$RUNNER_TEMP/crs-work" scripts/zkp_v4_e2e.sh
+          git diff --exit-code zkp/
+
+      - name: Real bb verification of the committed fixture
+        run: python -m unittest -v test_zkp_real_bb
+        env:
+          ZKP_REQUIRE_REAL: '1'
+          ZKP_BB_EXECUTABLE: ${{ runner.temp }}/zkp/bb
+          ZKP_CRS_DIR: ${{ runner.temp }}/zkp/crs
+          ZKP_V4_VK_PATH: zkp/manual_expense_v4/target/vk
+
+      - name: Browser client test (Node, real circuit)
+        working-directory: static/zkp
+        run: |
+          npm ci --no-audit --no-fund
+          npm run test:v4
+
+  docker-zkp:
+    # Builds the production image (pinned downloads checked during build),
+    # verifies the fixture proof INSIDE it with no network, and reports the
+    # image size against main.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build PR image
+        run: docker build -t mm:pr .
+
+      - name: Verify fixture inside the image with --network none
+        run: |
+          docker run --rm --network none \
+            -e ZKP_REQUIRE_REAL=1 \
+            -v "$PWD/tests/fixtures:/home/appuser/app/tests/fixtures:ro" \
+            -v "$PWD/test_zkp_real_bb.py:/home/appuser/app/test_zkp_real_bb.py:ro" \
+            mm:pr python -m unittest -v test_zkp_real_bb
+
+      - name: Image size versus main
+        run: |
+          git worktree add "$RUNNER_TEMP/base" origin/main
+          docker build -q -t mm:base "$RUNNER_TEMP/base" >/dev/null
+          pr=$(docker image inspect mm:pr --format '{{.Size}}')
+          base=$(docker image inspect mm:base --format '{{.Size}}')
+          echo "image size: main=$base bytes, pr=$pr bytes, delta=$((pr - base)) bytes" | tee -a "$GITHUB_STEP_SUMMARY"
