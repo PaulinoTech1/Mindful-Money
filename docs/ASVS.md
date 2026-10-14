@@ -83,7 +83,7 @@ server-visible metadata in [TRUST_BOUNDARIES.md](TRUST_BOUNDARIES.md#what-the-se
 | ID | Lvl | Requirement (short) | Status | Evidence | Conf. |
 |---|---|---|---|---|---|
 | 11.1.2 | L2 | Cryptographic inventory | partial | primitives listed across `TRUST_BOUNDARIES.md`, `RECOVERY.md`, `OFFLINE_ATTACK_COST.md`; no single inventory (part of [R6](HARDENING_PROPOSALS.md#r6-versioned-security-verification-report)) | high |
-| 11.2.1 | L2 | Industry-validated crypto implementations | implemented | libsodium (vendored `libsodium-wrappers`, pinned by SRI) for sealing, Argon2id, BLAKE2b | high |
+| 11.2.1 | L2 | Industry-validated crypto implementations | implemented | libsodium (vendored `libsodium-wrappers`, pinned by SRI) for sealing, Argon2id, BLAKE2b. The optional ZKP path uses Poseidon2 via Noir and Barretenberg, which is not a standard AEAD and is unreviewed ([ZKP_BINDING.md](ZKP_BINDING.md)) | medium |
 | 11.2.3 | L2 | At least 128-bit security | implemented | X25519 sealed boxes (about 128-bit), 256-bit keys | high |
 | 11.3.3 | L2 | Authenticated encryption against modification | CI-verified | NaCl sealed box (XSalsa20-Poly1305); tamper tests in `test_demo.py` | high |
 | 11.3.2 | L1 | Only approved ciphers and modes | needs review | XSalsa20-Poly1305 is not AES-GCM; whether it counts as "approved" per ASVS Appendix C needs an assessor's call | low |

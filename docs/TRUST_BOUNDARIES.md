@@ -54,9 +54,7 @@ An optional recovery key (256-bit, 32-word mnemonic) encrypts the vault seed. Th
 
 ## ZKP limitations
 
-A v3 circuit binds the validated plaintext to the stored ciphertext via a Poseidon2-based AEAD (ciphertext is a public circuit output). The prior v2 gap (proof of A, ciphertext of B) is closed for records that use the v3 path. v2 remains for backward compatibility. See `docs/ZKP_BINDING.md`.
-
-ZKP verification requires the `bb` binary and verification key. The current production image omits both, so server-side ZKP verification is unavailable (fails closed with 503). Residual risk: `docs/THREAT_MODEL.md` risk register, "ZKP verifier absent in production".
+The v4 circuit binds the validated plaintext to the stored ciphertext and binds the encryption key to a per-vault commitment registered at enrollment. The server sees the salt it generated, the commitment, and public proof outputs; never the key, `zk_root`, or plaintext. v3 (unbound key) is removed and never accepted; v2 records are read-only. Design and caveats: `docs/ZKP_BINDING.md`. Residual risk: `docs/THREAT_MODEL.md` risk register, "ZKP proof gate".
 
 ## What "zero-knowledge" means here (and doesn't)
 

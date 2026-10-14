@@ -104,6 +104,44 @@ in `docs/CLOUD_RUN_TROUBLESHOOTING.md`), and check
 Current state (2026-10-13): 9 revisions, head `a7b8c9d0e1f2` (applied to Neon
 before merging PR #8). PR #8 deployed to Cloud Run as `dee30a5`.
 
+### ZKP v4 migration (`b8c9d0e1f2a3`, branch `zkp/v4-key-commitment`)
+
+Additive only: two nullable columns on `vault_identity`
+(`zkp_key_commitment`, `zkp_vault_salt`). Run it BEFORE merging the PR, so
+the new code never meets an old schema; the old code ignores the columns.
+Same rules as above, but check out the PR branch instead of `main`:
+
+```bash
+# Cloud Shell
+cd ~/Mindful-Money/Mindful-Money
+git fetch origin && git checkout zkp/v4-key-commitment && git pull --ff-only
+git log --oneline -1                     # the PR head commit
+export PATH="$HOME/.local/bin:$PATH"
+read -rs NEON_UNPOOLED; echo             # UNPOOLED string, hidden prompt
+case "$NEON_UNPOOLED" in
+  postgresql+psycopg://*) VAULT_DATABASE_URL="$NEON_UNPOOLED" ;;
+  postgresql://*)         VAULT_DATABASE_URL="postgresql+psycopg://${NEON_UNPOOLED#postgresql://}" ;;
+  postgres://*)           VAULT_DATABASE_URL="postgresql+psycopg://${NEON_UNPOOLED#postgres://}" ;;
+  *)                      echo "Unrecognized scheme, aborting"; VAULT_DATABASE_URL="" ;;
+esac
+export VAULT_DATABASE_URL; unset NEON_UNPOOLED
+
+alembic heads      # expect: b8c9d0e1f2a3 (head)
+alembic current    # expect: a7b8c9d0e1f2
+alembic upgrade head
+alembic current    # expect: b8c9d0e1f2a3 (head)
+
+# Verify the columns exist (prints column names only, never the URL)
+python3 -c "import os,sqlalchemy as sa; e=sa.create_engine(os.environ['VAULT_DATABASE_URL']); print(sorted(c['name'] for c in sa.inspect(e).get_columns('vault_identity') if c['name'].startswith('zkp_')))"
+# expect: ['zkp_key_commitment', 'zkp_vault_salt']
+
+unset VAULT_DATABASE_URL
+git checkout main
+```
+
+Rollback, only if needed and before any vault enrolls (it drops the
+columns and any enrolled commitments): `alembic downgrade a7b8c9d0e1f2`.
+
 ```bash
 # Roll back one migration (dangerous: take a Neon branch/backup first,
 # see docs/BACKUP_RESTORE.md)
