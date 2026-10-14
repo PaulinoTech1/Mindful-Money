@@ -1397,8 +1397,9 @@ def zkp_key_commitment_status():
 
 @app.post("/api/zkp/key-commitment/salt")
 def zkp_key_commitment_salt():
-    """Step 1 of enrollment (step-up gated): issue a fresh server-generated
-    salt. Refused once a commitment exists; only rekey commit replaces it."""
+    """Step 1 of enrollment (step-up gated): issue a server-generated salt,
+    reusing a pending one. Refused once a commitment exists; only rekey
+    commit replaces it."""
     denied = require_destructive_management()
     if denied: return denied
     payload, error = _json_object()
@@ -1412,6 +1413,14 @@ def zkp_key_commitment_salt():
         conn.rollback(); return api_error("Vault not found", 404)
     if row.zkp_key_commitment is not None:
         conn.rollback(); return api_error("A ZK key commitment is already registered", 409)
+    # Idempotent while no commitment exists: a pending salt is reused, so two
+    # concurrent enrollments (two tabs, or background enrollment racing a
+    # manual entry) compute their commitment over the same salt and the
+    # stored commitment always matches the stored salt. The salt is public.
+    current = conn.execute(select(ident.c.zkp_vault_salt).where(ident.c.id == owner_id)).scalar()
+    if current is not None:
+        conn.commit()
+        return jsonify({"vault_salt": bytes(current).hex()})
     # 31 bytes: strictly below the BN254 modulus, so it is a field element as is.
     salt = secrets.token_bytes(31)
     conn.execute(update(ident).where(ident.c.id == owner_id).values(zkp_vault_salt=salt, updated_at=func.now()))

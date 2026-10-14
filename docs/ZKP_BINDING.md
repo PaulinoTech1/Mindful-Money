@@ -171,7 +171,10 @@ need SharedArrayBuffer. CSP already allows `'wasm-unsafe-eval'` under
 without prompting. If there is no passkey, or the passkey assertion is
 stale, it stops quietly. The next manual entry that wants a v4 proof
 retries with one passkey ceremony (`authenticateWithPasskey`). Both salt
-and commitment endpoints stay step-up gated.
+and commitment endpoints stay step-up gated. Salt issuance is idempotent
+while no commitment exists: a pending salt is reused so concurrent tabs
+(or background enrollment racing a manual entry) commit over the same
+salt and the stored commitment always matches the stored salt.
 
 **Manual entry.** `submitManualTransaction` tries the v4 path first
 (challenge, prove in the browser, submit with a sealed `meta` for id,
@@ -189,8 +192,10 @@ the UX of the fallback message.
 
 **Decrypt.** `load` opens each row through `openRecord`: sealed boxes as
 before, v4 rows through the prover's `decryptManualTransactionV4` plus
-the sealed meta. If the prover cannot load, a v4 row is counted as "not
-shown" (same warning as a malformed record) rather than failing the
+the sealed meta. If the prover cannot load, the sealed meta is still
+opened with the candidate key so a wrong passphrase fails unlock even
+when every stored record is v4; a correct key leaves that row counted as
+"not shown" (same warning as a malformed record) rather than failing the
 whole unlock.
 
 **Rekey and recovery.** `reencryptForRekey` opens v4 rows with the old

@@ -1282,8 +1282,15 @@ async function load(duringUnlock = false) {
       if (isZkpV4Record(r)) {
         // Without the prover (blocked, failed its SRI check, offline) a v4
         // record cannot be opened; show the rest and count it as not shown
-        // rather than failing the unlock. A wrong key still fails below.
-        try { await loadZkpProver(); } catch (_e) { decrypted.push(null); continue; }
+        // rather than failing the unlock. Its sealed meta part is a normal
+        // sealed box, so the candidate key is still verified here: a wrong
+        // passphrase fails the unlock even when every record is v4.
+        try { await loadZkpProver(); } catch (_e) {
+          const hex = typeof r.sealed === 'string' ? r.sealed : '';
+          if (hex.length <= ZKP_PROVEN_HEX) throw new Error('Malformed v4 record.');
+          open(hex.slice(ZKP_PROVEN_HEX));
+          decrypted.push(null); continue;
+        }
       }
       decrypted.push(await openRecord(r));
     }

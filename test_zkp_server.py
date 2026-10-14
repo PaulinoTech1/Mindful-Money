@@ -151,9 +151,19 @@ class TestKeyCommitmentEnrollment(ZkpCase):
         status = self.client.get("/api/zkp/key-commitment").get_json()
         self.assertEqual(status, {"registered": True, "vault_salt": salt_hex})
 
-    def test_salt_is_random_per_request(self):
+    def test_pending_salt_is_reused_until_enrolled(self):
+        """Concurrent enrollments must commit over the same salt (Codex P1)."""
         self.add_passkey(); self.set_auth_age(1)
         a = self.post("/api/zkp/key-commitment/salt").get_json()["vault_salt"]
+        b = self.post("/api/zkp/key-commitment/salt").get_json()["vault_salt"]
+        self.assertEqual(a, b)
+        self.assertEqual(self.post("/api/zkp/key-commitment", {"key_commitment": COMMITMENT.hex()}).status_code, 200)
+        self.assertEqual(self.vault_key(), (COMMITMENT, bytes.fromhex(a)))
+
+    def test_salt_is_fresh_after_reset_clears_it(self):
+        self.add_passkey(); self.set_auth_age(1)
+        a = self.post("/api/zkp/key-commitment/salt").get_json()["vault_salt"]
+        _set_vault_key(self, commitment=None, salt=None)
         b = self.post("/api/zkp/key-commitment/salt").get_json()["vault_salt"]
         self.assertNotEqual(a, b)
 

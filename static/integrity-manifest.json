@@ -23,8 +23,8 @@
       "sha256": "12980a3f75d14eea4f88b4f69bfa58b9289ce9f687e8a7b14c90a4bc0205dfdc"
     },
     "app.js": {
-      "sri": "sha384-+eHPwI/neKm47gMa4Yg6kh9t0wsejxZAzzQqbPFklo8dTz59lT5u3Bo3P0otEJY0",
-      "sha256": "ad6a908f99a0afbc4763f112dcd663d1acccd7d394f7c4d65f5bcd53861cedd0"
+      "sri": "sha384-Vn31kQcBU5T61vhA+0v0WDhREfCbaVtOhlB98iOJ3sS8bKQWkI2GWTMx2ZWZZTCt",
+      "sha256": "1ab6275420bc7a8968b9768580120f73323d68cc3e0c88e378640182028c2491"
     },
     "zkp/build/mm-zkp-v4.js": {
       "sri": "sha384-OUlH6lUUGJz3U2MAKTsYiaJYiGoPNWGk+4ZCDqFZfO8aQp84I1Pb/W6TC2D4cyH3",

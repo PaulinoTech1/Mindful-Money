@@ -313,6 +313,22 @@ def main():
             unlock(page2, PASSPHRASE)
             check(not page2.is_hidden("#recordWarning") and V4_MERCHANT not in page2.inner_text("#ledgerBody"),
                   "without the prover, unlock still works and the v4 record is counted as not shown")
+            page3 = ctx.new_page()
+            page3.route("**/static/zkp/build/mm-zkp-v4.js", lambda r: r.fulfill(status=200, content_type="text/javascript",
+                                                                               body="window.MMZkpV4 = {};"))
+            def only_v4(route):
+                resp = route.fetch()
+                data = resp.json()
+                data["records"] = [r for r in data.get("records", []) if r.get("circuit_version") == CIRCUIT]
+                route.fulfill(response=resp, json=data)
+            page3.route("**/api/records?*", only_v4)  # every visible record is v4
+            page3.goto(base, wait_until="networkidle")
+            page3.fill("#pass", "playwright-zkp-v4-wrong-passphrase")
+            page3.click("#unlockBtn")
+            page3.wait_for_function("() => /Incorrect vault passphrase|could not be displayed/.test(document.getElementById('gateNote').textContent)", timeout=120000)
+            check("Incorrect vault passphrase" in page3.inner_text("#gateNote") and not page3.is_hidden("#gate"),
+                  "without the prover, a wrong passphrase is still rejected (v4 meta checked)")
+            page3.close()
             note = add_manual(page2, FALLBACK_SRI, "8.48")
             check("non-ZKP" in note and "integrity" in note, "prover failing its SRI check falls back, labeled non-ZKP", note)
             check(page2.evaluate("() => window.MMZkpV4 === undefined"), "tampered prover never executed (SRI)")
