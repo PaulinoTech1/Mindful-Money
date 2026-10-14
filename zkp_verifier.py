@@ -71,11 +71,13 @@ CATEGORY_IDS = (
 _ROOT = Path(__file__).resolve().parent
 BB_EXECUTABLE = os.environ.get("ZKP_BB_EXECUTABLE") or shutil.which("bb") or "bb"
 _DEFAULT_VK_PATH = _ROOT / "zkp" / "manual_expense_v4" / "target" / "vk"
-VK_PATH = Path(os.environ["ZKP_V4_VK_PATH"]) if os.environ.get("ZKP_V4_VK_PATH") else _DEFAULT_VK_PATH
+# Resolved to absolute paths: bb runs with cwd set to a temporary directory,
+# so a relative path from the environment would silently point elsewhere.
+VK_PATH = Path(os.environ["ZKP_V4_VK_PATH"]).resolve() if os.environ.get("ZKP_V4_VK_PATH") else _DEFAULT_VK_PATH
 # Baked-in BN254 CRS (see Dockerfile). Without it bb would try to download
 # the CRS over plain HTTP at request time, so the verifier is reported
 # unavailable unless this directory holds both files.
-CRS_DIR = Path(os.environ["ZKP_CRS_DIR"]) if os.environ.get("ZKP_CRS_DIR") else None
+CRS_DIR = Path(os.environ["ZKP_CRS_DIR"]).resolve() if os.environ.get("ZKP_CRS_DIR") else None
 CRS_FILES = ("bn254_g1.dat", "bn254_g2.dat")
 VERIFY_TIMEOUT_SECONDS = float(os.environ.get("ZKP_VERIFY_TIMEOUT_SECONDS", "10"))
 MAX_PROOF_BYTES = int(os.environ.get("ZKP_MAX_PROOF_BYTES", str(256 * 1024)))
