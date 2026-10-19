@@ -12,6 +12,6 @@ PyNaCl==1.6.2
 webauthn==2.8.0
 gunicorn==23.0.0; platform_system != "Windows"
 SQLAlchemy==2.1.4
-alembic==1.13.3
+alembic==1.20.0
 psycopg[binary]==3.3.6
 maxminddb==3.2.0
