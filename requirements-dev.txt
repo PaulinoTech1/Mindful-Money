@@ -2,5 +2,5 @@
 -r requirements.txt
 pytest>=8,<9
 pip-audit
-playwright==1.63.0  # real-browser tests: test_browser.py, test_playwright_recovery.py
+playwright==1.64.0  # real-browser tests: test_browser.py, test_playwright_recovery.py
 # then run: python -m playwright install chromium
