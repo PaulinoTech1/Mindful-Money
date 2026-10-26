@@ -6,12 +6,12 @@
 # Fetches bb 5.1.0 and a truncated BN254 CRS over HTTPS, every file pinned by
 # sha256, and checks the committed v4 VK against the committed circuit. See
 # scripts/fetch_zkp_runtime.py and docs/ZKP_BINDING.md "Availability".
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS zkp-runtime
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704 AS zkp-runtime
 COPY zkp/manual_expense_v4/target/manual_expense_v4.json zkp/manual_expense_v4/target/vk zkp/manual_expense_v4/target/vk_hash /build/v4/
 COPY scripts/fetch_zkp_runtime.py /build/
 RUN python /build/fetch_zkp_runtime.py /opt/zkp /build/v4
 
-FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+FROM python:3.12-slim@sha256:a0f57064cbdcd6285fa45f51237ab0b35ea8ebaed06a1f5973e89e19dfb86704
 
 # Build args for version tracking (set by CI)
 ARG GITHUB_SHA=unknown
